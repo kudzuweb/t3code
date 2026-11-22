@@ -163,12 +163,16 @@ it.effect(
       assert.deepEqual(
         recorded.map((run) => [run.ordinal, run.status, run.providerThreadId, run.id]),
         [
-          [2, "completed", providerThreadId, "transcript-run:native-session:a-user"],
-          [3, "completed", providerThreadId, "transcript-run:native-session:b-user"],
+          [2, "completed", providerThreadId, RunId.make("transcript-run:native-session:a-user")],
+          [3, "completed", providerThreadId, RunId.make("transcript-run:native-session:b-user")],
         ],
       );
       assert.deepEqual(
-        recorded.map((run) => [run.requestedAt, run.completedAt].map(DateTime.formatIso)),
+        recorded.map((run) =>
+          [run.requestedAt, run.completedAt].map((at) =>
+            at === null ? null : DateTime.formatIso(at),
+          ),
+        ),
         [
           ["2026-11-20T10:01:00.000Z", "2026-11-20T10:01:30.000Z"],
           ["2026-11-20T10:02:00.000Z", "2026-11-20T10:02:30.000Z"],

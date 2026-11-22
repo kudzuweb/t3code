@@ -95,58 +95,55 @@ const layerRuntimeRepository = (imported: ScannerTestInput["importedTranscripts"
   });
 
 const layerScannerTest = (input: ScannerTestInput) =>
-  Layer.effect(AgentSessionScanner.AgentSessionScanner, AgentSessionScanner.make)
-    .pipe(
-      Layer.provide(input.processRunner ?? ProcessRunner.layer),
-      Layer.provide(
-        Layer.succeed(ClaudeSessionChain.ClaudeSessionChain, {
-          read: ({ sessionId, directory }) =>
-            Effect.sync(() => {
-              input.claudeChainDirectories?.push(directory);
-              return input.claudeChains?.[sessionId] ?? [];
-            }),
-        }),
-      ),
-    )
-    .pipe(
-      Layer.provide(
-        Layer.mergeAll(
-          ServerSettings.layerTest({
-            providerInstances: {
-              [ProviderInstanceId.make("claudeAgent")]: {
-                driver: ProviderDriverKind.make("claudeAgent"),
-                config: { homePath: input.claudeHomePath },
-              },
-              [ProviderInstanceId.make("codex")]: {
-                driver: ProviderDriverKind.make("codex"),
-                config: { homePath: input.codexHomePath },
-              },
-              // Keeps the default Pi instance off the developer's real ~/.pi.
-              [ProviderInstanceId.make("pi")]: {
-                driver: ProviderDriverKind.make("pi"),
-                enabled: true,
-                environment: [
-                  {
-                    name: "PI_CODING_AGENT_DIR",
-                    value: input.piAgentDir ?? `${input.claudeHomePath}/pi-agent`,
-                    sensitive: false,
-                  },
-                  { name: "PI_CODING_AGENT_SESSION_DIR", value: "", sensitive: false },
-                ],
-                config: {},
-              },
-              ...input.providerInstances,
-            },
+  Layer.effect(AgentSessionScanner.AgentSessionScanner, AgentSessionScanner.make).pipe(
+    Layer.provide(input.processRunner ?? ProcessRunner.layer),
+    Layer.provide(
+      Layer.succeed(ClaudeSessionChain.ClaudeSessionChain, {
+        read: ({ sessionId, directory }) =>
+          Effect.sync(() => {
+            input.claudeChainDirectories?.push(directory);
+            return input.claudeChains?.[sessionId] ?? [];
           }),
-          ServerConfig.layerTest(
-            input.claudeHomePath,
-            input.configBaseDir ?? { prefix: "t3code-scanner-config-" },
-          ),
-          layerProjectStore(input.importedWorkspaceRoots ?? []),
-          layerRuntimeRepository(input.importedTranscripts),
+      }),
+    ),
+    Layer.provide(
+      Layer.mergeAll(
+        ServerSettings.layerTest({
+          providerInstances: {
+            [ProviderInstanceId.make("claudeAgent")]: {
+              driver: ProviderDriverKind.make("claudeAgent"),
+              config: { homePath: input.claudeHomePath },
+            },
+            [ProviderInstanceId.make("codex")]: {
+              driver: ProviderDriverKind.make("codex"),
+              config: { homePath: input.codexHomePath },
+            },
+            // Keeps the default Pi instance off the developer's real ~/.pi.
+            [ProviderInstanceId.make("pi")]: {
+              driver: ProviderDriverKind.make("pi"),
+              enabled: true,
+              environment: [
+                {
+                  name: "PI_CODING_AGENT_DIR",
+                  value: input.piAgentDir ?? `${input.claudeHomePath}/pi-agent`,
+                  sensitive: false,
+                },
+                { name: "PI_CODING_AGENT_SESSION_DIR", value: "", sensitive: false },
+              ],
+              config: {},
+            },
+            ...input.providerInstances,
+          },
+        }),
+        ServerConfig.layerTest(
+          input.claudeHomePath,
+          input.configBaseDir ?? { prefix: "t3code-scanner-config-" },
         ),
+        layerProjectStore(input.importedWorkspaceRoots ?? []),
+        layerRuntimeRepository(input.importedTranscripts),
       ),
-    );
+    ),
+  );
 
 const runScan = (input: ScannerTestInput) =>
   Effect.gen(function* () {
@@ -4578,10 +4575,12 @@ describe("claudeTurnsAfter", () => {
       record("u0", null, "user", "earlier"),
       record("a0", "u0", "assistant", "done"),
     ];
-    const read = (entries: ReadonlyArray<ReturnType<typeof record>>) =>
+    const read = (
+      entries: ReadonlyArray<Parameters<typeof AgentSessionScanner.claudeTurnsAfter>[0][number]>,
+    ) =>
       AgentSessionScanner.claudeTurnsAfter(
         [...earlier, ...entries],
-        ["u0", "a0", ...entries.map((entry) => entry.uuid)],
+        ["u0", "a0", ...entries.flatMap((entry) => (entry.uuid === undefined ? [] : [entry.uuid]))],
         "a0",
         fallback,
       );
