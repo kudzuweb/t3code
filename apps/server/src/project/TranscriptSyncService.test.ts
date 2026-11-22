@@ -659,3 +659,25 @@ it.effect(
       );
     }).pipe(Effect.provide(layerStores)),
 );
+
+it.effect("reads nothing when the session has no native id to find a transcript by", () =>
+  Effect.gen(function* () {
+    const projections = yield* seed({ runs: [{ status: "completed", turn: "a-t3" }] });
+    const now = yield* DateTime.now;
+    yield* projections.apply({
+      id: EventId.make("sync:provider-thread-without-native-id"),
+      type: "provider-thread.updated",
+      threadId,
+      occurredAt: now,
+      payload: {
+        ...providerThreadAt(now, false),
+        nativeThreadRef: { driver, nativeId: null, strength: "strong" as const },
+      },
+    });
+    const sync = yield* makeService({ "a-t3": turnsOf("one") });
+
+    assert.equal(yield* sync.service.sync(threadId), 0);
+
+    assert.deepEqual(sync.asked, []);
+  }).pipe(Effect.provide(layerStores)),
+);

@@ -124,10 +124,12 @@ const make = Effect.gen(function* () {
       (candidate) => candidate.id === thread.activeProviderThreadId,
     );
     const nativeThread = providerThread?.nativeThreadRef;
+    const nativeSessionId = nativeThread?.nativeId;
     if (
       providerThread === undefined ||
       nativeThread == null ||
-      nativeThread.strength !== "strong"
+      nativeThread.strength !== "strong" ||
+      nativeSessionId == null
     ) {
       return 0;
     }
@@ -144,7 +146,7 @@ const make = Effect.gen(function* () {
     const read = yield* scanner.readTurnsAfter({
       driver: providerThread.driver,
       providerInstanceId: providerThread.providerInstanceId,
-      providerSessionId: nativeThread.nativeId,
+      providerSessionId: nativeSessionId,
       anchorNativeId,
       ...(previous?.anchor === anchorNativeId ? { unchangedSince: previous.signature } : {}),
     });
