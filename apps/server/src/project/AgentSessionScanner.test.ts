@@ -1908,7 +1908,10 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
         });
         yield* writeTranscript({
           filePath: path.join(claudeHomePath, "projects", "-live", "claude-mismatch.jsonl"),
-          contents: transcript(line("u1", null, "user", "prompt")),
+          contents: transcript(
+            line("u1", null, "user", "prompt"),
+            line("a2", "u1", "assistant", "reply"),
+          ),
           mtimeMs: 2_000_000,
         });
         expect(yield* read("claude-mismatch", "claudeAgent", "u1")).toEqual({
@@ -1965,31 +1968,101 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
               }),
             ),
           );
-          const read = (unchangedSince?: { readonly size: number; readonly mtimeMs: number }) =>
+          const session = {
+            driver: ProviderDriverKind.make("claudeAgent"),
+            providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+            providerSessionId: "claude-cached",
+          };
+          const read = (
+            unchangedSince?: { readonly size: number; readonly mtimeMs: number },
+            useRememberedPath = false,
+          ) =>
             scanner.readTurnsAfter({
-              driver: ProviderDriverKind.make("claudeAgent"),
-              providerInstanceId: ProviderInstanceId.make("claudeAgent"),
-              providerSessionId: "claude-cached",
+              ...session,
               anchorNativeId: "u1",
               ...(unchangedSince === undefined ? {} : { unchangedSince }),
+              ...(useRememberedPath ? { useRememberedPath } : {}),
             });
+          expect(yield* scanner.peekTranscriptSignature(session)).toEqual(Option.none());
 
           const first = yield* read();
           const signature = "signature" in first ? first.signature : undefined;
           expect(signature).toBeDefined();
 
-          // A newer copy elsewhere is not looked for while the remembered file is unchanged.
+          expect(yield* scanner.peekTranscriptSignature(session)).toEqual(Option.some(signature));
+
+          // A newer copy elsewhere is not looked for while a poll finds the remembered file unchanged.
           yield* writeTranscript({
             filePath: path.join(projects, "-second", "claude-cached.jsonl"),
             contents: `${contents}${contents}`,
             mtimeMs: 3_000_000,
           });
-          expect(yield* read(signature)).toEqual({ _tag: "Unchanged" });
+          expect(yield* read(signature, true)).toEqual({ _tag: "Unchanged" });
 
-          // Once the remembered file is gone, the session is found again, in its new folder.
-          yield* fileSystem.remove(original);
-          expect(yield* read(signature)).toMatchObject({ _tag: "Turns" });
+          // Any other trigger finds the newest copy, wherever Claude continued the session.
+          const newest = yield* read(signature);
+          expect(newest).toMatchObject({ _tag: "Turns" });
+          expect(yield* scanner.peekTranscriptSignature(session)).toEqual(
+            Option.some({ size: Buffer.byteLength(`${contents}${contents}`), mtimeMs: 3_000_000 }),
+          );
+
+          // Once the remembered file is gone, the poll finds the session again.
+          yield* fileSystem.remove(path.join(projects, "-second", "claude-cached.jsonl"));
+          expect(yield* scanner.peekTranscriptSignature(session)).toEqual(Option.none());
+          expect(yield* read(undefined, true)).toMatchObject({ _tag: "Turns" });
         }),
+    );
+
+    it.effect("does not start the session reader when nothing follows the anchor", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const line = (uuid: string, parentUuid: string | null, type: string) =>
+          encodeTranscriptRecord({
+            type,
+            uuid,
+            parentUuid,
+            sessionId: "claude-quiet",
+            cwd: "/work/project",
+            timestamp: "2026-11-20T10:00:00.000Z",
+            message: { role: type, content: "text", stop_reason: "end_turn" },
+          });
+        yield* writeTranscript({
+          filePath: path.join(claudeHomePath, "projects", "-quiet", "claude-quiet.jsonl"),
+          contents: `${line("u1", null, "user")}\n${line("a2", "u1", "assistant")}\n`,
+          mtimeMs: 1_000_000,
+        });
+        const chainDirectories: Array<string | undefined> = [];
+        const scanner = yield* AgentSessionScanner.AgentSessionScanner.pipe(
+          Effect.provide(
+            layerScannerTest({
+              claudeHomePath,
+              codexHomePath,
+              claudeChains: { "claude-quiet": ["u1", "a2"] },
+              claudeChainDirectories: chainDirectories,
+            }),
+          ),
+        );
+        const read = (anchorNativeId: string) =>
+          scanner.readTurnsAfter({
+            driver: ProviderDriverKind.make("claudeAgent"),
+            providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+            providerSessionId: "claude-quiet",
+            anchorNativeId,
+          });
+
+        expect(yield* read("a2")).toMatchObject({
+          _tag: "Turns",
+          turns: [],
+          throughNativeId: "a2",
+          signature: { mtimeMs: 1_000_000 },
+        });
+        expect(chainDirectories).toEqual([]);
+
+        yield* read("u1");
+        expect(chainDirectories).toHaveLength(1);
+      }),
     );
 
     it.effect("lists titles from the head and tail of a transcript larger than the sample", () =>
