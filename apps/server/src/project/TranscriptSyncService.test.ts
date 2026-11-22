@@ -73,6 +73,8 @@ type SeedRun = {
    * one, or `"never-started"` for a run that never reached the provider.
    */
   readonly turn: string;
+  /** Claude names a turn that did not finish with a strong id of its own, not a record's uuid. */
+  readonly turnStrength?: "strong" | "weak";
 };
 
 const seed = Effect.fn("TranscriptSyncService.test.seed")(function* (input: {
@@ -172,7 +174,9 @@ const seed = Effect.fn("TranscriptSyncService.test.seed")(function* (input: {
           nodeId: NodeId.make(`node:${ordinal}`),
           runAttemptId: attemptId,
           nativeTurnRef:
-            run.turn === "no-native-id" ? null : { driver, nativeId: run.turn, strength: "weak" },
+            run.turn === "no-native-id"
+              ? null
+              : { driver, nativeId: run.turn, strength: run.turnStrength ?? "weak" },
           ordinal,
           status: "completed",
           startedAt: now,
@@ -368,6 +372,10 @@ it.effect.each([
     name: "the latest run reached the provider but has no native turn id",
     seeded: { runs: [{ status: "failed", turn: "no-native-id" }] },
   },
+  {
+    name: "the latest run ended with a turn id that names no transcript record",
+    seeded: { runs: [{ status: "failed", turn: "attempt-turn", turnStrength: "strong" }] },
+  },
   { name: "nothing has anchored the thread yet", seeded: { runs: [] } },
   {
     name: "a rollback pins the native conversation head",
@@ -420,25 +428,26 @@ it.effect("does not read a transcript that has not changed since the last sync",
   }).pipe(Effect.provide(layerStores)),
 );
 
-it.effect("lets a trigger that arrives during a sync join it", () =>
+it.effect("serializes triggers for a thread, and the later one finds the file unchanged", () =>
   Effect.gen(function* () {
     yield* seed({ runs: [{ status: "completed", turn: "a-t3" }] });
     const orchestrator = yield* Orchestrator.OrchestratorV2;
     const entered = yield* Deferred.make<void>();
     const release = yield* Deferred.make<void>();
-    let reads = 0;
+    const asked: Array<AgentSessionScanner.TranscriptSignature | undefined> = [];
     const service = yield* TranscriptSyncService.TranscriptSyncService.pipe(
       Effect.provide(
         TranscriptSyncService.layer.pipe(
           Layer.provide(
             Layer.mergeAll(
               Layer.mock(AgentSessionScanner.AgentSessionScanner)({
-                readTurnsAfter: () =>
+                readTurnsAfter: ({ unchangedSince }) =>
                   Effect.gen(function* () {
-                    reads += 1;
+                    asked.push(unchangedSince);
+                    if (unchangedSince !== undefined) return { _tag: "Unchanged" as const };
                     yield* Deferred.succeed(entered, undefined);
                     yield* Deferred.await(release);
-                    return turnsOf("one");
+                    return { ...turnsOf("one"), signature };
                   }),
               }),
               Layer.succeed(Orchestrator.OrchestratorV2, orchestrator),
@@ -453,8 +462,8 @@ it.effect("lets a trigger that arrives during a sync join it", () =>
     const second = yield* Effect.forkChild(service.sync(threadId), { startImmediately: true });
     yield* Deferred.succeed(release, undefined);
 
-    assert.deepEqual([yield* Fiber.join(first), yield* Fiber.join(second)], [1, 1]);
-    assert.equal(reads, 1);
+    assert.deepEqual([yield* Fiber.join(first), yield* Fiber.join(second)], [1, 0]);
+    assert.deepEqual(asked, [undefined, signature]);
   }).pipe(Effect.provide(layerStores)),
 );
 

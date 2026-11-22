@@ -7,8 +7,8 @@ import {
   type ProviderThreadId,
   type ThreadId,
 } from "@t3tools/contracts";
+import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as Context from "effect/Context";
-import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
@@ -40,16 +40,10 @@ const isTerminal = (run: OrchestrationV2Run) =>
   run.status !== "running" &&
   run.status !== "waiting";
 
-// Claude Code names a turn that is still running `turn:<attempt>`; only a finished turn has a uuid.
-const isNativeRecordId = (nativeId: string) => !nativeId.startsWith("turn:");
-
 const make = Effect.gen(function* () {
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const scanner = yield* AgentSessionScanner.AgentSessionScanner;
-  const running = new Map<
-    ThreadId,
-    Deferred.Deferred<number, OrchestrationV2SyncTranscriptTurnsError>
-  >();
+  const locks = yield* KeyedLock.make<ThreadId>();
   // What the last read of each provider thread's transcript saw, so an unchanged file is not read again.
   const lastRead = new Map<
     ProviderThreadId,
@@ -83,8 +77,10 @@ const make = Effect.gen(function* () {
       if (providerTurn === undefined) continue;
       // A turn that ended without a native id, such as a failed or interrupted one, may sit beside
       // output of its own in the transcript, so nothing after it can be told apart.
-      const nativeId = providerTurn.nativeTurnRef?.nativeId;
-      return nativeId != null && isNativeRecordId(nativeId) ? nativeId : null;
+      // Claude gives a finished turn a weak ref holding its last record's uuid; a strong one is
+      // the placeholder of a turn that never finished.
+      const turnRef = providerTurn.nativeTurnRef;
+      return turnRef?.strength === "weak" ? turnRef.nativeId : null;
     }
     const { turnItems } = yield* orchestrator.getThreadRecords(threadId, ["turnItems"], {
       turnItemRunIds: [null],
@@ -167,25 +163,15 @@ const make = Effect.gen(function* () {
     return recorded;
   });
 
-  // A trigger that arrives while a sync of the thread is running takes that sync's answer.
+  // A trigger during a sync waits for it and then finds the transcript unchanged.
   const sync: TranscriptSyncService["Service"]["sync"] = (threadId) =>
-    Effect.suspend(() => {
-      const inFlight = running.get(threadId);
-      if (inFlight !== undefined) return Deferred.await(inFlight);
-      const done = Deferred.makeUnsafe<number, OrchestrationV2SyncTranscriptTurnsError>();
-      running.set(threadId, done);
-      return syncOnce(threadId).pipe(
+    locks
+      .withLock(threadId, syncOnce(threadId))
+      .pipe(
         Effect.mapError(
           (cause) => new OrchestrationV2SyncTranscriptTurnsError({ threadId, cause }),
         ),
-        Effect.onExit((exit) =>
-          Effect.sync(() => {
-            running.delete(threadId);
-            Deferred.doneUnsafe(done, exit);
-          }),
-        ),
       );
-    });
 
   const syncInBackground: TranscriptSyncService["Service"]["syncInBackground"] = (threadId) =>
     sync(threadId).pipe(
