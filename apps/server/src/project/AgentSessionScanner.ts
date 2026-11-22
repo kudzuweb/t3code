@@ -426,8 +426,12 @@ interface ClaudeFields {
   readonly title: string | undefined;
   readonly customTitle: string | null;
   readonly model: string | undefined;
-  /** The newest prompt's turn: whether it has a reply and how Claude's last record in it stopped. */
-  readonly turn: { readonly replied: boolean; readonly stopReason: string | null };
+  /** The newest prompt's turn: its reply, how Claude's last record stopped, and any ending record. */
+  readonly turn: {
+    readonly replied: boolean;
+    readonly stopReason: string | null;
+    readonly ended: boolean;
+  };
 }
 
 const emptyClaudeFields: ClaudeFields = {
@@ -435,25 +439,36 @@ const emptyClaudeFields: ClaudeFields = {
   title: undefined,
   customTitle: null,
   model: undefined,
-  turn: { replied: true, stopReason: "end_turn" },
+  turn: { replied: true, stopReason: "end_turn", ended: false },
 };
+
+// What Claude Code writes when a turn stops without a reply: the user interrupts it, or a local
+// command (`!cmd`, a slash command) prints its output.
+const CLAUDE_TURN_ENDING =
+  /^(?:<(?:local-command-stdout|local-command-stderr|bash-stdout|bash-stderr)>|\[Request interrupted by user(?: for tool use)?\]$)/;
 
 // A record without the field, as older transcripts write them, gives no sign the turn is running.
 const claudeStopReason = (record: DecodedTranscriptRecord): string | null =>
   record.message?.stop_reason === undefined ? "end_turn" : record.message.stop_reason;
 
+/** The one rule for a turn being done, which the import and the sync both apply. */
 const isFinishedClaudeTurn = (turn: ClaudeFields["turn"]) =>
-  turn.replied && isTerminalStopReason(turn.stopReason);
+  turn.ended || (turn.replied && isTerminalStopReason(turn.stopReason));
 
 function foldClaudeTurn(
   turn: ClaudeFields["turn"],
   record: DecodedTranscriptRecord,
 ): ClaudeFields["turn"] {
   if (record.type === "user") {
-    return claudeVisibleText(record).text.length > 0 ? { replied: false, stopReason: null } : turn;
+    if (CLAUDE_TURN_ENDING.test(extractText(record.message?.content)))
+      return { ...turn, ended: true };
+    return claudeVisibleText(record).text.length > 0
+      ? { replied: false, stopReason: null, ended: false }
+      : turn;
   }
   if (record.type !== "assistant") return turn;
   return {
+    ended: turn.ended,
     replied: turn.replied || claudeVisibleText(record).text.length > 0,
     stopReason: claudeStopReason(record),
   };
@@ -618,7 +633,7 @@ export function claudeTurnsAfter(
   const replies: Array<string> = [];
   let open: { userNativeId: string; userText: string; userAt: string } | undefined;
   let lastReply: { nativeId: string; at: string } | undefined;
-  let lastStopReason: string | null = null;
+  let turnState = emptyClaudeFields.turn;
   let throughNativeId = anchorNativeId;
   const closeTurn = () => {
     if (open === undefined) return;
@@ -630,7 +645,6 @@ export function claudeTurnsAfter(
     });
     throughNativeId = lastReply?.nativeId ?? open.userNativeId;
     open = undefined;
-    lastStopReason = null;
     replies.length = 0;
     lastReply = undefined;
   };
@@ -644,8 +658,8 @@ export function claudeTurnsAfter(
     ) {
       continue;
     }
-    // A tool call or a still-streaming block has no terminal stop reason, so text-less records count.
-    if (record.type === "assistant") lastStopReason = claudeStopReason(record);
+    // Text-less records count: a tool call or a block still streaming has no terminal stop reason.
+    turnState = foldClaudeTurn(turnState, record);
     const { text } = claudeVisibleText(record);
     if (text.length === 0) continue;
     const at = normalizeTimestamp(record.timestamp, fallbackTimestamp);
@@ -657,7 +671,7 @@ export function claudeTurnsAfter(
       lastReply = { nativeId: record.uuid, at };
     }
   }
-  if (open !== undefined && replies.length > 0 && isTerminalStopReason(lastStopReason)) closeTurn();
+  if (open !== undefined && isFinishedClaudeTurn(turnState)) closeTurn();
   return { _tag: "Turns", turns, throughNativeId };
 }
 
@@ -2824,9 +2838,21 @@ export const make = Effect.gen(function* () {
     if (transcript === undefined) return { _tag: "NoTranscript" } as const;
 
     const signature = { size: transcript.size, mtimeMs: transcript.mtimeMs };
+    const projectFolder = path.basename(path.dirname(transcript.filePath));
     if (unchangedSince?.size === signature.size && unchangedSince.mtimeMs === signature.mtimeMs) {
       return { _tag: "Unchanged" } as const;
     }
+
+    // Read for the folder the file was found in, so the chain and the records are one session; the
+    // chain comes first, so the file is never behind it.
+    const chain = yield* claudeChain
+      .read({
+        sessionId: providerSessionId,
+        environment: { ...hostEnvironment, CLAUDE_CONFIG_DIR: claudeHome },
+        directory: projectFolder,
+      })
+      .pipe(Effect.mapError(readError));
+    if (chain.length === 0) return { _tag: "NoTranscript" } as const;
 
     const records: Array<DecodedTranscriptRecord> = [];
     let recordBytes = 0;
@@ -2861,17 +2887,6 @@ export const make = Effect.gen(function* () {
       ),
       Effect.mapError(readError),
     );
-    // The chain is read for the project the file came from, so both describe the same session.
-    const chain = yield* claudeChain
-      .read({
-        sessionId: providerSessionId,
-        environment: { ...hostEnvironment, CLAUDE_CONFIG_DIR: claudeHome },
-        ...(records.find((record) => record.cwd !== undefined)?.cwd === undefined
-          ? {}
-          : { directory: records.find((record) => record.cwd !== undefined)!.cwd! }),
-      })
-      .pipe(Effect.mapError(readError));
-    if (chain.length === 0) return { _tag: "NoTranscript" } as const;
     return {
       ...claudeTurnsAfter(records, chain, anchorNativeId, DateTime.formatIso(yield* DateTime.now)),
       signature,

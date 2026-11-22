@@ -1900,8 +1900,8 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
             { userNativeId: "u3", userText: "terminal prompt", assistantText: "terminal reply" },
           ],
         });
-        // The chain comes from the project the file was read from.
-        expect(chainDirectories).toEqual(["/work/project"]);
+        // The chain comes from the project folder the file was found in.
+        expect(chainDirectories).toEqual(["-live"]);
         expect(yield* read("claude-live", "claudeAgent", "nope")).toMatchObject({
           _tag: "AnchorNotFound",
         });
@@ -4487,12 +4487,143 @@ describe("claudeTurnsAfter", () => {
     it("finds an anchor from before the compaction and records what came after it", () => {
       expect(read(replyTwo)).toMatchObject({
         _tag: "Turns",
-        turns: [{ userText: "Reply with exactly: three", assistantText: "three" }],
+        // The `/compact` command that followed is a finished turn of its own.
+        turns: [
+          { userText: "Reply with exactly: three", assistantText: "three" },
+          { userText: "/compact", assistantText: "" },
+        ],
       });
     });
 
     it("still finds an anchor the compaction preserved", () => {
-      expect(read("0ac5a9")).toMatchObject({ _tag: "Turns", turns: [] });
+      expect(read("0ac5a9")).toMatchObject({
+        _tag: "Turns",
+        turns: [{ userText: "/compact" }],
+      });
+    });
+  });
+
+  describe("a turn that ends without a reply", () => {
+    const earlier = [
+      record("u0", null, "user", "earlier"),
+      record("a0", "u0", "assistant", "done"),
+    ];
+    const read = (entries: ReadonlyArray<ReturnType<typeof record>>) =>
+      AgentSessionScanner.claudeTurnsAfter(
+        [...earlier, ...entries],
+        ["u0", "a0", ...entries.map((entry) => entry.uuid)],
+        "a0",
+        fallback,
+      );
+    const plain = (uuid: string, parentUuid: string, text: string) => ({
+      ...record(uuid, parentUuid, "user", text),
+      message: { role: "user", content: [{ type: "text", text }] },
+    });
+
+    it("counts an interrupted turn as finished", () => {
+      const interrupted = [
+        record("u1", "a0", "user", "run the build"),
+        record("a2", "u1", "assistant", "Running it.", { stopReason: "tool_use" }),
+        plain("u3", "a2", "[Request interrupted by user for tool use]"),
+      ];
+      expect(read(interrupted)).toMatchObject({
+        _tag: "Turns",
+        throughNativeId: "a2",
+        turns: [{ userNativeId: "u1", assistantText: "Running it." }],
+      });
+    });
+
+    it("counts a shell command or a slash command as finished once its output follows", () => {
+      const commands = [
+        record("u1", "a0", "user", "<bash-input>ls</bash-input>"),
+        record("u2", "u1", "user", "<bash-stdout>README.md</bash-stdout>"),
+        record(
+          "u3",
+          "u2",
+          "user",
+          "<command-name>/context</command-name><command-args></command-args>",
+        ),
+        record("u4", "u3", "user", "<local-command-stdout>Context usage</local-command-stdout>"),
+      ];
+      expect(read(commands)).toMatchObject({
+        _tag: "Turns",
+        throughNativeId: "u3",
+        turns: [
+          { userText: "!ls", assistantNativeId: null, assistantText: "" },
+          { userText: "/context", assistantNativeId: null, assistantText: "" },
+        ],
+      });
+      expect(read(commands.slice(0, 1))).toMatchObject({ turns: [] });
+    });
+
+    it("keeps such a turn in an import", () => {
+      const texts = (entries: ReadonlyArray<unknown>) =>
+        AgentSessionScanner.parseAgentSessionTranscript({
+          contents: [...earlier, ...entries].map((entry) => JSON.stringify(entry)).join("\n"),
+          source: "claudeAgent",
+          providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+          fallbackSessionId: "claude-session",
+          lastActiveAtMs: Date.parse("2026-11-20T12:00:00.000Z"),
+        })?.messages.map((message) => message.text);
+      expect(
+        texts([
+          record("u1", "a0", "user", "run the build"),
+          record("a2", "u1", "assistant", "Running it.", { stopReason: "tool_use" }),
+          plain("u3", "a2", "[Request interrupted by user for tool use]"),
+        ]),
+      ).toEqual(["earlier", "done", "run the build", "Running it."]);
+      expect(
+        texts([
+          record("u1", "a0", "user", "<bash-input>ls</bash-input>"),
+          record("u2", "u1", "user", "<bash-stdout>README.md</bash-stdout>"),
+        ]),
+      ).toEqual(["earlier", "done", "!ls"]);
+    });
+  });
+
+  describe("a session compacted twice", () => {
+    const turn = (
+      user: string,
+      parent: string | null,
+      reply: string,
+      text: string,
+    ): Array<ReturnType<typeof record>> => [
+      record(user, parent, "user", `prompt ${text}`),
+      record(reply, user, "assistant", `reply ${text}`),
+    ];
+    const boundary = (uuid: string, tailUuid: string) => ({
+      type: "system",
+      subtype: "compact_boundary",
+      uuid,
+      parentUuid: null,
+      logicalParentUuid: "never-written",
+      compactMetadata: { preservedSegment: { tailUuid } },
+    });
+    const summary = (uuid: string, parent: string) => ({
+      ...record(uuid, parent, "user", "summary"),
+      isCompactSummary: true,
+    });
+    const history = [
+      ...turn("u1", null, "a2", "one"),
+      ...turn("u3", "a2", "a4", "two"),
+      boundary("b1", "a4"),
+      summary("s1", "b1"),
+      ...turn("u5", "s1", "a6", "three"),
+      boundary("b2", "a6"),
+      summary("s2", "b2"),
+      ...turn("u7", "s2", "a8", "four"),
+    ];
+    // The session reader's live chain after the second compaction.
+    const live = ["s2", "u7", "a8"];
+
+    it("finds an anchor from before either compaction", () => {
+      const userIds = (anchor: string) => {
+        const read = AgentSessionScanner.claudeTurnsAfter(history, live, anchor, fallback);
+        return read._tag === "Turns" ? read.turns.map((entry) => entry.userNativeId) : read;
+      };
+      expect(userIds("a2")).toEqual(["u3", "u5", "u7"]);
+      expect(userIds("a4")).toEqual(["u5", "u7"]);
+      expect(userIds("a6")).toEqual(["u7"]);
     });
   });
 
