@@ -17,3 +17,16 @@ export const agentSessionImport = createEnvironmentRpcCommand(connectionAtomRunt
   label: "environment-data:agent-sessions:import",
   tag: WS_METHODS.agentSessionsImport,
 });
+
+export const agentSessionList = createEnvironmentRpcQueryAtomFamily(connectionAtomRuntime, {
+  label: "environment-data:agent-sessions:list",
+  tag: WS_METHODS.agentSessionsList,
+  // Sessions change while the user works in a terminal.
+  staleTimeMs: 10_000,
+  idleTtlMs: 60_000,
+});
+
+export const agentSessionImportOne = createEnvironmentRpcCommand(connectionAtomRuntime, {
+  label: "environment-data:agent-sessions:import-one",
+  tag: WS_METHODS.agentSessionsImportOne,
+});
