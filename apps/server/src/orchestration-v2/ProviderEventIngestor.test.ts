@@ -911,6 +911,228 @@ layer("ProviderEventIngestorV2", (it) => {
   );
 
   it.effect(
+    "judges a recorded terminal turn by its native user entry when a provider rewinds",
+    () =>
+      Effect.gen(function* () {
+        const now = yield* DateTime.now;
+        const eventSink = yield* EventSink.EventSinkV2;
+        const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+        const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const threadEvent = yield* threadCreatedEvent(now);
+        const threadId = threadEvent.threadId;
+        const providerSessionId = yield* idAllocator.allocate.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+        });
+        const providerThreadId = idAllocator.derive.providerThread({
+          driver: CODEX_DRIVER,
+          nativeThreadId: "terminal-rewound-thread",
+        });
+        const eventId = () => idAllocator.allocate.event({ threadId });
+        const runFields = (ordinal: number, status: "completed" | "running") => ({
+          id: RunId.make(`run:terminal-rewind:${ordinal}`),
+          threadId,
+          ordinal,
+          providerInstanceId: modelSelection.instanceId,
+          modelSelection,
+          providerThreadId,
+          userMessageId: MessageId.make(`message:terminal-rewind:${ordinal}`),
+          requestedAt: now,
+          startedAt: now,
+          completedAt: status === "running" ? null : now,
+          checkpointId: null,
+          contextHandoffId: null,
+        });
+        // A run made in T3: its provider turn carries the native user entry the turn started at.
+        const seedT3Run = Effect.fnUntraced(function* (ordinal: number, nativeTurnId: string) {
+          const run = runFields(ordinal, "completed");
+          const attemptId = RunAttemptId.make(`attempt:terminal-rewind:${ordinal}`);
+          const nodeId = NodeId.make(`node:terminal-rewind:${ordinal}`);
+          const providerTurnId = ProviderTurnId.make(`provider-turn:terminal-rewind:${ordinal}`);
+          yield* eventSink.write({
+            events: [
+              {
+                id: yield* eventId(),
+                type: "run.created",
+                threadId,
+                occurredAt: now,
+                payload: {
+                  ...run,
+                  rootNodeId: nodeId,
+                  activeAttemptId: attemptId,
+                  status: "completed",
+                },
+              },
+              {
+                id: yield* eventId(),
+                type: "run-attempt.created",
+                threadId,
+                occurredAt: now,
+                payload: {
+                  id: attemptId,
+                  runId: run.id,
+                  attemptOrdinal: 1,
+                  rootNodeId: nodeId,
+                  providerInstanceId: modelSelection.instanceId,
+                  providerThreadId,
+                  providerTurnId,
+                  reason: "initial",
+                  status: "completed",
+                  startedAt: now,
+                  completedAt: now,
+                },
+              },
+              {
+                id: yield* eventId(),
+                type: "provider-turn.updated",
+                threadId,
+                occurredAt: now,
+                payload: {
+                  id: providerTurnId,
+                  providerThreadId,
+                  nodeId,
+                  runAttemptId: attemptId,
+                  nativeTurnRef: {
+                    driver: CODEX_DRIVER,
+                    nativeId: nativeTurnId,
+                    strength: "strong",
+                  },
+                  ordinal,
+                  status: "completed",
+                  startedAt: now,
+                  completedAt: now,
+                },
+              },
+            ],
+          });
+          return run.id;
+        });
+        // A run recorded from the transcript: no attempt or provider turn, and its user item names the
+        // native entry the turn started at.
+        const seedRecordedRun = Effect.fnUntraced(function* (ordinal: number, userEntryId: string) {
+          const run = runFields(ordinal, "completed");
+          yield* eventSink.write({
+            events: [
+              {
+                id: yield* eventId(),
+                type: "run.created",
+                threadId,
+                occurredAt: now,
+                payload: {
+                  ...run,
+                  rootNodeId: null,
+                  activeAttemptId: null,
+                  status: "completed",
+                  recordedFrom: "transcript",
+                },
+              },
+              {
+                id: yield* eventId(),
+                type: "turn-item.updated",
+                threadId,
+                runId: run.id,
+                occurredAt: now,
+                payload: {
+                  id: TurnItemId.make(`turn-item:terminal-rewind:${ordinal}`),
+                  threadId,
+                  runId: run.id,
+                  nodeId: null,
+                  providerThreadId,
+                  providerTurnId: null,
+                  nativeItemRef: {
+                    driver: CODEX_DRIVER,
+                    nativeId: userEntryId,
+                    strength: "strong",
+                  },
+                  parentItemId: null,
+                  ordinal: 0,
+                  status: "completed",
+                  title: null,
+                  startedAt: now,
+                  completedAt: now,
+                  updatedAt: now,
+                  createdBy: "user",
+                  creationSource: "server",
+                  type: "user_message",
+                  messageId: run.userMessageId,
+                  inputIntent: "turn_start",
+                  text: "From the terminal",
+                  attachments: [],
+                },
+              },
+            ],
+          });
+          return run.id;
+        });
+
+        yield* eventSink.write({ events: [threadEvent] });
+        const keptT3 = yield* seedT3Run(1, "kept-turn");
+        const abandonedT3 = yield* seedT3Run(2, "abandoned-turn");
+        const keptTerminal = yield* seedRecordedRun(3, "kept-terminal-entry");
+        const abandonedTerminal = yield* seedRecordedRun(4, "abandoned-terminal-entry");
+        const reportingRunId = RunId.make("run:terminal-rewind:5");
+        yield* eventSink.write({
+          events: [
+            {
+              id: yield* eventId(),
+              type: "run.created",
+              threadId,
+              occurredAt: now,
+              payload: {
+                ...runFields(5, "running"),
+                rootNodeId: null,
+                activeAttemptId: null,
+                status: "running",
+              },
+            },
+          ],
+        });
+
+        yield* ingestor.ingestNormalized({
+          providerSessionId,
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+          runId: reportingRunId,
+          event: {
+            type: "provider_thread.updated",
+            driver: CODEX_DRIVER,
+            providerThread: {
+              id: providerThreadId,
+              driver: CODEX_DRIVER,
+              providerInstanceId: modelSelection.instanceId,
+              providerSessionId,
+              appThreadId: threadId,
+              ownerNodeId: null,
+              nativeThreadRef: {
+                driver: CODEX_DRIVER,
+                nativeId: "terminal-rewound-thread",
+                strength: "strong",
+              },
+              nativeConversationHeadRef: null,
+              status: "idle",
+              firstRunOrdinal: 1,
+              lastRunOrdinal: 5,
+              handoffIds: [],
+              forkedFrom: null,
+              createdAt: now,
+              updatedAt: now,
+            },
+            retainedNativeTurnIds: ["kept-turn", "kept-terminal-entry"],
+          },
+        });
+
+        const projection = yield* projectionStore.getThreadProjection(threadId);
+        assert.deepEqual(
+          [keptT3, abandonedT3, keptTerminal, abandonedTerminal].map(
+            (runId) => projection.runs.find((run) => run.id === runId)?.status,
+          ),
+          ["completed", "rolled_back", "completed", "rolled_back"],
+        );
+      }),
+  );
+
+  it.effect(
     "treats successful provider terminal markers as non-persisted orchestration control signals",
     () =>
       Effect.gen(function* () {
