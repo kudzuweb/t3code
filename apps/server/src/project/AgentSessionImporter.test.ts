@@ -322,7 +322,7 @@ const makeImporter = Effect.fn(function* (
 });
 
 it.effect(
-  "ignores owned sessions, including archived and deleted threads, but imports other instances and unowned sessions",
+  "ignores sessions owned by live or archived threads, but imports other instances, unowned sessions and sessions whose thread was deleted",
   () =>
     Effect.gen(function* () {
       const projections = yield* ProjectionStore.ProjectionStoreV2;
@@ -364,8 +364,8 @@ it.effect(
         unownedPi,
       ]);
 
-      expect(yield* importer.run).toEqual({ importedCount: 3, skippedCount: 0 });
-      for (const source of [active, archived, deleted, ownedPi]) {
+      expect(yield* importer.run).toEqual({ importedCount: 4, skippedCount: 0 });
+      for (const source of [active, archived, ownedPi]) {
         const threadId = importId(source);
         expect(yield* Effect.option(projections.getThread(threadId))).toEqual(Option.none());
         expect(yield* events.read({ threadId }).pipe(Stream.runCollect)).toEqual([]);
@@ -382,8 +382,15 @@ it.effect(
             "event" in stored ? [stored.event.threadId] : [],
           ),
         ),
-      ).toEqual(new Set([importId(otherInstance), importId(unowned), importId(unownedPi)]));
-      for (const source of [otherInstance, unowned, unownedPi]) {
+      ).toEqual(
+        new Set([
+          importId(otherInstance),
+          importId(unowned),
+          importId(unownedPi),
+          importId(deleted),
+        ]),
+      );
+      for (const source of [otherInstance, unowned, unownedPi, deleted]) {
         const threadId = importId(source);
         const records = yield* projections.getThreadRecords(threadId, [
           "messages",
@@ -1248,19 +1255,64 @@ describe("importing one session", () => {
     }).pipe(Effect.scoped, Effect.provide(persistence)),
   );
 
-  it.effect("marks a session held only by a deleted thread and refuses to import it", () =>
+  const deleteThread = (threadId: ThreadId) =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`UPDATE orchestration_v2_projection_threads SET deleted_at = ${timestamp} WHERE thread_id = ${threadId}`;
+    });
+
+  it.effect("reimports a session whose only thread was deleted as a new thread", () =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const source = candidate(CLAUDE_MODEL_SELECTION, claudeId, "claudeAgent");
+      const importer = yield* makeImporter([source]);
+      expect(yield* importer.run).toEqual({ importedCount: 1, skippedCount: 0 });
+      yield* deleteThread(importId(source));
+      expect((yield* importer.listSessions).sessions[0]?.threadId).toBeNull();
+
+      const reimported = yield* importer.importSession(source);
+      expect(reimported.imported).toBe(true);
+      expect(reimported.threadId).not.toBe(importId(source));
+      const records = yield* projections.getThreadRecords(reimported.threadId, [
+        "messages",
+        "providerThreads",
+      ]);
+      expect(records.thread.deletedAt).toBeNull();
+      expect(records.messages.map((message) => message.text)).toEqual(["Fix it", "Fixed"]);
+      expect(records.providerThreads[0]?.nativeThreadRef?.nativeId).toBe(claudeId);
+      expect((yield* importer.listSessions).sessions[0]?.threadId).toBe(reimported.threadId);
+      expect(yield* importer.importSession(source)).toEqual({
+        threadId: reimported.threadId,
+        imported: false,
+      });
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+  );
+
+  it.effect("keeps one live thread when two reimports of a deleted session reach the write", () =>
     Effect.gen(function* () {
       const source = candidate(CLAUDE_MODEL_SELECTION, claudeId, "claudeAgent");
-      const owner = yield* seedOwner(source, "deleted");
-      const importer = yield* makeImporter([source]);
-      expect(yield* Effect.flip(importer.importSession(source))).toMatchObject({
-        _tag: "AgentSessionDeletedThreadError",
-        threadId: owner,
-      });
-      expect((yield* importer.listSessions).sessions[0]).toMatchObject({
-        threadId: null,
-        heldBy: "deleted",
-      });
+      const bothChecked = yield* Deferred.make<void>();
+      let gated = false;
+      let arrived = 0;
+      const importer = yield* makeImporter(
+        [source],
+        Effect.suspend(() => {
+          if (!gated) return Effect.void;
+          arrived += 1;
+          return (arrived === 2 ? Deferred.succeed(bothChecked, undefined) : Effect.void).pipe(
+            Effect.andThen(Deferred.await(bothChecked)),
+          );
+        }),
+      );
+      yield* importer.run;
+      yield* deleteThread(importId(source));
+      gated = true;
+      const results = yield* Effect.all(
+        [importer.importSession(source), importer.importSession(source)],
+        { concurrency: 2 },
+      );
+      expect(results[0].threadId).toBe(results[1].threadId);
+      expect(results.filter((result) => result.imported)).toHaveLength(1);
     }).pipe(Effect.scoped, Effect.provide(persistence)),
   );
 

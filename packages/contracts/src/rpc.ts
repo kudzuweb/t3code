@@ -114,7 +114,6 @@ import {
 } from "./workspaceFolders.ts";
 import {
   AgentSessionImportInput,
-  AgentSessionDeletedThreadError,
   AgentSessionImportOneInput,
   AgentSessionImportOneResult,
   AgentSessionImportProjectChangedError,
@@ -1740,7 +1739,6 @@ const WsAgentSessionsImportOneRpc = Rpc.make(WS_METHODS.agentSessionsImportOne, 
   error: Schema.Union([
     AgentSessionImportProjectNotFoundError,
     AgentSessionNotFoundError,
-    AgentSessionDeletedThreadError,
     AgentSessionUnreadableError,
     AgentSessionUnresumableSessionError,
     AgentSessionScanError,

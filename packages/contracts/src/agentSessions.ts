@@ -120,19 +120,6 @@ export class AgentSessionNotFoundError extends Schema.TaggedError<AgentSessionNo
   }
 }
 
-export class AgentSessionDeletedThreadError extends Schema.TaggedError<AgentSessionDeletedThreadError>()(
-  "AgentSessionDeletedThreadError",
-  {
-    projectId: ProjectId,
-    providerSessionId: Schema.String,
-    threadId: ThreadId,
-  },
-) {
-  override get message(): string {
-    return `Session '${this.providerSessionId}' belongs to thread '${this.threadId}', which was deleted.`;
-  }
-}
-
 export class AgentSessionUnreadableError extends Schema.TaggedError<AgentSessionUnreadableError>()(
   "AgentSessionUnreadableError",
   {
@@ -166,8 +153,6 @@ export const AgentSessionSummary = Schema.Struct({
   worktree: Schema.NullOr(AgentSessionWorktree),
   /** The T3 thread that already holds this session. */
   threadId: Schema.NullOr(ThreadId),
-  /** Set when the only thread that held this session was deleted, so it cannot be opened again. */
-  heldBy: Schema.optionalKey(Schema.Literal("deleted")),
 });
 export type AgentSessionSummary = typeof AgentSessionSummary.Type;
 

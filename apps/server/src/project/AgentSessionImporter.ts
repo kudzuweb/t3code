@@ -6,7 +6,6 @@ import {
   isRuntimeModeAbove,
   AgentSessionImportProjectChangedError,
   AgentSessionImportProjectNotFoundError,
-  AgentSessionDeletedThreadError,
   AgentSessionNotFoundError,
   AgentSessionUnreadableError,
   AgentSessionScanError,
@@ -15,6 +14,7 @@ import {
   MessageId,
   ProjectId,
   ProviderDriverKind,
+  ProviderThreadId,
   ThreadId,
   TurnItemId,
   type AgentSessionImportInput,
@@ -128,7 +128,6 @@ interface SessionKey {
 interface SessionOwner {
   readonly threadId: ThreadId;
   readonly projectId: string;
-  readonly deleted: boolean;
 }
 
 function importThreadIdOf(providerInstanceId: ProviderInstanceId, providerSessionId: string) {
@@ -289,12 +288,13 @@ const make = Effect.gen(function* () {
     readonly projectId: ProjectId;
     readonly workspaceRoot: string;
     readonly runtimeMode: RuntimeMode;
+    // Set when the deterministic ids belong to a deleted thread.
+    readonly ids?: { readonly threadId: ThreadId; readonly providerThreadId: ProviderThreadId };
   }) {
     const { outcome, projectId, workspaceRoot, runtimeMode } = input;
     const source = outcome.source;
-    const threadId = ThreadId.make(
-      `import:${source.providerInstanceId}:${source.providerSessionId}`,
-    );
+    const threadId =
+      input.ids?.threadId ?? importThreadIdOf(source.providerInstanceId, source.providerSessionId);
     const thread = outcome.thread;
     if (
       thread.source === "claudeAgent" &&
@@ -355,11 +355,13 @@ const make = Effect.gen(function* () {
     }
 
     const model = thread.model ?? DEFAULT_MODEL_BY_PROVIDER[driver] ?? DEFAULT_MODEL;
-    const providerThreadId = idAllocator.derive.providerThread({
-      driver,
-      providerInstanceId: thread.providerInstanceId,
-      nativeThreadId,
-    });
+    const providerThreadId =
+      input.ids?.providerThreadId ??
+      idAllocator.derive.providerThread({
+        driver,
+        providerInstanceId: thread.providerInstanceId,
+        nativeThreadId,
+      });
     const createdAt = dateTime(thread.createdAt);
     const updatedAt = dateTime(thread.updatedAt);
     const appThread: OrchestrationV2AppThread = {
@@ -577,23 +579,24 @@ const make = Effect.gen(function* () {
     const rows = yield* sql<{
       readonly thread_id: string;
       readonly project_id: string;
-      readonly deleted_at: string | null;
       readonly provider_instance_id: string | null;
       readonly native_id: string | null;
     }>`
       SELECT thread.thread_id AS thread_id,
              thread.project_id AS project_id,
-             thread.deleted_at AS deleted_at,
              provider.provider_instance_id AS provider_instance_id,
              json_extract(provider.payload_json, '$.nativeThreadRef.nativeId') AS native_id
       FROM orchestration_v2_projection_threads AS thread
       LEFT JOIN orchestration_v2_projection_provider_threads AS provider
         ON provider.thread_id = thread.thread_id
-      WHERE thread.thread_id IN (
-          SELECT value FROM json_each(${encodeStringList(keys.map((key) => key.importThreadId))})
-        )
-        OR json_extract(provider.payload_json, '$.nativeThreadRef.nativeId') IN (
-          SELECT value FROM json_each(${encodeStringList(keys.map((key) => key.nativeThreadId))})
+      WHERE thread.deleted_at IS NULL
+        AND (
+          thread.thread_id IN (
+            SELECT value FROM json_each(${encodeStringList(keys.map((key) => key.importThreadId))})
+          )
+          OR json_extract(provider.payload_json, '$.nativeThreadRef.nativeId') IN (
+            SELECT value FROM json_each(${encodeStringList(keys.map((key) => key.nativeThreadId))})
+          )
         )
       ORDER BY thread.updated_at DESC
     `.pipe(
@@ -606,19 +609,53 @@ const make = Effect.gen(function* () {
           (row.provider_instance_id === key.providerInstanceId &&
             row.native_id === key.nativeThreadId),
       );
-      const holder =
-        holders.find((row) => row.deleted_at === null && row.project_id === projectId) ??
-        holders.find((row) => row.deleted_at === null) ??
-        holders[0];
+      const holder = holders.find((row) => row.project_id === projectId) ?? holders[0];
       if (holder !== undefined) {
         owners.set(sessionKeyId(key), {
           threadId: ThreadId.make(holder.thread_id),
           projectId: holder.project_id,
-          deleted: holder.deleted_at !== null,
         });
       }
     }
     return owners;
+  });
+
+  // A deleted thread keeps its rows, so a session whose only thread was deleted gets new ids.
+  const importIds = Effect.fn("AgentSessionImporter.importIds")(function* (
+    projectId: ProjectId,
+    found: ImportableThread,
+  ) {
+    const { source, thread } = found;
+    const threadId = importThreadIdOf(source.providerInstanceId, source.providerSessionId);
+    const providerThreadId = idAllocator.derive.providerThread({
+      driver: ProviderDriverKind.make(thread.source),
+      providerInstanceId: thread.providerInstanceId,
+      nativeThreadId: nativeThreadIdOf(source),
+    });
+    const taken = yield* sql<{ readonly taken: number }>`
+      SELECT 1 AS taken
+      WHERE EXISTS (
+          SELECT 1 FROM orchestration_v2_projection_threads WHERE thread_id = ${threadId}
+        )
+        OR EXISTS (
+          SELECT 1 FROM orchestration_v2_projection_provider_threads
+          WHERE provider_thread_id = ${providerThreadId}
+        )
+    `.pipe(
+      Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-owners", cause })),
+    );
+    if (taken.length === 0) return { threadId, providerThreadId };
+    const freshThreadId = yield* idAllocator.allocate
+      .thread({ projectId })
+      .pipe(
+        Effect.mapError(
+          (cause) => new AgentSessionScanError({ operation: "import-session", cause }),
+        ),
+      );
+    return {
+      threadId: freshThreadId,
+      providerThreadId: ProviderThreadId.make(`${providerThreadId}:reimport:${freshThreadId}`),
+    };
   });
 
   const listSessions = Effect.fn("AgentSessionImporter.listSessions")(function* (
@@ -640,8 +677,7 @@ const make = Effect.gen(function* () {
           title,
           lastActiveAt,
           worktree,
-          threadId: owner === undefined || owner.deleted ? null : owner.threadId,
-          ...(owner?.deleted === true ? { heldBy: "deleted" as const } : {}),
+          threadId: owner?.threadId ?? null,
         };
       },
     );
@@ -668,16 +704,7 @@ const make = Effect.gen(function* () {
       };
       const owner = (yield* findOwners(input.projectId, [key])).get(sessionKeyId(key));
       if (owner === undefined) return null;
-      if (scope === "project" && (owner.deleted || owner.projectId !== input.projectId)) {
-        return null;
-      }
-      if (owner.deleted) {
-        return yield* new AgentSessionDeletedThreadError({
-          projectId: input.projectId,
-          providerSessionId: input.providerSessionId,
-          threadId: owner.threadId,
-        });
-      }
+      if (scope === "project" && owner.projectId !== input.projectId) return null;
       return { threadId: owner.threadId, imported: false } satisfies AgentSessionImportOneResult;
     });
     const alreadyHeld = yield* held(input.providerSessionId, "project");
@@ -706,16 +733,18 @@ const make = Effect.gen(function* () {
       (nativeThreadId === input.providerSessionId ? null : yield* held(nativeThreadId, "any"));
     if (heldAfterScan !== null) return heldAfterScan;
 
+    const ids = yield* importIds(input.projectId, found);
     const settled = yield* importThread({
       outcome: found,
       projectId: input.projectId,
       workspaceRoot: project.workspaceRoot,
       runtimeMode: yield* importRuntimeMode(input.projectId, project),
+      ids,
     }).pipe(
       Effect.map((outcome) =>
         outcome === "imported"
           ? ({
-              threadId: importThreadIdOf(input.providerInstanceId, input.providerSessionId),
+              threadId: ids.threadId,
               imported: true,
             } satisfies AgentSessionImportOneResult)
           : new AgentSessionUnresumableSessionError({
