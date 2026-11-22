@@ -119,6 +119,7 @@ const TranscriptMessage = Schema.Struct({
   role: Schema.optional(Schema.String),
   content: Schema.optional(Schema.Union([Schema.String, Schema.Array(TranscriptContentBlock)])),
   model: Schema.optional(Schema.String),
+  stop_reason: Schema.optional(Schema.NullOr(Schema.String)),
 });
 
 const CodexTurnMetadata = Schema.Struct({
@@ -499,6 +500,14 @@ function claudeVisibleText(record: DecodedTranscriptRecord) {
   return record.type === "user" ? claudeUserText(text) : { text, titleText: text };
 }
 
+// Claude Code writes the API's stop reason on each assistant record; `tool_use` and null mean the
+// turn is still going.
+const isTerminalStopReason = (stopReason: string | null) =>
+  stopReason === "end_turn" ||
+  stopReason === "max_tokens" ||
+  stopReason === "stop_sequence" ||
+  stopReason === "refusal";
+
 export type TurnsAfterAnchor =
   | {
       readonly _tag: "Turns";
@@ -512,7 +521,7 @@ export type TurnsAfterAnchor =
 
 /**
  * The turns after the anchor on Claude's live `chain` of uuids. A uuid the transcript has no
- * record for yet ends the walk, and a last prompt with no reply is left for the next read.
+ * record for yet ends the walk, and a last turn not yet finished is left for the next read.
  */
 export function claudeTurnsAfter(
   records: ReadonlyArray<DecodedTranscriptRecord>,
@@ -532,6 +541,7 @@ export function claudeTurnsAfter(
   const replies: Array<string> = [];
   let open: { userNativeId: string; userText: string; userAt: string } | undefined;
   let lastReply: { nativeId: string; at: string } | undefined;
+  let lastStopReason: string | null = null;
   let throughNativeId = anchorNativeId;
   const closeTurn = () => {
     if (open === undefined) return;
@@ -543,6 +553,7 @@ export function claudeTurnsAfter(
     });
     throughNativeId = lastReply?.nativeId ?? open.userNativeId;
     open = undefined;
+    lastStopReason = null;
     replies.length = 0;
     lastReply = undefined;
   };
@@ -556,6 +567,8 @@ export function claudeTurnsAfter(
     ) {
       continue;
     }
+    // A tool call or a still-streaming block has no terminal stop reason, so text-less records count.
+    if (record.type === "assistant") lastStopReason = record.message?.stop_reason ?? null;
     const { text } = claudeVisibleText(record);
     if (text.length === 0) continue;
     const at = normalizeTimestamp(record.timestamp, fallbackTimestamp);
@@ -567,7 +580,7 @@ export function claudeTurnsAfter(
       lastReply = { nativeId: record.uuid, at };
     }
   }
-  if (open !== undefined && replies.length > 0) closeTurn();
+  if (open !== undefined && replies.length > 0 && isTerminalStopReason(lastStopReason)) closeTurn();
   return { _tag: "Turns", turns, throughNativeId };
 }
 

@@ -1846,7 +1846,7 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
             parentUuid,
             sessionId: "claude-live",
             timestamp: "2026-11-20T10:00:00.000Z",
-            message: { role: type, content },
+            message: { role: type, content, stop_reason: "end_turn" },
           });
         const transcript = (...lines: ReadonlyArray<string>) => `${lines.join("\n")}\n`;
         const live = transcript(
@@ -4313,15 +4313,26 @@ describe("claudeTurnsAfter", () => {
     parentUuid: string | null,
     type: "user" | "assistant",
     text: string,
-    extra: { readonly isSidechain?: boolean; readonly isMeta?: boolean } = {},
-  ) => ({
-    type,
-    uuid,
-    parentUuid,
-    timestamp: `2026-11-20T10:00:${uuid.slice(1).padStart(2, "0")}.000Z`,
-    message: { role: type, content: text },
-    ...extra,
-  });
+    extra: {
+      readonly isSidechain?: boolean;
+      readonly isMeta?: boolean;
+      readonly stopReason?: string | null;
+    } = {},
+  ) => {
+    const { stopReason = "end_turn", ...flags } = extra;
+    return {
+      type,
+      uuid,
+      parentUuid,
+      timestamp: `2026-11-20T10:00:${uuid.slice(1).padStart(2, "0")}.000Z`,
+      message: {
+        role: type,
+        content: text,
+        ...(type === "assistant" ? { stop_reason: stopReason } : {}),
+      },
+      ...flags,
+    };
+  };
   const records = [
     record("u1", null, "user", "first prompt"),
     record("a2", "u1", "assistant", "first reply"),
@@ -4409,6 +4420,27 @@ describe("claudeTurnsAfter", () => {
     expect(userIds(AgentSessionScanner.claudeTurnsAfter(records, lagging, "a2", fallback))).toEqual(
       ["u5"],
     );
+  });
+
+  it("records a last turn only once it has finished", () => {
+    const base = ["u1", "a2", "u3", "a4"];
+    const turn = (stopReason: string | null) => [
+      record("u1", null, "user", "prompt"),
+      record("a2", "u1", "assistant", "done"),
+      record("u3", "a2", "user", "next prompt"),
+      record("a4", "u3", "assistant", "reply so far", { stopReason }),
+    ];
+    const midReply = AgentSessionScanner.claudeTurnsAfter(turn("tool_use"), base, "a2", fallback);
+    expect(midReply).toEqual({ _tag: "Turns", throughNativeId: "a2", turns: [] });
+    const streaming = AgentSessionScanner.claudeTurnsAfter(turn(null), base, "a2", fallback);
+    expect(streaming).toEqual(midReply);
+
+    const finished = AgentSessionScanner.claudeTurnsAfter(turn("end_turn"), base, "a2", fallback);
+    expect(finished).toMatchObject({
+      _tag: "Turns",
+      throughNativeId: "a4",
+      turns: [{ userNativeId: "u3", assistantText: "reply so far" }],
+    });
   });
 
   it("picks up exactly the turns written after what the import consumed", () => {
