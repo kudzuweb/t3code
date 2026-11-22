@@ -602,3 +602,54 @@ it.effect("reads again after a dispatch the thread refused, though the file is u
     assert.deepEqual(asked, [undefined, undefined]);
   }).pipe(Effect.provide(layerStores)),
 );
+
+it.effect("syncs a batch of threads, and one that fails does not stop the others", () =>
+  Effect.gen(function* () {
+    yield* seed({ runs: [{ status: "completed", turn: "a-t3" }] });
+    const sync = yield* makeService({ "a-t3": turnsOf("one") });
+
+    const recorded = yield* sync.service.syncMany([ThreadId.make("thread:missing"), threadId]);
+
+    assert.equal(recorded, 1);
+    assert.deepEqual(sync.anchors, ["a-t3"]);
+  }).pipe(Effect.provide(layerStores)),
+);
+
+it.effect("a batch reads an unchanged transcript no further than its signature", () =>
+  Effect.gen(function* () {
+    yield* seed({ runs: [{ status: "completed", turn: "a-t3" }] });
+    const sync = yield* makeService({
+      "a-t3": { _tag: "Turns", turns: [], throughNativeId: "a-t3" },
+    });
+
+    assert.equal(yield* sync.service.syncMany([threadId]), 0);
+    assert.equal(yield* sync.service.syncMany([threadId]), 0);
+
+    assert.deepEqual(sync.asked, [
+      { anchor: "a-t3", unchangedSince: undefined },
+      { anchor: "a-t3", unchangedSince: signature },
+    ]);
+  }).pipe(Effect.provide(layerStores)),
+);
+
+it.effect(
+  "a thread synced without being open has a shell whose latest run is the terminal turn",
+  () =>
+    Effect.gen(function* () {
+      const projections = yield* seed({ runs: [{ status: "completed", turn: "a-t3" }] });
+      const sync = yield* makeService({ "a-t3": turnsOf("one") });
+      const shellOf = Effect.map(projections.getShellSnapshot(), (snapshot) =>
+        snapshot.threads.find((thread) => thread.id === threadId),
+      );
+      const before = yield* shellOf;
+
+      yield* sync.service.syncMany([threadId]);
+
+      const after = yield* shellOf;
+      assert.notEqual(after?.latestRunId, before?.latestRunId);
+      assert.equal(
+        after?.latestRunCompletedAt && DateTime.toEpochMillis(after.latestRunCompletedAt),
+        Date.parse(terminalTurn.assistantAt ?? ""),
+      );
+    }).pipe(Effect.provide(layerStores)),
+);

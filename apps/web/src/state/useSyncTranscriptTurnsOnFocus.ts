@@ -29,7 +29,7 @@ export function useSyncTranscriptTurnsOnFocus(ref: ScopedThreadRef | null): void
 
   const sync = useStableCallback(() => {
     if (ref !== null) {
-      void run({ environmentId: ref.environmentId, input: { threadId: ref.threadId } });
+      void run({ environmentId: ref.environmentId, input: { threadIds: [ref.threadId] } });
     }
   });
 

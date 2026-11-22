@@ -30,10 +30,17 @@ export class TranscriptSyncService extends Context.Service<
     readonly sync: (
       threadId: ThreadId,
     ) => Effect.Effect<number, OrchestrationV2SyncTranscriptTurnsError>;
+    /**
+     * Syncs each thread, a few at a time, and returns the total recorded. A thread that fails is
+     * logged and the rest still sync.
+     */
+    readonly syncMany: (threadIds: ReadonlyArray<ThreadId>) => Effect.Effect<number>;
     /** Starts a sync and returns at once; a failure is logged, never raised. */
     readonly syncInBackground: (threadId: ThreadId) => Effect.Effect<void>;
   }
 >()("t3/project/TranscriptSyncService") {}
+
+const SYNC_MANY_CONCURRENCY = 4;
 
 const providerTurnEnded = (turn: OrchestrationV2ProviderTurn) =>
   turn.status === "completed" ||
@@ -204,7 +211,21 @@ const make = Effect.gen(function* () {
       Effect.asVoid,
     );
 
-  return TranscriptSyncService.of({ sync, syncInBackground });
+  const syncMany: TranscriptSyncService["Service"]["syncMany"] = (threadIds) =>
+    Effect.forEach(
+      new Set(threadIds),
+      (threadId) =>
+        sync(threadId).pipe(
+          Effect.catch((error) =>
+            Effect.logWarning("Transcript sync failed", { threadId, cause: error.cause }).pipe(
+              Effect.as(0),
+            ),
+          ),
+        ),
+      { concurrency: SYNC_MANY_CONCURRENCY },
+    ).pipe(Effect.map((counts) => counts.reduce((total, count) => total + count, 0)));
+
+  return TranscriptSyncService.of({ sync, syncMany, syncInBackground });
 });
 
 export const layer = Layer.effect(TranscriptSyncService, make);
