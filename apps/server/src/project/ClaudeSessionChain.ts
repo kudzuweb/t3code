@@ -31,8 +31,8 @@ export const layer = Layer.effect(
     const path = yield* Path.Path;
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     return ClaudeSessionChain.of({
-      read: ({ sessionId, environment, directory }) =>
-        runClaudeWorker({
+      read: Effect.fn("ClaudeSessionChain.read")(function* ({ sessionId, environment, directory }) {
+        return yield* runClaudeWorker({
           method: "getSessionUuids",
           sessionId,
           environment,
@@ -41,7 +41,8 @@ export const layer = Layer.effect(
           Effect.flatMap(decodeChain),
           Effect.provideService(Path.Path, path),
           Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-        ),
+        );
+      }),
     });
   }),
 );
