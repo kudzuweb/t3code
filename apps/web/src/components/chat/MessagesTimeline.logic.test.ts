@@ -26,6 +26,7 @@ import {
 import type { TurnDiffSummary } from "../../types";
 import { describe, expect, it } from "vite-plus/test";
 import { MessageId, RunId } from "@t3tools/contracts";
+import type { HandoffTimelineRun } from "@t3tools/client-runtime/handoff";
 import {
   computeStableMessagesTimelineRows,
   deriveMessagesTimelineRows,
@@ -5187,12 +5188,13 @@ describe("subagent continued by a later turn", () => {
 });
 
 describe("handoffRunsSignature", () => {
-  const run = {
+  const claude = ProviderInstanceId.make("claude");
+  const run: HandoffTimelineRun = {
     id: RunId.make("run-1"),
     ordinal: 1,
-    providerInstanceId: "claude",
-    modelSelection: { instanceId: "claude", model: "haiku" },
-  } as never;
+    providerInstanceId: claude,
+    modelSelection: { instanceId: claude, model: "haiku" },
+  };
 
   it("tells a run recorded from a terminal transcript from the same run made in T3", () => {
     expect(handoffRunsSignature([{ ...run, recordedFrom: "transcript" }])).not.toBe(
