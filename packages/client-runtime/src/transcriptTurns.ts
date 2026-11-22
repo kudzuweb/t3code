@@ -84,3 +84,28 @@ export async function syncTranscriptTurnsOnFocus(input: {
     }),
   );
 }
+
+export interface WindowActivity {
+  readonly visible: boolean;
+  readonly focused: boolean;
+}
+
+/**
+ * Decides which return events to the window send a sync. One return can fire both a focus and a
+ * visibility event, so a return sends once until the user has left again.
+ */
+export function createReturnSyncGate() {
+  let sentSinceLeaving = false;
+  return {
+    /** Call on every activity change; leaving the window re-arms the next return. */
+    observe(activity: WindowActivity): void {
+      if (!activity.visible || !activity.focused) sentSinceLeaving = false;
+    },
+    /** Call on a focus or visibility event; true when it should send. */
+    returned(activity: WindowActivity): boolean {
+      if (!activity.visible || !activity.focused || sentSinceLeaving) return false;
+      sentSinceLeaving = true;
+      return true;
+    },
+  };
+}

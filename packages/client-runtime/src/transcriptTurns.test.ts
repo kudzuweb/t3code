@@ -5,6 +5,7 @@ import { EnvironmentId, SYNC_TRANSCRIPT_TURNS_MAX_THREADS, ThreadId } from "@t3t
 import {
   findTerminalRun,
   isTerminalRun,
+  createReturnSyncGate,
   planTranscriptSyncBatches,
   syncTranscriptTurnsOnFocus,
 } from "./transcriptTurns.ts";
@@ -122,5 +123,40 @@ describe("syncTranscriptTurnsOnFocus", () => {
     await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(2));
     answers[1]!();
     await done;
+  });
+});
+
+describe("createReturnSyncGate", () => {
+  const looking = { visible: true, focused: true };
+
+  it("sends when the user returns to a visible, focused window", () => {
+    expect(createReturnSyncGate().returned(looking)).toBe(true);
+  });
+
+  it("sends nothing while the tab is hidden or the window is not focused", () => {
+    const gate = createReturnSyncGate();
+    expect(gate.returned({ visible: false, focused: false })).toBe(false);
+    expect(gate.returned({ visible: true, focused: false })).toBe(false);
+  });
+
+  it("sends once when one return fires both the focus and the visibility event", () => {
+    const gate = createReturnSyncGate();
+    expect(gate.returned({ visible: true, focused: false })).toBe(false);
+    expect(gate.returned(looking)).toBe(true);
+    expect(gate.returned(looking)).toBe(false);
+  });
+
+  it("sends again after the user leaves", () => {
+    const gate = createReturnSyncGate();
+    expect(gate.returned(looking)).toBe(true);
+    gate.observe({ visible: false, focused: false });
+    expect(gate.returned(looking)).toBe(true);
+  });
+
+  it("does not re-arm while the user is still looking", () => {
+    const gate = createReturnSyncGate();
+    expect(gate.returned(looking)).toBe(true);
+    gate.observe(looking);
+    expect(gate.returned(looking)).toBe(false);
   });
 });
