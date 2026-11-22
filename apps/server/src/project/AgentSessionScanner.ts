@@ -13,6 +13,7 @@ import {
   type AgentSessionProjectCandidate,
   type AgentSessionProjectGit,
   type AgentSessionScanResult,
+  type OrchestrationV2TranscriptTurn,
   type ProviderInstanceConfig,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
@@ -129,6 +130,9 @@ const TranscriptRecord = Schema.Struct({
   id: Schema.optional(Schema.String),
   parentId: Schema.optional(Schema.NullOr(Schema.String)),
   name: Schema.optional(Schema.String),
+  // Claude records form a tree through uuid/parentUuid.
+  uuid: Schema.optional(Schema.String),
+  parentUuid: Schema.optional(Schema.NullOr(Schema.String)),
   timestamp: Schema.optional(Schema.String),
   cwd: Schema.optional(Schema.String),
   sessionId: Schema.optional(Schema.String),
@@ -207,6 +211,8 @@ export interface AgentSessionThreadMessage {
   readonly role: "user" | "assistant";
   readonly text: string;
   readonly createdAt: string;
+  /** The provider's id for the record this message came from, when the record has one. */
+  readonly nativeId?: string;
 }
 
 export interface AgentSessionThread {
@@ -265,6 +271,13 @@ export class AgentSessionScanner extends Context.Service<
     readonly findProjectSession: (
       input: AgentSessionKey & { readonly workspaceRoot: string },
     ) => Effect.Effect<AgentSessionRecentThread, AgentSessionScanError>;
+    /** What the session gained after `anchorNativeId`. Only Claude sessions can be read so far. */
+    readonly readTurnsAfter: (
+      input: AgentSessionKey & {
+        readonly driver: ProviderDriverKind;
+        readonly anchorNativeId: string;
+      },
+    ) => Effect.Effect<TurnsAfterAnchor, AgentSessionScanError>;
   }
 >()("t3/project/AgentSessionScanner") {}
 
@@ -485,6 +498,90 @@ function claudeVisibleText(record: DecodedTranscriptRecord) {
   return record.type === "user" ? claudeUserText(text) : { text, titleText: text };
 }
 
+export type TurnsAfterAnchor =
+  | {
+      readonly _tag: "Turns";
+      readonly turns: ReadonlyArray<OrchestrationV2TranscriptTurn>;
+      /** The last record the turns consumed; the anchor itself when there are none. */
+      readonly throughNativeId: string;
+    }
+  | { readonly _tag: "AnchorNotFound" }
+  | { readonly _tag: "NoTranscript" }
+  | { readonly _tag: "Unsupported" };
+
+/**
+ * The turns after the anchor on the main chain, which skips branches a rewind abandoned. A last
+ * prompt with no reply yet is left for the next read.
+ */
+export function claudeTurnsAfter(
+  records: ReadonlyArray<DecodedTranscriptRecord>,
+  anchorNativeId: string,
+  fallbackTimestamp: string,
+): TurnsAfterAnchor {
+  const byUuid = new Map(
+    records.flatMap((record) =>
+      record.uuid === undefined ? [] : [[record.uuid, record] as const],
+    ),
+  );
+  const leaf = records.findLast(
+    (record) =>
+      record.uuid !== undefined &&
+      record.isSidechain !== true &&
+      (record.type === "user" || record.type === "assistant"),
+  );
+  const chain: Array<DecodedTranscriptRecord> = [];
+  for (
+    let record: DecodedTranscriptRecord | undefined = leaf;
+    record !== undefined && chain.length <= byUuid.size;
+    record = record.parentUuid ? byUuid.get(record.parentUuid) : undefined
+  ) {
+    chain.push(record);
+  }
+  chain.reverse();
+  const anchorIndex = chain.findIndex((record) => record.uuid === anchorNativeId);
+  if (anchorIndex === -1) return { _tag: "AnchorNotFound" };
+
+  const turns: Array<OrchestrationV2TranscriptTurn> = [];
+  const replies: Array<string> = [];
+  let open: { userNativeId: string; userText: string; userAt: string } | undefined;
+  let lastReply: { nativeId: string; at: string } | undefined;
+  let throughNativeId = anchorNativeId;
+  const closeTurn = () => {
+    if (open === undefined) return;
+    turns.push({
+      ...open,
+      assistantNativeId: lastReply?.nativeId ?? null,
+      assistantText: replies.join("\n\n"),
+      assistantAt: lastReply?.at ?? null,
+    });
+    throughNativeId = lastReply?.nativeId ?? open.userNativeId;
+    open = undefined;
+    replies.length = 0;
+    lastReply = undefined;
+  };
+  for (const record of chain.slice(anchorIndex + 1)) {
+    if (
+      record.uuid === undefined ||
+      isHiddenClaudeRecord(record) ||
+      (record.type !== "user" && record.type !== "assistant")
+    ) {
+      continue;
+    }
+    const { text } = claudeVisibleText(record);
+    if (text.length === 0) continue;
+    const at = normalizeTimestamp(record.timestamp, fallbackTimestamp);
+    if (record.type === "user") {
+      closeTurn();
+      open = { userNativeId: record.uuid, userText: text, userAt: at };
+    } else if (open !== undefined) {
+      replies.push(text);
+      lastReply = { nativeId: record.uuid, at };
+    }
+  }
+  if (open !== undefined && replies.length > 0) closeTurn();
+  return { _tag: "Turns", turns, throughNativeId };
+}
+
 /** Saved titles can be the raw markup of a user turn, such as the command that opened the session. */
 function claudeTitle(title: string | undefined): string | undefined {
   const trimmed = title?.trim();
@@ -700,6 +797,7 @@ function parseAgentSessionRecords(
         role: record.message.role,
         text,
         createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
+        ...(record.id === undefined ? {} : { nativeId: record.id }),
         codexResponseUser: false,
       });
       continue;
@@ -719,6 +817,7 @@ function parseAgentSessionRecords(
           role: record.type,
           text,
           createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
+          ...(record.uuid === undefined ? {} : { nativeId: record.uuid }),
           codexResponseUser: false,
         },
         titleText,
@@ -776,10 +875,15 @@ function parseAgentSessionRecords(
     if (record.payload.role === "user" && hasMatchingCodexEventInTurn(extractedText)) {
       continue;
     }
+    const codexNativeId =
+      record.payload.role === "user"
+        ? codexTurnId(record.payload.internal_chat_message_metadata_passthrough)
+        : null;
     retainMessage({
       role: record.payload.role,
       text: extractedText,
       createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
+      ...(codexNativeId === null ? {} : { nativeId: codexNativeId }),
       codexResponseUser: record.payload.role === "user",
     });
   }
@@ -2577,11 +2681,98 @@ export const make = Effect.gen(function* () {
     return Option.getOrElse(found, (): AgentSessionRecentThread => ({ _tag: "Skipped" }));
   });
 
+  const readTurnsAfter: AgentSessionScanner["Service"]["readTurnsAfter"] = Effect.fn(
+    "AgentSessionScanner.readTurnsAfter",
+  )(function* ({ driver, providerInstanceId, providerSessionId, anchorNativeId }) {
+    if (driver !== "claudeAgent") return { _tag: "Unsupported" } as const;
+    const readError = (cause: unknown) =>
+      new AgentSessionScanError({ operation: "read-transcript", cause });
+    const settings = yield* serverSettings.getSettings.pipe(
+      Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-settings", cause })),
+    );
+    const instance =
+      settings.providerInstances[providerInstanceId] ??
+      (providerInstanceId === "claudeAgent" ? { driver } : undefined);
+    const claudeSettings =
+      instance === undefined ? Option.none() : decodeClaudeSettings(instance.config ?? {});
+    if (instance === undefined || Option.isNone(claudeSettings)) {
+      return { _tag: "NoTranscript" } as const;
+    }
+    const configuredHome = instance.environment?.findLast(
+      (variable) => variable.name === "CLAUDE_CONFIG_DIR",
+    )?.value;
+    const projectsDir = path.join(
+      resolveClaudeConfigDir(
+        claudeSettings.value.homePath,
+        typeof configuredHome === "string" ? configuredHome : hostEnvironment.CLAUDE_CONFIG_DIR,
+      ),
+      "projects",
+    );
+    // The same session id can sit in several project folders; the newest copy is the live one.
+    const projectFolders = yield* listDirectory(projectsDir);
+    const copies = yield* Effect.forEach(projectFolders, (folder) => {
+      const filePath = path.join(projectsDir, folder, `${providerSessionId}.jsonl`);
+      return statOption(filePath).pipe(
+        Effect.map((info) =>
+          Option.isSome(info) && info.value.type === "File"
+            ? [
+                {
+                  filePath,
+                  mtimeMs: Option.match(info.value.mtime, {
+                    onNone: () => 0,
+                    onSome: (mtime) => mtime.getTime(),
+                  }),
+                },
+              ]
+            : [],
+        ),
+      );
+    });
+    const transcript = copies.flat().toSorted((left, right) => right.mtimeMs - left.mtimeMs)[0];
+    if (transcript === undefined) return { _tag: "NoTranscript" } as const;
+
+    const records: Array<DecodedTranscriptRecord> = [];
+    let recordBytes = 0;
+    const reserve = (bytes: number) => {
+      recordBytes += bytes;
+      if (recordBytes > MAX_IMPORT_HISTORY_BYTES) {
+        throw new TranscriptJsonLimitError({
+          message: "Transcript record exceeds the 32 MiB memory budget",
+        });
+      }
+    };
+    yield* fileSystem.stream(transcript.filePath).pipe(
+      Stream.decodeText,
+      Stream.splitLines,
+      Stream.runForEach((line) =>
+        Effect.try({
+          try: () => {
+            if (line.length === 0) return;
+            recordBytes = 0;
+            const reader = createTranscriptJsonReader(reserve, selectTranscriptPath);
+            reader.write(line);
+            const decoded = decodeTranscriptValue(reader.finish());
+            if (Option.isSome(decoded) && decoded.value.uuid !== undefined) {
+              records.push(decoded.value);
+            }
+            if (records.length > MAX_IMPORT_RECORDS) {
+              throw new TranscriptJsonLimitError({ message: "Transcript has too many records" });
+            }
+          },
+          catch: readError,
+        }),
+      ),
+      Effect.mapError(readError),
+    );
+    return claudeTurnsAfter(records, anchorNativeId, DateTime.formatIso(yield* DateTime.now));
+  });
+
   return AgentSessionScanner.of({
     scan,
     recentThreads,
     listProjectSessions,
     findProjectSession,
+    readTurnsAfter,
   });
 });
 

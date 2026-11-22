@@ -87,7 +87,13 @@ export type AgentSessionImportResult = typeof AgentSessionImportResult.Type;
 export class AgentSessionScanError extends Schema.TaggedError<AgentSessionScanError>()(
   "AgentSessionScanError",
   {
-    operation: Schema.Literals(["read-settings", "read-projects", "read-owners", "import-session"]),
+    operation: Schema.Literals([
+      "read-settings",
+      "read-projects",
+      "read-owners",
+      "read-transcript",
+      "import-session",
+    ]),
     cause: Schema.Defect(),
   },
 ) {
