@@ -40,6 +40,7 @@ import * as ServerConfig from "../config.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.ts";
+import * as ClaudeSessionChain from "./ClaudeSessionChain.ts";
 import { resolveCodexHomeLayout } from "../provider/Drivers/CodexHomeLayout.ts";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
@@ -510,11 +511,12 @@ export type TurnsAfterAnchor =
   | { readonly _tag: "Unsupported" };
 
 /**
- * The turns after the anchor on the main chain, which skips branches a rewind abandoned. A last
- * prompt with no reply yet is left for the next read.
+ * The turns after the anchor on Claude's live `chain` of uuids. A uuid the transcript has no
+ * record for yet ends the walk, and a last prompt with no reply is left for the next read.
  */
 export function claudeTurnsAfter(
   records: ReadonlyArray<DecodedTranscriptRecord>,
+  chain: ReadonlyArray<string>,
   anchorNativeId: string,
   fallbackTimestamp: string,
 ): TurnsAfterAnchor {
@@ -523,22 +525,7 @@ export function claudeTurnsAfter(
       record.uuid === undefined ? [] : [[record.uuid, record] as const],
     ),
   );
-  const leaf = records.findLast(
-    (record) =>
-      record.uuid !== undefined &&
-      record.isSidechain !== true &&
-      (record.type === "user" || record.type === "assistant"),
-  );
-  const chain: Array<DecodedTranscriptRecord> = [];
-  for (
-    let record: DecodedTranscriptRecord | undefined = leaf;
-    record !== undefined && chain.length <= byUuid.size;
-    record = record.parentUuid ? byUuid.get(record.parentUuid) : undefined
-  ) {
-    chain.push(record);
-  }
-  chain.reverse();
-  const anchorIndex = chain.findIndex((record) => record.uuid === anchorNativeId);
+  const anchorIndex = chain.indexOf(anchorNativeId);
   if (anchorIndex === -1) return { _tag: "AnchorNotFound" };
 
   const turns: Array<OrchestrationV2TranscriptTurn> = [];
@@ -559,7 +546,9 @@ export function claudeTurnsAfter(
     replies.length = 0;
     lastReply = undefined;
   };
-  for (const record of chain.slice(anchorIndex + 1)) {
+  for (const uuid of chain.slice(anchorIndex + 1)) {
+    const record = byUuid.get(uuid);
+    if (record === undefined) break;
     if (
       record.uuid === undefined ||
       isHiddenClaudeRecord(record) ||
@@ -1081,6 +1070,7 @@ export const make = Effect.gen(function* () {
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const projectStore = yield* ProjectStore.ProjectStoreV2;
   const runtimes = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+  const claudeChain = yield* ClaudeSessionChain.ClaudeSessionChain;
   const baseDir = path.resolve(serverConfig.baseDir);
   const worktreesDir = path.resolve(serverConfig.worktreesDir);
   const platform = yield* HostProcess.Platform;
@@ -2701,13 +2691,11 @@ export const make = Effect.gen(function* () {
     const configuredHome = instance.environment?.findLast(
       (variable) => variable.name === "CLAUDE_CONFIG_DIR",
     )?.value;
-    const projectsDir = path.join(
-      resolveClaudeConfigDir(
-        claudeSettings.value.homePath,
-        typeof configuredHome === "string" ? configuredHome : hostEnvironment.CLAUDE_CONFIG_DIR,
-      ),
-      "projects",
+    const claudeHome = resolveClaudeConfigDir(
+      claudeSettings.value.homePath,
+      typeof configuredHome === "string" ? configuredHome : hostEnvironment.CLAUDE_CONFIG_DIR,
     );
+    const projectsDir = path.join(claudeHome, "projects");
     // The same session id can sit in several project folders; the newest copy is the live one.
     const projectFolders = yield* listDirectory(projectsDir);
     const copies = yield* Effect.forEach(projectFolders, (folder) => {
@@ -2730,6 +2718,14 @@ export const make = Effect.gen(function* () {
     });
     const transcript = copies.flat().toSorted((left, right) => right.mtimeMs - left.mtimeMs)[0];
     if (transcript === undefined) return { _tag: "NoTranscript" } as const;
+
+    const chain = yield* claudeChain
+      .read({
+        sessionId: providerSessionId,
+        environment: { ...hostEnvironment, CLAUDE_CONFIG_DIR: claudeHome },
+      })
+      .pipe(Effect.mapError(readError));
+    if (chain.length === 0) return { _tag: "NoTranscript" } as const;
 
     const records: Array<DecodedTranscriptRecord> = [];
     let recordBytes = 0;
@@ -2764,7 +2760,12 @@ export const make = Effect.gen(function* () {
       ),
       Effect.mapError(readError),
     );
-    return claudeTurnsAfter(records, anchorNativeId, DateTime.formatIso(yield* DateTime.now));
+    return claudeTurnsAfter(
+      records,
+      chain,
+      anchorNativeId,
+      DateTime.formatIso(yield* DateTime.now),
+    );
   });
 
   return AgentSessionScanner.of({
@@ -2777,5 +2778,6 @@ export const make = Effect.gen(function* () {
 });
 
 export const layer = Layer.effect(AgentSessionScanner, make).pipe(
+  Layer.provide(ClaudeSessionChain.layer),
   Layer.provide(ProcessRunner.layer),
 );

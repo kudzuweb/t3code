@@ -36,6 +36,7 @@ import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as AgentSessionScanner from "./AgentSessionScanner.ts";
+import * as ClaudeSessionChain from "./ClaudeSessionChain.ts";
 
 const makeProjectShell = (workspaceRoot: string): OrchestrationProjectShell => ({
   id: ProjectId.make("project-1"),
@@ -67,6 +68,8 @@ interface ScannerTestInput {
     readonly sources: ReadonlyArray<AgentSessionImportSource>;
   };
   readonly processRunner?: Layer.Layer<ProcessRunner.ProcessRunner>;
+  /** What the Claude session reader reports as the live chain of uuids, by session id. */
+  readonly claudeChains?: Readonly<Record<string, ReadonlyArray<string>>>;
 }
 
 const layerRuntimeRepository = (imported: ScannerTestInput["importedTranscripts"]) =>
@@ -90,50 +93,54 @@ const layerRuntimeRepository = (imported: ScannerTestInput["importedTranscripts"
   });
 
 const layerScannerTest = (input: ScannerTestInput) =>
-  (input.processRunner === undefined
-    ? AgentSessionScanner.layer
-    : Layer.effect(AgentSessionScanner.AgentSessionScanner, AgentSessionScanner.make).pipe(
-        Layer.provide(input.processRunner),
-      )
-  ).pipe(
-    Layer.provide(
-      Layer.mergeAll(
-        ServerSettings.layerTest({
-          providerInstances: {
-            [ProviderInstanceId.make("claudeAgent")]: {
-              driver: ProviderDriverKind.make("claudeAgent"),
-              config: { homePath: input.claudeHomePath },
-            },
-            [ProviderInstanceId.make("codex")]: {
-              driver: ProviderDriverKind.make("codex"),
-              config: { homePath: input.codexHomePath },
-            },
-            // Keeps the default Pi instance off the developer's real ~/.pi.
-            [ProviderInstanceId.make("pi")]: {
-              driver: ProviderDriverKind.make("pi"),
-              enabled: true,
-              environment: [
-                {
-                  name: "PI_CODING_AGENT_DIR",
-                  value: input.piAgentDir ?? `${input.claudeHomePath}/pi-agent`,
-                  sensitive: false,
-                },
-                { name: "PI_CODING_AGENT_SESSION_DIR", value: "", sensitive: false },
-              ],
-              config: {},
-            },
-            ...input.providerInstances,
-          },
+  Layer.effect(AgentSessionScanner.AgentSessionScanner, AgentSessionScanner.make)
+    .pipe(
+      Layer.provide(input.processRunner ?? ProcessRunner.layer),
+      Layer.provide(
+        Layer.succeed(ClaudeSessionChain.ClaudeSessionChain, {
+          read: ({ sessionId }) => Effect.succeed(input.claudeChains?.[sessionId] ?? []),
         }),
-        ServerConfig.layerTest(
-          input.claudeHomePath,
-          input.configBaseDir ?? { prefix: "t3code-scanner-config-" },
-        ),
-        layerProjectStore(input.importedWorkspaceRoots ?? []),
-        layerRuntimeRepository(input.importedTranscripts),
       ),
-    ),
-  );
+    )
+    .pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          ServerSettings.layerTest({
+            providerInstances: {
+              [ProviderInstanceId.make("claudeAgent")]: {
+                driver: ProviderDriverKind.make("claudeAgent"),
+                config: { homePath: input.claudeHomePath },
+              },
+              [ProviderInstanceId.make("codex")]: {
+                driver: ProviderDriverKind.make("codex"),
+                config: { homePath: input.codexHomePath },
+              },
+              // Keeps the default Pi instance off the developer's real ~/.pi.
+              [ProviderInstanceId.make("pi")]: {
+                driver: ProviderDriverKind.make("pi"),
+                enabled: true,
+                environment: [
+                  {
+                    name: "PI_CODING_AGENT_DIR",
+                    value: input.piAgentDir ?? `${input.claudeHomePath}/pi-agent`,
+                    sensitive: false,
+                  },
+                  { name: "PI_CODING_AGENT_SESSION_DIR", value: "", sensitive: false },
+                ],
+                config: {},
+              },
+              ...input.providerInstances,
+            },
+          }),
+          ServerConfig.layerTest(
+            input.claudeHomePath,
+            input.configBaseDir ?? { prefix: "t3code-scanner-config-" },
+          ),
+          layerProjectStore(input.importedWorkspaceRoots ?? []),
+          layerRuntimeRepository(input.importedTranscripts),
+        ),
+      ),
+    );
 
 const runScan = (input: ScannerTestInput) =>
   Effect.gen(function* () {
@@ -1861,7 +1868,13 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
           mtimeMs: 1_000_000,
         });
         const scanner = yield* AgentSessionScanner.AgentSessionScanner.pipe(
-          Effect.provide(layerScannerTest({ claudeHomePath, codexHomePath })),
+          Effect.provide(
+            layerScannerTest({
+              claudeHomePath,
+              codexHomePath,
+              claudeChains: { "claude-live": ["u1", "a2", "u3", "a4"] },
+            }),
+          ),
         );
         const read = (providerSessionId: string, driver: string, anchorNativeId: string) =>
           scanner.readTurnsAfter({
@@ -4309,7 +4322,7 @@ describe("claudeTurnsAfter", () => {
     message: { role: type, content: text },
     ...extra,
   });
-  const chain = [
+  const records = [
     record("u1", null, "user", "first prompt"),
     record("a2", "u1", "assistant", "first reply"),
     // A subagent line and a meta line share the file but are not conversation.
@@ -4328,10 +4341,24 @@ describe("claudeTurnsAfter", () => {
     record("a10", "a9", "assistant", "third reply, part two"),
     record("u11", "a10", "user", "fourth prompt, not answered yet"),
   ];
+  // What Claude's session reader lists as the live conversation.
+  const live = ["u1", "a2", "u4", "u5", "a6", "a7", "u8", "a9", "a10", "u11"];
+  const userIds = (read: AgentSessionScanner.TurnsAfterAnchor) =>
+    read._tag === "Turns" ? read.turns.map((entry) => entry.userNativeId) : read;
+  const importOf = (count: number) =>
+    AgentSessionScanner.parseAgentSessionTranscript({
+      contents: records
+        .slice(0, count)
+        .map((entry) => JSON.stringify(entry))
+        .join("\n"),
+      source: "claudeAgent",
+      providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+      fallbackSessionId: "claude-session",
+      lastActiveAtMs: Date.parse("2026-11-20T12:00:00.000Z"),
+    });
 
   it("returns the turns after the anchor, without hidden records or a prompt still waiting for its reply", () => {
-    const result = AgentSessionScanner.claudeTurnsAfter(chain, "a2", fallback);
-    expect(result).toEqual({
+    expect(AgentSessionScanner.claudeTurnsAfter(records, live, "a2", fallback)).toEqual({
       _tag: "Turns",
       throughNativeId: "a10",
       turns: [
@@ -4356,53 +4383,44 @@ describe("claudeTurnsAfter", () => {
   });
 
   it("reports no turns, and keeps the anchor, when nothing new has a reply", () => {
-    expect(AgentSessionScanner.claudeTurnsAfter(chain, "a10", fallback)).toEqual({
+    expect(AgentSessionScanner.claudeTurnsAfter(records, live, "a10", fallback)).toEqual({
       _tag: "Turns",
       throughNativeId: "a10",
       turns: [],
     });
   });
 
-  it("does not find an anchor that a rewind left on an abandoned branch", () => {
-    const rewound = [...chain, record("u12", "u1", "user", "a different second prompt")];
-    expect(AgentSessionScanner.claudeTurnsAfter(rewound, "a7", fallback)).toEqual({
-      _tag: "AnchorNotFound",
-    });
-    expect(AgentSessionScanner.claudeTurnsAfter(chain, "missing", fallback)).toEqual({
-      _tag: "AnchorNotFound",
-    });
+  it("follows the session reader's chain, not a branch a rewind left in the file", () => {
+    const withAbandonedBranch = [
+      ...records,
+      record("u12", "a2", "user", "abandoned prompt"),
+      record("a13", "u12", "assistant", "abandoned reply"),
+    ];
+    expect(
+      userIds(AgentSessionScanner.claudeTurnsAfter(withAbandonedBranch, live, "a2", fallback)),
+    ).toEqual(["u5", "u8"]);
+    expect(
+      AgentSessionScanner.claudeTurnsAfter(withAbandonedBranch, live, "a13", fallback),
+    ).toEqual({ _tag: "AnchorNotFound" });
+  });
+
+  it("stops at a uuid the file has not caught up to and leaves the rest for the next read", () => {
+    const lagging = ["u1", "a2", "u5", "a6", "a7", "not-written-yet", "u8", "a9"];
+    expect(userIds(AgentSessionScanner.claudeTurnsAfter(records, lagging, "a2", fallback))).toEqual(
+      ["u5"],
+    );
   });
 
   it("picks up exactly the turns written after what the import consumed", () => {
-    const imported = AgentSessionScanner.parseAgentSessionTranscript({
-      contents: chain
-        .slice(0, 2)
-        .map((entry) => JSON.stringify(entry))
-        .join("\n"),
-      source: "claudeAgent",
-      providerInstanceId: ProviderInstanceId.make("claudeAgent"),
-      fallbackSessionId: "claude-session",
-      lastActiveAtMs: Date.parse("2026-11-20T12:00:00.000Z"),
-    });
-    const anchor = imported?.messages.at(-1)?.nativeId ?? "";
-
-    const read = AgentSessionScanner.claudeTurnsAfter(chain, anchor, fallback);
-
-    expect(read._tag === "Turns" ? read.turns.map((entry) => entry.userNativeId) : read).toEqual([
+    const anchor = importOf(2)?.messages.at(-1)?.nativeId ?? "";
+    expect(userIds(AgentSessionScanner.claudeTurnsAfter(records, live, anchor, fallback))).toEqual([
       "u5",
       "u8",
     ]);
   });
 
   it("carries each record's uuid through the import as its native id", () => {
-    const thread = AgentSessionScanner.parseAgentSessionTranscript({
-      contents: chain.map((entry) => JSON.stringify(entry)).join("\n"),
-      source: "claudeAgent",
-      providerInstanceId: ProviderInstanceId.make("claudeAgent"),
-      fallbackSessionId: "claude-session",
-      lastActiveAtMs: Date.parse("2026-11-20T12:00:00.000Z"),
-    });
-    expect(thread?.messages.map((message) => message.nativeId)).toEqual([
+    expect(importOf(records.length)?.messages.map((message) => message.nativeId)).toEqual([
       "u1",
       "a2",
       "u5",

@@ -1475,7 +1475,7 @@ const claudeConfigDirOf = (
 
 // The SDK reads CLAUDE_CONFIG_DIR from process.env. Isolate custom homes in a
 // worker so concurrent providers keep the server's environment.
-const runClaudeWorker = Effect.fn("runClaudeWorker")(function* (input: {
+export const runClaudeWorker = Effect.fn("runClaudeWorker")(function* (input: {
   readonly method: "forkSession" | "getSessionMessages";
   readonly sessionId: string;
   readonly options?: ForkSessionOptions;
