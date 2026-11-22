@@ -292,6 +292,16 @@ export class AgentSessionScanner extends Context.Service<
     readonly peekTranscriptSignature: (
       input: AgentSessionKey & { readonly driver: ProviderDriverKind },
     ) => Effect.Effect<Option.Option<TranscriptSignature>, AgentSessionScanError>;
+    /**
+     * The signature of the session's newest file, found by looking (or, with `useRememberedPath`,
+     * by the file found last time), and remembered for later checks.
+     */
+    readonly locateTranscript: (
+      input: AgentSessionKey & {
+        readonly driver: ProviderDriverKind;
+        readonly useRememberedPath?: boolean;
+      },
+    ) => Effect.Effect<Option.Option<TranscriptSignature>, AgentSessionScanError>;
     /** What the session gained after `anchorNativeId`. Only Claude sessions can be read so far. */
     readonly readTurnsAfter: (
       input: AgentSessionKey & {
@@ -2857,6 +2867,38 @@ export const make = Effect.gen(function* () {
     return (yield* statTranscript(rememberedPath))[0];
   });
 
+  // The same session id can sit in several project folders; the newest copy is the live one.
+  const discoverTranscript = Effect.fn("AgentSessionScanner.discoverTranscript")(function* (
+    projectsDir: string,
+    cacheKey: string,
+    providerSessionId: string,
+  ) {
+    const projectFolders = yield* listDirectory(projectsDir);
+    const copies = yield* Effect.forEach(projectFolders, (folder) =>
+      statTranscript(path.join(projectsDir, folder, `${providerSessionId}.jsonl`)),
+    );
+    const transcript = copies.flat().toSorted((left, right) => right.mtimeMs - left.mtimeMs)[0];
+    if (transcript === undefined) transcriptPaths.delete(cacheKey);
+    else transcriptPaths.set(cacheKey, transcript.filePath);
+    return transcript;
+  });
+
+  const locateTranscript: AgentSessionScanner["Service"]["locateTranscript"] = Effect.fn(
+    "AgentSessionScanner.locateTranscript",
+  )(function* ({ driver, providerInstanceId, providerSessionId, useRememberedPath }) {
+    if (!supportsTranscriptSync(driver)) return Option.none();
+    const projectsDir = yield* claudeProjectsDir(driver, providerInstanceId);
+    if (Option.isNone(projectsDir)) return Option.none();
+    const cacheKey = `${providerInstanceId}\0${providerSessionId}`;
+    const found =
+      (useRememberedPath === true
+        ? yield* rememberedTranscript(projectsDir.value, cacheKey)
+        : undefined) ?? (yield* discoverTranscript(projectsDir.value, cacheKey, providerSessionId));
+    return found === undefined
+      ? Option.none()
+      : Option.some({ size: found.size, mtimeMs: found.mtimeMs });
+  });
+
   const peekTranscriptSignature: AgentSessionScanner["Service"]["peekTranscriptSignature"] =
     Effect.fn("AgentSessionScanner.peekTranscriptSignature")(function* ({
       driver,
@@ -2900,17 +2942,8 @@ export const make = Effect.gen(function* () {
         return { _tag: "Unchanged" } as const;
       }
     }
-    // The same session id can sit in several project folders; the newest copy is the live one.
-    const projectFolders = yield* listDirectory(projectsDir.value);
-    const copies = yield* Effect.forEach(projectFolders, (folder) =>
-      statTranscript(path.join(projectsDir.value, folder, `${providerSessionId}.jsonl`)),
-    );
-    const transcript = copies.flat().toSorted((left, right) => right.mtimeMs - left.mtimeMs)[0];
-    if (transcript === undefined) {
-      transcriptPaths.delete(cacheKey);
-      return { _tag: "NoTranscript" } as const;
-    }
-    transcriptPaths.set(cacheKey, transcript.filePath);
+    const transcript = yield* discoverTranscript(projectsDir.value, cacheKey, providerSessionId);
+    if (transcript === undefined) return { _tag: "NoTranscript" } as const;
 
     const signature = { size: transcript.size, mtimeMs: transcript.mtimeMs };
     if (unchangedSince?.size === signature.size && unchangedSince.mtimeMs === signature.mtimeMs) {
@@ -2986,6 +3019,7 @@ export const make = Effect.gen(function* () {
     findProjectSession,
     supportsTranscriptSync,
     peekTranscriptSignature,
+    locateTranscript,
     readTurnsAfter,
   });
 });

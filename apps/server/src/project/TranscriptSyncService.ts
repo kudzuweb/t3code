@@ -93,7 +93,7 @@ const make = Effect.gen(function* () {
   const quietSince = new Map<ProviderThreadId, number>();
   const lastRead = new Map<
     ProviderThreadId,
-    { readonly anchor: string; readonly signature: AgentSessionScanner.TranscriptSignature }
+    { readonly anchor: string | null; readonly signature: AgentSessionScanner.TranscriptSignature }
   >();
 
   const newestItemNativeId = (items: ReadonlyArray<OrchestrationV2TurnItem>): string | undefined =>
@@ -141,9 +141,28 @@ const make = Effect.gen(function* () {
     return newestItemNativeId(turnItems) ?? null;
   });
 
+  // A sync that stops before reading still notes the file, so the poll leaves the thread alone
+  // until the file changes and it takes no cold-read slot meanwhile.
+  const rememberFile = Effect.fn("TranscriptSyncService.rememberFile")(function* (
+    providerThread: OrchestrationV2ProviderThread,
+    providerSessionId: string,
+    pollingRememberedPath: boolean,
+  ) {
+    const found = yield* scanner.locateTranscript({
+      driver: providerThread.driver,
+      providerInstanceId: providerThread.providerInstanceId,
+      providerSessionId,
+      ...(pollingRememberedPath ? { useRememberedPath: true } : {}),
+    });
+    if (Option.isSome(found)) {
+      lastRead.set(providerThread.id, { anchor: null, signature: found.value });
+    }
+  });
+
   const syncOnce = Effect.fn("TranscriptSyncService.sync")(function* (
     threadId: ThreadId,
     pollingRememberedPath: boolean,
+    coldBudget?: { remaining: number },
   ) {
     yield* Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": threadId });
     // Provider threads are few, so they are read first to rule out a thread with nothing to read
@@ -161,6 +180,11 @@ const make = Effect.gen(function* () {
     ) {
       return 0;
     }
+    // A batch reads only so many sessions it has not read before; the poll picks up the rest.
+    if (coldBudget !== undefined && !lastRead.has(headProviderThread.id)) {
+      if (coldBudget.remaining <= 0) return 0;
+      coldBudget.remaining -= 1;
+    }
     const records = yield* orchestrator.getThreadRecords(threadId, [
       "runs",
       "attempts",
@@ -168,14 +192,21 @@ const make = Effect.gen(function* () {
       "providerTurns",
     ]);
     const { thread, runs } = records;
-    if (!runs.every(isTerminal)) return 0;
     const providerThread = records.providerThreads.find(
       (candidate) => candidate.id === thread.activeProviderThreadId,
     );
     const nativeSessionId = providerThread?.nativeThreadRef?.nativeId;
     if (providerThread === undefined || nativeSessionId == null) return 0;
+    if (!runs.every(isTerminal)) {
+      yield* rememberFile(providerThread, nativeSessionId, pollingRememberedPath);
+      return 0;
+    }
     // A rollback resumes the next T3 turn at its head, which leaves out what the terminal added.
-    if (providerThread.nativeConversationHeadRef !== null) return 0;
+    if (providerThread.nativeConversationHeadRef !== null) {
+      yield* rememberFile(providerThread, nativeSessionId, pollingRememberedPath);
+      quietSince.set(providerThread.id, yield* Clock.currentTimeMillis);
+      return 0;
+    }
 
     const anchorNativeId = yield* anchorFor(threadId, records, providerThread);
     if (anchorNativeId === null) {
@@ -242,9 +273,13 @@ const make = Effect.gen(function* () {
   });
 
   // A trigger during a sync waits for it and then finds the transcript unchanged.
-  const syncLocked = (threadId: ThreadId, pollingRememberedPath: boolean) =>
+  const syncLocked = (
+    threadId: ThreadId,
+    pollingRememberedPath: boolean,
+    coldBudget?: { remaining: number },
+  ) =>
     locks
-      .withLock(threadId, syncOnce(threadId, pollingRememberedPath))
+      .withLock(threadId, syncOnce(threadId, pollingRememberedPath, coldBudget))
       .pipe(
         Effect.mapError(
           (cause) => new OrchestrationV2SyncTranscriptTurnsError({ threadId, cause }),
@@ -263,11 +298,12 @@ const make = Effect.gen(function* () {
       Effect.asVoid,
     );
 
-  const syncMany: TranscriptSyncService["Service"]["syncMany"] = (threadIds) =>
-    Effect.forEach(
+  const syncMany: TranscriptSyncService["Service"]["syncMany"] = (threadIds) => {
+    const coldBudget = { remaining: TRANSCRIPT_SYNC_COLD_READS_PER_TICK };
+    return Effect.forEach(
       new Set(threadIds),
       (threadId) =>
-        sync(threadId).pipe(
+        syncLocked(threadId, false, coldBudget).pipe(
           Effect.catch((error) =>
             Effect.logWarning("Transcript sync failed", { threadId, cause: error.cause }).pipe(
               Effect.as(0),
@@ -276,6 +312,7 @@ const make = Effect.gen(function* () {
         ),
       { concurrency: SYNC_MANY_CONCURRENCY },
     ).pipe(Effect.map((counts) => counts.reduce((total, count) => total + count, 0)));
+  };
 
   type PollVerdict = "skip" | "changed" | "cold";
 

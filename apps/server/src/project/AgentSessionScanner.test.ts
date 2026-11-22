@@ -2010,6 +2010,18 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
           yield* fileSystem.remove(path.join(projects, "-second", "claude-cached.jsonl"));
           expect(yield* scanner.peekTranscriptSignature(session)).toEqual(Option.none());
           expect(yield* read(undefined, true)).toMatchObject({ _tag: "Turns" });
+
+          // Locating a file finds it without reading and remembers it for the poll's checks.
+          yield* writeTranscript({
+            filePath: path.join(projects, "-third", "claude-cached.jsonl"),
+            contents,
+            mtimeMs: 5_000_000,
+          });
+          const located = yield* scanner.locateTranscript(session);
+          expect(located).toEqual(
+            Option.some({ size: Buffer.byteLength(contents), mtimeMs: 5_000_000 }),
+          );
+          expect(yield* scanner.peekTranscriptSignature(session)).toEqual(located);
         }),
     );
 

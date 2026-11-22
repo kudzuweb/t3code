@@ -229,6 +229,31 @@ const providerThreadAt = (now: DateTime.Utc, pinnedHead: boolean) => ({
 
 const signature = { size: 100, mtimeMs: 5 };
 
+/**
+ * Records for a thread that exists only in a test: `thread:busy-*` has a run in progress, any
+ * other has no history and so no anchor.
+ */
+const syntheticRecords = (id: ThreadId) => {
+  const syntheticProviderThreadId = ProviderThreadId.make(`provider-thread:${id}`);
+  return {
+    thread: { id, deletedAt: null, activeProviderThreadId: syntheticProviderThreadId },
+    providerThreads: [
+      {
+        id: syntheticProviderThreadId,
+        driver,
+        providerInstanceId: instanceId,
+        appThreadId: id,
+        nativeThreadRef: { driver, nativeId: `native:${id}`, strength: "strong" },
+        nativeConversationHeadRef: null,
+      },
+    ],
+    runs: id.startsWith("thread:busy-") ? [{ ordinal: 1, status: "running" }] : [],
+    attempts: [],
+    providerTurns: [],
+    turnItems: [],
+  } as never;
+};
+
 /** A sync whose reader answers with `reads[anchor]` and remembers what it was asked. */
 const makeService = Effect.fn("TranscriptSyncService.test.makeService")(function* (
   reads: Record<string, AgentSessionScanner.TurnsAfterAnchor | { readonly _tag: "NoTranscript" }>,
@@ -246,6 +271,9 @@ const makeService = Effect.fn("TranscriptSyncService.test.makeService")(function
   const realOrchestrator = yield* Orchestrator.OrchestratorV2;
   /** The fields each projection read asked for, so a test can see what a sync read. */
   const recordReads: Array<ReadonlyArray<string>> = [];
+  /** The threads whose run history was read. */
+  const historyReads: Array<ThreadId> = [];
+  const realThreadId = threadId;
   const orchestrator = {
     ...realOrchestrator,
     getThreadRecords: (
@@ -254,6 +282,8 @@ const makeService = Effect.fn("TranscriptSyncService.test.makeService")(function
       ...rest: Array<never>
     ) => {
       recordReads.push(fields);
+      if (fields.includes("runs")) historyReads.push(threadId);
+      if (threadId !== realThreadId) return Effect.succeed(syntheticRecords(threadId));
       return (realOrchestrator.getThreadRecords as (...args: Array<unknown>) => never)(
         threadId,
         fields,
@@ -264,6 +294,7 @@ const makeService = Effect.fn("TranscriptSyncService.test.makeService")(function
   const scanner = Layer.mock(AgentSessionScanner.AgentSessionScanner)({
     supportsTranscriptSync: () => options.supported ?? true,
     peekTranscriptSignature: () => Effect.succeed(options.peek ?? Option.none()),
+    locateTranscript: () => Effect.succeedSome(signature),
     readTurnsAfter: ({ anchorNativeId, unchangedSince, useRememberedPath }) =>
       Effect.sync(() => {
         asked.push({ anchor: anchorNativeId, unchangedSince });
@@ -287,6 +318,7 @@ const makeService = Effect.fn("TranscriptSyncService.test.makeService")(function
     asked,
     polled,
     recordReads,
+    historyReads,
     get anchors() {
       return asked.map((entry) => entry.anchor);
     },
@@ -763,7 +795,7 @@ it.effect("a poll starts at most the cold-read limit of sessions it has never re
     yield* sync.service.pollMany(candidates);
 
     assert.equal(
-      sync.recordReads.length,
+      sync.historyReads.length,
       TranscriptSyncService.TRANSCRIPT_SYNC_COLD_READS_PER_TICK,
     );
   }).pipe(Effect.provide(layerStores)),
@@ -823,5 +855,41 @@ it.effect("a poll does not keep retrying a thread that has no anchor", () =>
     yield* sync.service.pollMany([candidateFor()]);
 
     assert.equal(sync.recordReads.length, readsAfterFirstPoll);
+  }).pipe(Effect.provide(layerStores)),
+);
+
+const candidateForSynthetic = (id: string) => ({
+  ...candidateFor(ThreadId.make(`thread:${id}`)),
+  providerThreadId: ProviderThreadId.make(`provider-thread:thread:${id}`),
+  nativeId: `native:thread:${id}`,
+});
+
+it.effect("threads a poll skipped for a run in progress do not take a cold slot next tick", () =>
+  Effect.gen(function* () {
+    const sync = yield* makeService({}, { peek: Option.some(signature) });
+    const limit = TranscriptSyncService.TRANSCRIPT_SYNC_COLD_READS_PER_TICK;
+    const busy = Array.from({ length: limit }, (_, index) =>
+      candidateForSynthetic(`busy-${index}`),
+    );
+    const candidates = [...busy, candidateForSynthetic("waiting")];
+
+    yield* sync.service.pollMany(candidates);
+    assert.isFalse(sync.historyReads.includes(ThreadId.make("thread:waiting")));
+
+    yield* sync.service.pollMany(candidates);
+    assert.isTrue(sync.historyReads.includes(ThreadId.make("thread:waiting")));
+  }).pipe(Effect.provide(layerStores)),
+);
+
+it.effect("a batch reads at most the cold-read limit of sessions it has never read", () =>
+  Effect.gen(function* () {
+    const sync = yield* makeService({});
+    const limit = TranscriptSyncService.TRANSCRIPT_SYNC_COLD_READS_PER_TICK;
+
+    yield* sync.service.syncMany(
+      Array.from({ length: limit + 2 }, (_, index) => ThreadId.make(`thread:cold-${index}`)),
+    );
+
+    assert.equal(sync.historyReads.length, limit);
   }).pipe(Effect.provide(layerStores)),
 );
