@@ -562,29 +562,31 @@ it.effect("reads again after a dispatch the thread refused, though the file is u
                     if (reads === 1) {
                       // A run appears between the read and the command, so the command is refused.
                       const now = yield* DateTime.now;
-                      yield* projections.apply({
-                        id: EventId.make("sync:late-run"),
-                        type: "run.created",
-                        threadId,
-                        occurredAt: now,
-                        payload: {
-                          id: RunId.make("run:late"),
+                      yield* projections
+                        .apply({
+                          id: EventId.make("sync:late-run"),
+                          type: "run.created",
                           threadId,
-                          ordinal: 2,
-                          providerInstanceId: instanceId,
-                          modelSelection,
-                          providerThreadId,
-                          userMessageId: MessageId.make("message:late"),
-                          rootNodeId: null,
-                          activeAttemptId: null,
-                          status: "cancelled",
-                          requestedAt: now,
-                          startedAt: null,
-                          completedAt: now,
-                          checkpointId: null,
-                          contextHandoffId: null,
-                        },
-                      });
+                          occurredAt: now,
+                          payload: {
+                            id: RunId.make("run:late"),
+                            threadId,
+                            ordinal: 2,
+                            providerInstanceId: instanceId,
+                            modelSelection,
+                            providerThreadId,
+                            userMessageId: MessageId.make("message:late"),
+                            rootNodeId: null,
+                            activeAttemptId: null,
+                            status: "cancelled",
+                            requestedAt: now,
+                            startedAt: null,
+                            completedAt: now,
+                            checkpointId: null,
+                            contextHandoffId: null,
+                          },
+                        })
+                        .pipe(Effect.orDie);
                     }
                     return { ...turnsOf("one"), signature };
                   }),
