@@ -93,7 +93,12 @@ function candidate(
       omittedMessageCount: 0,
       messages: [
         { role: "user" as const, text: "Fix it", createdAt: timestamp },
-        { role: "assistant" as const, text: "Fixed", createdAt: timestamp },
+        {
+          role: "assistant" as const,
+          text: "Fixed",
+          createdAt: timestamp,
+          nativeId: `${providerSessionId}:last`,
+        },
       ],
     },
     worktree: null as { path: string; branch: string | null } | null,
@@ -1107,6 +1112,10 @@ describe("importing one session", () => {
       ]);
       expect(records.messages.map((message) => message.text)).toEqual(["Fix it", "Fixed"]);
       expect(records.providerThreads[0]?.nativeThreadRef?.nativeId).toBe(claudeId);
+      expect(records.providerThreads[0]?.nativeMetadata?.transcriptSync).toEqual({
+        throughNativeId: `${claudeId}:last`,
+        throughRunOrdinal: 0,
+      });
 
       const writtenBefore = (yield* events
         .read({ threadId: first.threadId })

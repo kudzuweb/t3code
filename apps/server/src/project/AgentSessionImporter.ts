@@ -364,6 +364,7 @@ const make = Effect.gen(function* () {
       });
     const createdAt = dateTime(thread.createdAt);
     const updatedAt = dateTime(thread.updatedAt);
+    const lastImportedNativeId = thread.messages.at(-1)?.nativeId;
     const appThread: OrchestrationV2AppThread = {
       createdBy: "system",
       creationSource: "server",
@@ -419,6 +420,14 @@ const make = Effect.gen(function* () {
       handoffIds: [],
       forkedFrom: null,
       pendingBackgroundTasks: [],
+      // The next transcript sync starts after the last record this import shows.
+      ...(lastImportedNativeId === undefined
+        ? {}
+        : {
+            nativeMetadata: {
+              transcriptSync: { throughNativeId: lastImportedNativeId, throughRunOrdinal: 0 },
+            },
+          }),
       createdAt,
       updatedAt,
     };
