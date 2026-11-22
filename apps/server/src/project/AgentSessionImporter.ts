@@ -60,6 +60,7 @@ const isProjectionStoreThreadNotFoundError = Schema.is(
   ProjectionStore.ProjectionStoreThreadNotFoundError,
 );
 
+const encodeStringList = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Schema.String)));
 const isUnresumableSessionError = Schema.is(AgentSessionUnresumableSessionError);
 
 const IMPORT_EVENT_PREFIX = "agent-session-import:v2";
@@ -588,10 +589,10 @@ const make = Effect.gen(function* () {
       LEFT JOIN orchestration_v2_projection_provider_threads AS provider
         ON provider.thread_id = thread.thread_id
       WHERE thread.thread_id IN (
-          SELECT value FROM json_each(${JSON.stringify(keys.map((key) => key.importThreadId))})
+          SELECT value FROM json_each(${encodeStringList(keys.map((key) => key.importThreadId))})
         )
         OR json_extract(provider.payload_json, '$.nativeThreadRef.nativeId') IN (
-          SELECT value FROM json_each(${JSON.stringify(keys.map((key) => key.nativeThreadId))})
+          SELECT value FROM json_each(${encodeStringList(keys.map((key) => key.nativeThreadId))})
         )
       ORDER BY thread.updated_at DESC
     `.pipe(
