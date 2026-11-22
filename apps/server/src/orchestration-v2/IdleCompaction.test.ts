@@ -192,6 +192,26 @@ describe("idleCompactionWindow", () => {
     expect(idleCompactionWindow(sideChat, NOW_MS)).toBeNull();
   });
 
+  it("never compacts for a turn recorded from a terminal session", () => {
+    const recorded = records({ cacheExpiresInMs: 60 * MINUTE_MS });
+    expect(idleCompactionWindow(recorded, NOW_MS)?.runId).toBe(runId);
+    recorded.messages = [
+      ...recorded.messages,
+      { ...recorded.messages[0]!, id: MessageId.make("message-2") },
+    ];
+    recorded.runs = [
+      ...recorded.runs,
+      {
+        ...recorded.runs[0]!,
+        id: RunId.make("run-2"),
+        ordinal: 2,
+        userMessageId: MessageId.make("message-2"),
+        recordedFrom: "transcript",
+      },
+    ];
+    expect(idleCompactionWindow(recorded, NOW_MS)).toBeNull();
+  });
+
   it("still compacts while a delegated child thread runs on its own", () => {
     const delegating = records({ cacheExpiresInMs: 60 * MINUTE_MS });
     delegating.turnItems = [
