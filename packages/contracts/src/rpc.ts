@@ -286,6 +286,7 @@ import {
   OrchestrationGetWorkflowScriptError,
   OrchestrationV2GetNativeChildWorkError,
   OrchestrationV2StopWorkflowError,
+  OrchestrationV2SyncTranscriptTurnsError,
   OrchestrationV2ForceStopThreadError,
   OrchestrationV2DispatchCommandError,
   OrchestrationV2GetShellSnapshotError,
@@ -2202,6 +2203,15 @@ const WsOrchestrationV2GetThreadProjectionRpc = Rpc.make(
   },
 );
 
+const WsOrchestrationV2SyncTranscriptTurnsRpc = Rpc.make(
+  ORCHESTRATION_V2_WS_METHODS.syncTranscriptTurns,
+  {
+    payload: OrchestrationV2RpcSchemas.syncTranscriptTurns.input,
+    success: OrchestrationV2RpcSchemas.syncTranscriptTurns.output,
+    error: Schema.Union([OrchestrationV2SyncTranscriptTurnsError, EnvironmentAuthorizationError]),
+  },
+);
+
 const WsOrchestrationV2StopWorkflowRpc = Rpc.make(ORCHESTRATION_V2_WS_METHODS.stopWorkflow, {
   payload: OrchestrationV2RpcSchemas.stopWorkflow.input,
   success: OrchestrationV2RpcSchemas.stopWorkflow.output,
@@ -2635,6 +2645,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsOrchestrationV2GetWorkflowScriptRpc,
   WsOrchestrationV2GetNativeChildWorkRpc,
   WsOrchestrationV2StopWorkflowRpc,
+  WsOrchestrationV2SyncTranscriptTurnsRpc,
   WsOrchestrationV2ForceStopThreadRpc,
   WsOrchestrationV2GetTurnItemRpc,
   WsOrchestrationV2GetTurnDiffRpc,
