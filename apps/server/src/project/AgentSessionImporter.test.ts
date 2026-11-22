@@ -1,5 +1,5 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { expect, it } from "@effect/vitest";
+import { describe, expect, it } from "@effect/vitest";
 import {
   type AgentSessionSource,
   type ServerSettingsError,
@@ -231,6 +231,7 @@ const makeImporter = Effect.fn(function* (
       Layer.provide(
         Layer.mergeAll(
           sinkLayer,
+          Layer.succeed(SqlClient.SqlClient, importSql),
           settings,
           Layer.succeed(IdAllocator.IdAllocatorV2, yield* IdAllocator.IdAllocatorV2),
           Layer.succeed(
@@ -240,6 +241,35 @@ const makeImporter = Effect.fn(function* (
           realScan === undefined
             ? Layer.mock(AgentSessionScanner.AgentSessionScanner)({
                 recentThreads: () => Stream.fromIterable(candidates),
+                listProjectSessions: () =>
+                  Effect.succeed({
+                    sessions: candidates.flatMap((entry) =>
+                      entry._tag === "Importable"
+                        ? [
+                            {
+                              source: entry.source,
+                              title: entry.thread.title,
+                              lastActiveAt: entry.thread.updatedAt,
+                              worktree: entry.worktree,
+                            },
+                          ]
+                        : [],
+                    ),
+                    truncated: false,
+                  }),
+                findProjectSession: ({ providerInstanceId, providerSessionId }) =>
+                  Effect.succeed(
+                    candidates.find(
+                      (entry) =>
+                        entry._tag === "Importable" &&
+                        entry.source.providerInstanceId === providerInstanceId &&
+                        entry.source.providerSessionId === providerSessionId,
+                    ) ??
+                      candidates.find(
+                        (entry) =>
+                          entry._tag === "Skipped" && entry.filePath?.includes(providerSessionId),
+                      ) ?? { _tag: "Skipped" as const },
+                  ),
               })
             : Layer.succeed(AgentSessionScanner.AgentSessionScanner, realScan.scanner),
           Layer.mock(ProjectService.ProjectService)({
@@ -280,6 +310,13 @@ const makeImporter = Effect.fn(function* (
   return {
     run: importer.importRecentAgentThreads({ projectId }),
     importNativeHistory: importer.importNativeHistory,
+    listSessions: importer.listSessions({ projectId }),
+    importSession: (source: ReturnType<typeof candidate>) =>
+      importer.importSession({
+        projectId,
+        providerInstanceId: source.source.providerInstanceId,
+        providerSessionId: source.source.providerSessionId,
+      }),
     published,
   };
 });
@@ -1051,3 +1088,267 @@ it.effect("repeated imports reach linked-worktree sessions behind the scan budge
     expect(oldest.worktreePath).toBe(worktree);
   }).pipe(Effect.scoped, Effect.provide(Layer.merge(persistence, NodeServices.layer))),
 );
+
+describe("importing one session", () => {
+  const claudeId = "7c1d9a52-2f0e-4a53-9b0a-1f5f4e0c6a11";
+
+  it.effect("opens a session as a thread bound to its native id, once", () =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const events = yield* EventStore.EventStoreV2;
+      const source = candidate(CLAUDE_MODEL_SELECTION, claudeId, "claudeAgent");
+      const importer = yield* makeImporter([source]);
+
+      const first = yield* importer.importSession(source);
+      expect(first).toEqual({ threadId: importId(source), imported: true });
+      const records = yield* projections.getThreadRecords(first.threadId, [
+        "messages",
+        "providerThreads",
+      ]);
+      expect(records.messages.map((message) => message.text)).toEqual(["Fix it", "Fixed"]);
+      expect(records.providerThreads[0]?.nativeThreadRef?.nativeId).toBe(claudeId);
+
+      const writtenBefore = (yield* events
+        .read({ threadId: first.threadId })
+        .pipe(Stream.runCollect)).length;
+      expect(yield* importer.importSession(source)).toEqual({
+        threadId: first.threadId,
+        imported: false,
+      });
+      expect(
+        (yield* events.read({ threadId: first.threadId }).pipe(Stream.runCollect)).length,
+      ).toBe(writtenBefore);
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+  );
+
+  it.effect("returns the thread the bulk import created, even after the transcript grew", () =>
+    Effect.gen(function* () {
+      const source = candidate(CLAUDE_MODEL_SELECTION, claudeId, "claudeAgent");
+      const importer = yield* makeImporter([source]);
+      expect(yield* importer.run).toEqual({ importedCount: 1, skippedCount: 0 });
+
+      source.thread.messages.push({ role: "user", text: "One more", createdAt: timestamp });
+      expect(yield* importer.importSession(source)).toEqual({
+        threadId: importId(source),
+        imported: false,
+      });
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+  );
+
+  it.effect("returns a thread that already owns the native session, whatever its id", () =>
+    Effect.gen(function* () {
+      const source = candidate(CLAUDE_MODEL_SELECTION, claudeId, "claudeAgent");
+      const owner = yield* seedOwner(source);
+      const importer = yield* makeImporter([source]);
+      expect(yield* importer.importSession(source)).toEqual({ threadId: owner, imported: false });
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+  );
+
+  it.effect("finds a Pi session's owner by its file path", () =>
+    Effect.gen(function* () {
+      const source = candidate(PI_MODEL_SELECTION, "pi-session", "pi");
+      const owner = yield* seedOwner(source);
+      const importer = yield* makeImporter([source]);
+      expect(yield* importer.importSession(source)).toEqual({ threadId: owner, imported: false });
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+  );
+
+  it.effect("fails with a typed error for a session the project does not have", () =>
+    Effect.gen(function* () {
+      const importer = yield* makeImporter([]);
+      const missing = candidate(CLAUDE_MODEL_SELECTION, claudeId, "claudeAgent");
+      expect(yield* Effect.flip(importer.importSession(missing))).toMatchObject({
+        _tag: "AgentSessionNotFoundError",
+        projectId,
+        providerSessionId: claudeId,
+      });
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+  );
+
+  it.effect("rejects a Claude session id that cannot be resumed", () =>
+    Effect.gen(function* () {
+      const source = candidate(CLAUDE_MODEL_SELECTION, "not-a-uuid", "claudeAgent");
+      const importer = yield* makeImporter([source]);
+      expect(yield* Effect.flip(importer.importSession(source))).toMatchObject({
+        _tag: "AgentSessionUnresumableSessionError",
+        providerSessionId: "not-a-uuid",
+      });
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+  );
+
+  it.effect("returns the owner that claims the session while the import is being written", () =>
+    Effect.gen(function* () {
+      const enteringTransaction = yield* Deferred.make<void>();
+      const continueTransaction = yield* Deferred.make<void>();
+      const source = candidate(CLAUDE_MODEL_SELECTION, claudeId, "claudeAgent");
+      const importer = yield* makeImporter(
+        [source],
+        Deferred.succeed(enteringTransaction, undefined).pipe(
+          Effect.andThen(Deferred.await(continueTransaction)),
+        ),
+      );
+      const pending = yield* Effect.forkScoped(importer.importSession(source));
+      yield* Deferred.await(enteringTransaction);
+      const ownerId = yield* seedOwner(source);
+      yield* Deferred.succeed(continueTransaction, undefined);
+      expect(yield* Fiber.join(pending)).toEqual({ threadId: ownerId, imported: false });
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+  );
+
+  it.effect("settles on one thread when two imports of the same session reach the write", () =>
+    Effect.gen(function* () {
+      const source = candidate(CLAUDE_MODEL_SELECTION, claudeId, "claudeAgent");
+      const bothChecked = yield* Deferred.make<void>();
+      let arrived = 0;
+      const importer = yield* makeImporter(
+        [source],
+        Effect.sync(() => (arrived += 1)).pipe(
+          Effect.flatMap((count) =>
+            count === 2 ? Deferred.succeed(bothChecked, undefined) : Effect.void,
+          ),
+          Effect.andThen(Deferred.await(bothChecked)),
+        ),
+      );
+      const results = yield* Effect.all(
+        [importer.importSession(source), importer.importSession(source)],
+        { concurrency: 2 },
+      );
+      expect(arrived).toBe(2);
+      expect(results.map((result) => result.threadId)).toEqual([
+        importId(source),
+        importId(source),
+      ]);
+      expect(results.filter((result) => result.imported)).toHaveLength(1);
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+  );
+
+  it.effect("does not return another project's thread for a session this project lacks", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const source = candidate(CLAUDE_MODEL_SELECTION, claudeId, "claudeAgent");
+      const owner = yield* seedOwner(source);
+      yield* sql`UPDATE orchestration_v2_projection_threads SET project_id = 'other-project' WHERE thread_id = ${owner}`;
+      const importer = yield* makeImporter([]);
+      expect(yield* Effect.flip(importer.importSession(source))).toMatchObject({
+        _tag: "AgentSessionNotFoundError",
+        projectId,
+      });
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+  );
+
+  it.effect("returns and lists a live thread that holds the session in another project", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const source = candidate(CLAUDE_MODEL_SELECTION, claudeId, "claudeAgent");
+      const owner = yield* seedOwner(source);
+      yield* sql`UPDATE orchestration_v2_projection_threads SET project_id = 'other-project' WHERE thread_id = ${owner}`;
+      const importer = yield* makeImporter([source]);
+      expect(yield* importer.importSession(source)).toEqual({ threadId: owner, imported: false });
+      expect((yield* importer.listSessions).sessions[0]?.threadId).toBe(owner);
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+  );
+
+  const deleteThread = (threadId: ThreadId) =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`UPDATE orchestration_v2_projection_threads SET deleted_at = ${timestamp} WHERE thread_id = ${threadId}`;
+    });
+
+  it.effect("reimports a session whose only thread was deleted as a new thread", () =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const source = candidate(CLAUDE_MODEL_SELECTION, claudeId, "claudeAgent");
+      const importer = yield* makeImporter([source]);
+      expect(yield* importer.run).toEqual({ importedCount: 1, skippedCount: 0 });
+      yield* deleteThread(importId(source));
+      expect((yield* importer.listSessions).sessions[0]?.threadId).toBeNull();
+
+      const reimported = yield* importer.importSession(source);
+      expect(reimported.imported).toBe(true);
+      expect(reimported.threadId).not.toBe(importId(source));
+      const records = yield* projections.getThreadRecords(reimported.threadId, [
+        "messages",
+        "providerThreads",
+      ]);
+      expect(records.thread.deletedAt).toBeNull();
+      expect(records.messages.map((message) => message.text)).toEqual(["Fix it", "Fixed"]);
+      expect(records.providerThreads[0]?.nativeThreadRef?.nativeId).toBe(claudeId);
+      expect((yield* importer.listSessions).sessions[0]?.threadId).toBe(reimported.threadId);
+      expect(yield* importer.importSession(source)).toEqual({
+        threadId: reimported.threadId,
+        imported: false,
+      });
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+  );
+
+  it.effect(
+    "is skipped by the bulk import but reimported by importSession when its thread was deleted",
+    () =>
+      Effect.gen(function* () {
+        const source = candidate(CLAUDE_MODEL_SELECTION, claudeId, "claudeAgent");
+        yield* deleteThread(yield* seedOwner(source));
+        const importer = yield* makeImporter([source]);
+        expect(yield* importer.run).toEqual({ importedCount: 0, skippedCount: 0 });
+        expect((yield* importer.importSession(source)).imported).toBe(true);
+      }).pipe(Effect.scoped, Effect.provide(persistence)),
+  );
+
+  it.effect("keeps one live thread when two reimports of a deleted session reach the write", () =>
+    Effect.gen(function* () {
+      const source = candidate(CLAUDE_MODEL_SELECTION, claudeId, "claudeAgent");
+      const bothChecked = yield* Deferred.make<void>();
+      let gated = false;
+      let arrived = 0;
+      const importer = yield* makeImporter(
+        [source],
+        Effect.suspend(() => {
+          if (!gated) return Effect.void;
+          arrived += 1;
+          return (arrived === 2 ? Deferred.succeed(bothChecked, undefined) : Effect.void).pipe(
+            Effect.andThen(Deferred.await(bothChecked)),
+          );
+        }),
+      );
+      yield* importer.run;
+      yield* deleteThread(importId(source));
+      gated = true;
+      const results = yield* Effect.all(
+        [importer.importSession(source), importer.importSession(source)],
+        { concurrency: 2 },
+      );
+      expect(results[0].threadId).toBe(results[1].threadId);
+      expect(results.filter((result) => result.imported)).toHaveLength(1);
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+  );
+
+  it.effect("reports a listed session whose transcript cannot be read as unreadable", () =>
+    Effect.gen(function* () {
+      const filePath = `/tmp/claude/${claudeId}.jsonl`;
+      const importer = yield* makeImporter([{ _tag: "Skipped", filePath }]);
+      expect(
+        yield* Effect.flip(
+          importer.importSession(candidate(CLAUDE_MODEL_SELECTION, claudeId, "claudeAgent")),
+        ),
+      ).toMatchObject({ _tag: "AgentSessionUnreadableError", filePath });
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+  );
+
+  it.effect("lists each session with the thread that holds it", () =>
+    Effect.gen(function* () {
+      const held = candidate(CLAUDE_MODEL_SELECTION, claudeId, "claudeAgent");
+      const free = candidate(CODEX_MODEL_SELECTION, "free");
+      const heldPi = candidate(PI_MODEL_SELECTION, "held-pi", "pi");
+      const owner = yield* seedOwner(held);
+      const piOwner = yield* seedOwner(heldPi);
+      const importer = yield* makeImporter([held, free, heldPi]);
+      expect(yield* importer.listSessions).toEqual({
+        sessions: [
+          expect.objectContaining({ providerSessionId: claudeId, threadId: owner }),
+          expect.objectContaining({ providerSessionId: "free", threadId: null }),
+          expect.objectContaining({ providerSessionId: "held-pi", threadId: piOwner }),
+        ],
+        truncated: false,
+      });
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+  );
+});

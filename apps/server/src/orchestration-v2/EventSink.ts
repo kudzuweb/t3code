@@ -502,13 +502,17 @@ const layerBase: Layer.Layer<
           // Check ownership in the same transaction that claims the native session.
           const imported = input.unlessNativeThreadOwned;
           if (imported?.nativeThreadRef != null) {
+            // A deleted thread has no runs and no live provider session, so it cannot hold the session.
             const owners = yield* sql`
-              SELECT provider_thread_id
-              FROM orchestration_v2_projection_provider_threads
-              WHERE driver = ${imported.driver}
-                AND provider_instance_id = ${imported.providerInstanceId}
-                AND thread_id IS NOT ${imported.appThreadId}
-                AND json_extract(payload_json, '$.nativeThreadRef.nativeId') = ${imported.nativeThreadRef.nativeId}
+              SELECT provider.provider_thread_id
+              FROM orchestration_v2_projection_provider_threads AS provider
+              JOIN orchestration_v2_projection_threads AS thread
+                ON thread.thread_id = provider.thread_id
+              WHERE provider.driver = ${imported.driver}
+                AND provider.provider_instance_id = ${imported.providerInstanceId}
+                AND provider.thread_id IS NOT ${imported.appThreadId}
+                AND json_extract(provider.payload_json, '$.nativeThreadRef.nativeId') = ${imported.nativeThreadRef.nativeId}
+                AND thread.deleted_at IS NULL
               LIMIT 1
             `;
             if (owners.length > 0) return { committed: [], outcomes: [] };

@@ -19,6 +19,7 @@ import {
   AuthSourceControlWriteScope,
   AuthTerminalReadScope,
   AuthTerminalOperateScope,
+  CLIENT_GUARDED_RPC_SCOPES,
   CommandId,
   MessageId,
   ORCHESTRATION_V2_WS_METHODS,
@@ -56,6 +57,18 @@ describe("RPC authorization scopes", () => {
 
   it("keeps triage, which seeds an agent that reads logs and the database, behind operate scope", () => {
     expect(requiredScopeForRpcMethod(WS_METHODS.serverPrepareTriage)).toBe(
+      AuthOrchestrationOperateScope,
+    );
+  });
+
+  it("lets readers list a project's agent sessions and takes operate scope to import one", () => {
+    expect(requiredScopeForRpcMethod(WS_METHODS.agentSessionsList)).toBe(
+      AuthOrchestrationReadScope,
+    );
+    expect(requiredScopeForRpcMethod(WS_METHODS.agentSessionsImportOne)).toBe(
+      AuthOrchestrationOperateScope,
+    );
+    expect(CLIENT_GUARDED_RPC_SCOPES[WS_METHODS.agentSessionsImportOne]).toBe(
       AuthOrchestrationOperateScope,
     );
   });
