@@ -11199,6 +11199,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           readonly text: string;
           readonly at: DateTime.Utc;
         }) {
+          const nativeRefId = turn.nativeRefId ?? input.nativeId;
           const messageId = MessageId.make(`transcript:${idKey}:${input.nativeId}`);
           const turnItemId = TurnItemId.make(`transcript:turn-item:${idKey}:${input.nativeId}`);
           const message: OrchestrationV2ConversationMessage = {
@@ -11225,7 +11226,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             // The next sync reads from the native record of the newest item.
             nativeItemRef: {
               driver: providerThread.driver,
-              nativeId: input.nativeId,
+              nativeId: nativeRefId,
               strength: "strong" as const,
             },
             parentItemId: null,

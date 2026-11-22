@@ -798,6 +798,11 @@ export const OrchestrationV2TranscriptTurn = Schema.Struct({
   assistantNativeId: Schema.NullOr(TrimmedNonEmptyString),
   assistantText: Schema.String,
   assistantAt: Schema.NullOr(IsoDateTime),
+  /**
+   * The native record the next sync reads on from, when it is not the item's own id. Codex names
+   * a turn, not a message, so each of its items names the turn.
+   */
+  nativeRefId: Schema.optional(TrimmedNonEmptyString),
 });
 export type OrchestrationV2TranscriptTurn = typeof OrchestrationV2TranscriptTurn.Type;
 
