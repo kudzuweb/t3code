@@ -84,6 +84,7 @@ export const STATIC_KEYBINDING_COMMANDS = [
   "commandPalette.toggle",
   "filePicker.toggle",
   "projectSearch.toggle",
+  "agentSessions.resume",
   "usage.open",
   "theme.select",
   "appearance.cycle",
