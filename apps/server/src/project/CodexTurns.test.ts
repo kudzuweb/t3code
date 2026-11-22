@@ -1,60 +1,37 @@
 import { assert, describe, it } from "@effect/vitest";
-import type * as CodexSchema from "effect-codex-app-server/schema";
-
 import { ProviderInstanceId } from "@t3tools/contracts";
 
-import { parseAgentSessionTranscript } from "./AgentSessionScanner.ts";
+import {
+  parseAgentSessionTranscript,
+  type AgentSessionThreadMessage,
+} from "./AgentSessionScanner.ts";
 import { codexTurnsAfter } from "./CodexTurns.ts";
 
-type Turn = CodexSchema.V2ThreadReadResponse__Turn;
-type Item = CodexSchema.V2ThreadReadResponse__ThreadItem;
-
-const user = (id: string, text: string): Item => ({
-  type: "userMessage",
-  id,
-  content: [{ type: "text", text, text_elements: [] }],
+const message = (
+  role: "user" | "assistant",
+  turnId: string | undefined,
+  text: string,
+  second = 0,
+): AgentSessionThreadMessage => ({
+  role,
+  text,
+  createdAt: `2026-11-20T10:00:${String(second).padStart(2, "0")}.000Z`,
+  ...(turnId === undefined ? {} : { nativeId: turnId }),
 });
-const agent = (id: string, text: string, phase: "commentary" | "final_answer" = "final_answer") =>
-  ({ type: "agentMessage", id, text, phase }) satisfies Item;
-const command: Item = {
-  type: "commandExecution",
-  id: "item-command",
-  command: "ls",
-  commandActions: [],
-  cwd: "/tmp/project",
-  source: "agent",
-  status: "completed",
-} as unknown as Item;
-const turn = (
-  id: string,
-  items: ReadonlyArray<Item>,
-  status: Turn["status"] = "completed",
-): Turn => ({
-  id,
-  status,
-  items,
-  startedAt: 1_784_000_000,
-  completedAt: status === "inProgress" ? null : 1_784_000_030,
-});
-
-const fallback = "2026-11-22T12:00:00.000Z";
-const after = (turns: ReadonlyArray<Turn>, anchor: string) =>
-  codexTurnsAfter({ turns }, anchor, fallback);
 
 describe("codexTurnsAfter", () => {
-  const shown = turn("turn-shown", [user("u-shown", "Shown"), agent("a-shown", "Shown reply")]);
+  const shown = [
+    message("user", "turn-shown", "Shown"),
+    message("assistant", "turn-shown", "Done"),
+  ];
 
-  it("returns the turns after the anchor turn, with a prompt and the reply text of each", () => {
-    const result = after(
+  it("names a recorded turn by its turn id, role and place, and its refs by the turn id", () => {
+    const result = codexTurnsAfter(
       [
-        shown,
-        turn("turn-1", [
-          user("u-1", "First from the terminal"),
-          command,
-          agent("a-1-note", "Looking.", "commentary"),
-          agent("a-1", "First answer"),
-        ]),
-        turn("turn-2", [user("u-2", "Second"), agent("a-2", "Second answer")]),
+        ...shown,
+        message("user", "turn-1", "First", 1),
+        message("assistant", "turn-1", "Looking.", 2),
+        message("assistant", "turn-1", "First answer", 3),
       ],
       "turn-shown",
     );
@@ -62,114 +39,63 @@ describe("codexTurnsAfter", () => {
       _tag: "Turns",
       turns: [
         {
-          userNativeId: "u-1",
-          userText: "First from the terminal",
-          userAt: "2026-07-14T03:33:20.000Z",
-          assistantNativeId: "a-1",
+          userNativeId: "turn-1:user:0",
+          userText: "First",
+          userAt: "2026-11-20T10:00:01.000Z",
+          assistantNativeId: "turn-1:assistant:0",
           assistantText: "Looking.\n\nFirst answer",
-          assistantAt: "2026-07-14T03:33:50.000Z",
-        },
-        {
-          userNativeId: "u-2",
-          userText: "Second",
-          userAt: "2026-07-14T03:33:20.000Z",
-          assistantNativeId: "a-2",
-          assistantText: "Second answer",
-          assistantAt: "2026-07-14T03:33:50.000Z",
+          assistantAt: "2026-11-20T10:00:03.000Z",
+          nativeRefId: "turn-1",
         },
       ],
-      throughNativeId: "a-2",
+      throughNativeId: "turn-1",
     });
   });
 
-  it("finds an anchor that names an item of a turn, as a recorded terminal turn leaves", () => {
-    const result = after(
-      [shown, turn("turn-1", [user("u-1", "Next"), agent("a-1", "Answer")])],
-      "a-shown",
-    );
-    assert.equal(result._tag === "Turns" && result.turns.length, 1);
-  });
-
-  it("holds back a turn still in progress and every turn after it", () => {
-    const result = after(
+  it("keeps a message sent while a turn ran as a prompt of its own, under the same turn id", () => {
+    const result = codexTurnsAfter(
       [
-        shown,
-        turn("turn-1", [user("u-1", "Done"), agent("a-1", "Done reply")]),
-        turn("turn-2", [user("u-2", "Running"), agent("a-2", "Partial")], "inProgress"),
-      ],
-      "turn-shown",
-    );
-    assert.equal(result._tag === "Turns" && result.turns.length, 1);
-    assert.equal(result._tag === "Turns" && result.throughNativeId, "a-1");
-  });
-
-  it("counts an interrupted turn and a failed turn without a reply as finished", () => {
-    const result = after(
-      [
-        shown,
-        turn("turn-1", [user("u-1", "Stopped"), agent("a-1", "Half")], "interrupted"),
-        turn("turn-2", [user("u-2", "Broke")], "failed"),
+        ...shown,
+        message("user", "turn-1", "Start"),
+        message("assistant", "turn-1", "Working"),
+        message("user", "turn-1", "Also this"),
+        message("assistant", "turn-1", "Both done"),
       ],
       "turn-shown",
     );
     assert.deepStrictEqual(
-      result._tag === "Turns" && result.turns.map((t) => [t.userNativeId, t.assistantNativeId]),
+      result._tag === "Turns" && result.turns.map((t) => [t.userNativeId, t.nativeRefId]),
       [
-        ["u-1", "a-1"],
-        ["u-2", null],
+        ["turn-1:user:0", "turn-1"],
+        ["turn-1:user:1", "turn-1"],
       ],
     );
-    assert.equal(result._tag === "Turns" && result.throughNativeId, "u-2");
   });
 
-  it("returns no turns, still through the anchor, when nothing follows it", () => {
-    assert.deepStrictEqual(after([shown], "a-shown"), {
+  it("returns no turns, still through the last turn, when nothing follows the anchor", () => {
+    assert.deepStrictEqual(codexTurnsAfter(shown, "turn-shown"), {
       _tag: "Turns",
       turns: [],
-      throughNativeId: "a-shown",
+      throughNativeId: "turn-shown",
     });
   });
 
-  it("reports a missing anchor, as after a rollback, so nothing is written", () => {
-    assert.deepStrictEqual(after([shown], "turn-reverted"), { _tag: "AnchorNotFound" });
+  it("does not find an anchor that no message names, as after Codex dropped the turn", () => {
+    assert.deepStrictEqual(codexTurnsAfter(shown, "turn-reverted"), { _tag: "AnchorNotFound" });
   });
 
-  it("keeps a message sent while a turn ran as a prompt of its own", () => {
-    const result = after(
-      [
-        shown,
-        turn("turn-1", [
-          user("u-1", "Start"),
-          agent("a-1", "Working"),
-          user("u-steer", "Also this"),
-          agent("a-steer", "Done both"),
-        ]),
-      ],
+  it("leaves out a message that names no turn", () => {
+    const result = codexTurnsAfter(
+      [...shown, message("user", undefined, "Which turn?"), message("user", "turn-1", "Next")],
       "turn-shown",
     );
-    assert.deepStrictEqual(result._tag === "Turns" && result.turns.map((t) => t.userNativeId), [
-      "u-1",
-      "u-steer",
-    ]);
-  });
-
-  it("leaves out a prompt with no text, such as an image, and the replies that follow it", () => {
-    const imageOnly: Item = {
-      type: "userMessage",
-      id: "u-image",
-      content: [{ type: "image", url: "https://example.com/a.png" }],
-    };
-    const result = after(
-      [shown, turn("turn-1", [imageOnly, agent("a-1", "A picture")])],
-      "turn-shown",
-    );
-    assert.deepStrictEqual(result, { _tag: "Turns", turns: [], throughNativeId: "turn-shown" });
+    assert.equal(result._tag === "Turns" && result.turns.length, 1);
   });
 });
 
 describe("a Codex turn still running when its session is imported", () => {
   const record = (value: unknown) => JSON.stringify(value);
-  const message = (role: "user" | "assistant", turnId: string, text: string) =>
+  const line = (role: "user" | "assistant", turnId: string, text: string) =>
     record({
       type: "response_item",
       timestamp: "2026-11-20T10:00:00.000Z",
@@ -194,52 +120,55 @@ describe("a Codex turn still running when its session is imported", () => {
     });
   const finishedFirstTurn = [
     event("task_started", "turn-1"),
-    message("user", "turn-1", "First"),
-    message("assistant", "turn-1", "First reply"),
+    line("user", "turn-1", "First"),
+    line("assistant", "turn-1", "First reply"),
     event("task_complete", "turn-1"),
   ];
-  const runningSecondTurn = [
+  const secondTurn = [
     event("task_started", "turn-2"),
-    message("user", "turn-2", "Second"),
-    message("assistant", "turn-2", "Partial"),
+    line("user", "turn-2", "Second"),
+    line("assistant", "turn-2", "Partial"),
   ];
 
   it("is left out of the import, and recorded whole by the sync once it completes", () => {
-    const imported = rollout(...finishedFirstTurn, ...runningSecondTurn);
+    const imported = rollout(...finishedFirstTurn, ...secondTurn);
     assert.deepStrictEqual(
       imported?.messages.map((entry) => entry.text),
       ["First", "First reply"],
     );
-    const anchor = imported?.messages.findLast((entry) => entry.nativeId !== undefined)?.nativeId;
+    const anchor = imported?.messages.at(-1)?.nativeId ?? "";
     assert.equal(anchor, "turn-1");
 
-    const completed = (status: Turn["status"]) => [
-      turn("turn-1", [user("u-1", "First"), agent("a-1", "First reply")]),
-      turn(
-        "turn-2",
-        [user("u-2", "Second"), agent("a-2", "Partial"), agent("a-3", "Full reply")],
-        status,
-      ),
-    ];
-    assert.deepStrictEqual(after(completed("inProgress"), anchor ?? ""), {
-      _tag: "Turns",
-      turns: [],
-      throughNativeId: "turn-1",
-    });
-    const read = after(completed("completed"), anchor ?? "");
+    const completed = rollout(
+      ...finishedFirstTurn,
+      ...secondTurn,
+      line("assistant", "turn-2", "Full reply"),
+      event("task_complete", "turn-2"),
+    );
+    const read = codexTurnsAfter(completed?.messages ?? [], anchor);
     assert.equal(read._tag === "Turns" && read.turns[0]?.assistantText, "Partial\n\nFull reply");
   });
 
+  it("drops every message of the running turn, not only those after its last prompt", () => {
+    const imported = rollout(
+      ...finishedFirstTurn,
+      event("task_started", "turn-2"),
+      line("user", "turn-2", "Second"),
+      line("assistant", "turn-2", "Working"),
+      line("user", "turn-2", "Also this"),
+    );
+    assert.deepStrictEqual(
+      imported?.messages.map((entry) => entry.text),
+      ["First", "First reply"],
+    );
+  });
+
   it("keeps the whole import when its only turn is the running one", () => {
-    assert.equal(rollout(...runningSecondTurn)?.messages.length, 2);
+    assert.equal(rollout(...secondTurn.slice(0, 3))?.messages.length, 2);
   });
 
   it("counts an interrupted turn as finished", () => {
-    const imported = rollout(
-      ...finishedFirstTurn,
-      ...runningSecondTurn,
-      event("turn_aborted", "turn-2"),
-    );
+    const imported = rollout(...finishedFirstTurn, ...secondTurn, event("turn_aborted", "turn-2"));
     assert.equal(imported?.messages.length, 4);
   });
 });

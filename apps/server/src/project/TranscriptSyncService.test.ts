@@ -31,7 +31,7 @@ import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ProviderReplayHarness from "../orchestration-v2/testkit/ProviderReplayHarness.ts";
 import * as AgentSessionScanner from "./AgentSessionScanner.ts";
-import * as CodexSessionReader from "./CodexSessionReader.ts";
+import * as ProjectService from "./ProjectService.ts";
 import * as TranscriptSyncService from "./TranscriptSyncService.ts";
 
 const instanceId = ProviderInstanceId.make("claudeAgent");
@@ -82,6 +82,8 @@ type SeedRun = {
   readonly turnStrength?: "strong" | "weak";
   /** A provider thread other than the active one, which holds the same native session. */
   readonly onEarlierProviderThread?: true;
+  /** The run left an assistant message in the thread. */
+  readonly output?: true;
 };
 
 const seed = Effect.fn("TranscriptSyncService.test.seed")(function* (input: {
@@ -208,6 +210,34 @@ const seed = Effect.fn("TranscriptSyncService.test.seed")(function* (input: {
         },
       });
     }
+    if (run.output === true) {
+      yield* projections.apply({
+        id: EventId.make(`sync:output:${ordinal}`),
+        type: "turn-item.updated",
+        threadId,
+        occurredAt: now,
+        payload: {
+          id: TurnItemId.make(`output:${ordinal}`),
+          threadId,
+          runId: RunId.make(`run:${ordinal}`),
+          nodeId: null,
+          providerThreadId,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal: 0,
+          status: "completed",
+          title: null,
+          startedAt: now,
+          completedAt: now,
+          updatedAt: now,
+          type: "assistant_message",
+          messageId: MessageId.make(`output-message:${ordinal}`),
+          text: "It wrote something before it lost its place.",
+          streaming: false,
+        },
+      });
+    }
   }
   return projections;
 });
@@ -242,42 +272,26 @@ const providerThreadAt = (
 
 const signature = { size: 100, mtimeMs: 5 };
 
-// Claude and Pi sessions are read as files and Codex through its app-server, so a test that reads
-// no Codex thread gets a reader that fails when asked.
-const layerNoCodexReader = Layer.mock(CodexSessionReader.CodexSessionReader)({});
+// Where a thread's sessions are looked for: its project's directory.
+const layerProjects = Layer.mock(ProjectService.ProjectService)({
+  getById: () => Effect.succeedSome({ workspaceRoot: "/work/project" } as never),
+});
 
 /** A sync whose reader answers with `reads[anchor]` and remembers what it was asked. */
 const makeService = Effect.fn("TranscriptSyncService.test.makeService")(function* (
   reads: Record<string, AgentSessionScanner.TurnsAfterAnchor>,
-  codexReads: Record<string, AgentSessionScanner.TurnsAfterAnchor> = {},
 ) {
-  const codexAsked: Array<string> = [];
-  // The Codex session's rollout file: where the app server says it is and what a stat shows.
-  // By default it is located but cannot be stat'ed, so every sync reads.
-  const codexRollout: {
-    path: string | undefined;
-    signature: AgentSessionScanner.TranscriptSignature | undefined;
-  } = { path: "/codex/rollout.jsonl", signature: undefined };
-  const codexReader = Layer.mock(CodexSessionReader.CodexSessionReader)({
-    readTurnsAfter: ({ anchorNativeId }) =>
-      Effect.sync(() => {
-        codexAsked.push(anchorNativeId);
-        return {
-          ...(codexReads[anchorNativeId] ?? { _tag: "AnchorNotFound" as const }),
-          ...(codexRollout.path === undefined ? {} : { rolloutPath: codexRollout.path }),
-        };
-      }),
-    rolloutSignature: () => Effect.sync(() => codexRollout.signature),
-  });
   const asked: Array<{
     readonly anchor: string;
     readonly unchangedSince: AgentSessionScanner.TranscriptSignature | undefined;
   }> = [];
+  const workspaceRoots: Array<string | undefined> = [];
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const scanner = Layer.mock(AgentSessionScanner.AgentSessionScanner)({
-    readTurnsAfter: ({ anchorNativeId, unchangedSince }) =>
+    readTurnsAfter: ({ anchorNativeId, unchangedSince, workspaceRoot }) =>
       Effect.sync(() => {
         asked.push({ anchor: anchorNativeId, unchangedSince });
+        workspaceRoots.push(workspaceRoot);
         return unchangedSince !== undefined
           ? ({ _tag: "Unchanged" } as const)
           : { ...(reads[anchorNativeId] ?? { _tag: "AnchorNotFound" as const }), signature };
@@ -289,7 +303,7 @@ const makeService = Effect.fn("TranscriptSyncService.test.makeService")(function
         Layer.provide(
           Layer.mergeAll(
             scanner,
-            codexReader,
+            layerProjects,
             Layer.succeed(Orchestrator.OrchestratorV2, orchestrator),
           ),
         ),
@@ -299,8 +313,7 @@ const makeService = Effect.fn("TranscriptSyncService.test.makeService")(function
   return {
     service,
     asked,
-    codexAsked,
-    codexRollout,
+    workspaceRoots,
     get anchors() {
       return asked.map((entry) => entry.anchor);
     },
@@ -530,7 +543,7 @@ it.effect("serializes triggers for a thread, and the later one finds the file un
         TranscriptSyncService.layer.pipe(
           Layer.provide(
             Layer.mergeAll(
-              layerNoCodexReader,
+              layerProjects,
               Layer.mock(AgentSessionScanner.AgentSessionScanner)({
                 readTurnsAfter: ({ unchangedSince }) =>
                   Effect.gen(function* () {
@@ -568,7 +581,7 @@ it.effect("starts a sync in the background without waiting for it", () =>
         TranscriptSyncService.layer.pipe(
           Layer.provide(
             Layer.mergeAll(
-              layerNoCodexReader,
+              layerProjects,
               Layer.mock(AgentSessionScanner.AgentSessionScanner)({
                 readTurnsAfter: ({ anchorNativeId }) =>
                   Deferred.succeed(read, anchorNativeId).pipe(
@@ -599,7 +612,7 @@ it.effect("reads again after a dispatch the thread refused, though the file is u
         TranscriptSyncService.layer.pipe(
           Layer.provide(
             Layer.mergeAll(
-              layerNoCodexReader,
+              layerProjects,
               Layer.mock(AgentSessionScanner.AgentSessionScanner)({
                 readTurnsAfter: ({ unchangedSince }) =>
                   Effect.gen(function* () {
@@ -661,19 +674,19 @@ describe("Codex sessions", () => {
       anchor: "turn-t3",
     },
     {
-      name: "imported history anchors on the native id of its last item",
+      name: "imported history anchors on the turn id of its last item",
       seeded: { provider: "codex", runs: [], importedItems: ["turn-a", "turn-b"] },
       anchor: "turn-b",
     },
-  ] as const)("reads through the Codex reader when $name", ({ seeded, anchor }) =>
+  ] as const)("reads the rollout from the thread's directory when $name", ({ seeded, anchor }) =>
     Effect.gen(function* () {
       const projections = yield* seed(seeded);
-      const sync = yield* makeService({}, { [anchor]: turnsOf("one") });
+      const sync = yield* makeService({ [anchor]: turnsOf("one") });
 
       assert.equal(yield* sync.service.sync(threadId), 1);
 
-      assert.deepEqual(sync.codexAsked, [anchor]);
-      assert.deepEqual(sync.anchors, []);
+      assert.deepEqual(sync.anchors, [anchor]);
+      assert.deepEqual(sync.workspaceRoots, ["/work/project"]);
       assert.equal(
         (yield* projections.getThreadProjection(threadId)).runs.at(-1)?.recordedFrom,
         "transcript",
@@ -681,101 +694,9 @@ describe("Codex sessions", () => {
     }).pipe(Effect.provide(layerStores)),
   );
 
-  it.effect("moves its anchor to the recorded turn and writes nothing when read again", () =>
-    Effect.gen(function* () {
-      const projections = yield* seed({
-        provider: "codex",
-        runs: [{ status: "completed", turn: "turn-t3", turnStrength: "strong" }],
-      });
-      const sync = yield* makeService(
-        {},
-        {
-          "turn-t3": turnsOf("one"),
-          "a-one": { _tag: "Turns", turns: [], throughNativeId: "a-one" },
-        },
-      );
-
-      assert.equal(yield* sync.service.sync(threadId), 1);
-      assert.equal(yield* sync.service.sync(threadId), 0);
-      assert.equal(yield* sync.service.sync(threadId), 0);
-
-      assert.deepEqual(sync.codexAsked, ["turn-t3", "a-one", "a-one"]);
-      assert.equal((yield* projections.getThreadProjection(threadId)).runs.length, 2);
-    }).pipe(Effect.provide(layerStores)),
-  );
-
-  it.effect("reads again only when the rollout file has changed", () =>
-    Effect.gen(function* () {
-      yield* seed({
-        provider: "codex",
-        runs: [{ status: "completed", turn: "turn-t3", turnStrength: "strong" }],
-      });
-      const empty = { _tag: "Turns", turns: [], throughNativeId: "turn-t3" } as const;
-      const sync = yield* makeService({}, { "turn-t3": empty });
-      const first = { size: 10, mtimeMs: 1 };
-      sync.codexRollout.signature = first;
-
-      // The first read finds where the rollout is, and the second remembers what it looked like.
-      yield* sync.service.sync(threadId);
-      yield* sync.service.sync(threadId);
-      assert.deepEqual(sync.codexAsked, ["turn-t3", "turn-t3"]);
-
-      yield* sync.service.sync(threadId);
-      assert.deepEqual(sync.codexAsked, ["turn-t3", "turn-t3"]);
-
-      sync.codexRollout.signature = { size: 20, mtimeMs: 2 };
-      yield* sync.service.sync(threadId);
-      assert.deepEqual(sync.codexAsked, ["turn-t3", "turn-t3", "turn-t3"]);
-
-      // A rollout that is gone, as when Codex compressed it, is read through the app server.
-      sync.codexRollout.signature = undefined;
-      yield* sync.service.sync(threadId);
-      assert.equal(sync.codexAsked.length, 4);
-    }).pipe(Effect.provide(layerStores)),
-  );
-
-  it.effect("reads a session whose rollout cannot be located only once", () =>
-    Effect.gen(function* () {
-      yield* seed({
-        provider: "codex",
-        runs: [{ status: "completed", turn: "turn-t3", turnStrength: "strong" }],
-      });
-      const sync = yield* makeService(
-        {},
-        { "turn-t3": { _tag: "Turns", turns: [], throughNativeId: "turn-t3" } },
-      );
-      sync.codexRollout.path = undefined;
-
-      yield* sync.service.sync(threadId);
-      yield* sync.service.sync(threadId);
-      yield* sync.service.sync(threadId);
-
-      assert.deepEqual(sync.codexAsked, ["turn-t3"]);
-    }).pipe(Effect.provide(layerStores)),
-  );
-
-  it.effect("writes nothing when the anchor is not in the Codex thread", () =>
-    Effect.gen(function* () {
-      const projections = yield* seed({
-        provider: "codex",
-        runs: [{ status: "completed", turn: "turn-t3", turnStrength: "strong" }],
-      });
-      const sync = yield* makeService({}, {});
-
-      assert.equal(yield* sync.service.sync(threadId), 0);
-
-      assert.deepEqual(sync.codexAsked, ["turn-t3"]);
-      assert.equal((yield* projections.getThreadProjection(threadId)).runs.length, 1);
-    }).pipe(Effect.provide(layerStores)),
-  );
-
   it.effect.each([
     {
-      name: "the latest run's provider turn has no Codex turn id",
-      seeded: { provider: "codex", runs: [{ status: "failed", turn: "no-native-id" }] },
-    },
-    {
-      name: "the latest run's Codex turn id is weak",
+      name: "the latest run's provider turn has a weak Codex turn id",
       seeded: { provider: "codex", runs: [{ status: "completed", turn: "turn-t3" }] },
     },
     {
@@ -795,14 +716,38 @@ describe("Codex sessions", () => {
         nativeConversationHeadRef: true,
       },
     },
-  ] as const)("does not read the Codex thread when $name", ({ seeded }) =>
+  ] as const)("does not read the rollout when $name", ({ seeded }) =>
     Effect.gen(function* () {
       yield* seed(seeded);
-      const sync = yield* makeService({}, { "turn-t3": turnsOf("one") });
+      const sync = yield* makeService({ "turn-t3": turnsOf("one") });
 
       assert.equal(yield* sync.service.sync(threadId), 0);
 
-      assert.deepEqual(sync.codexAsked, []);
+      assert.deepEqual(sync.anchors, []);
+    }).pipe(Effect.provide(layerStores)),
+  );
+
+  it.effect("moves its anchor to the turn it recorded, which names the turn and not an item", () =>
+    Effect.gen(function* () {
+      const projections = yield* seed({
+        provider: "codex",
+        runs: [{ status: "completed", turn: "turn-t3", turnStrength: "strong" }],
+      });
+      const recorded: AgentSessionScanner.TurnsAfterAnchor = {
+        _tag: "Turns",
+        turns: [{ ...terminal("one"), nativeRefId: "turn-one" }],
+        throughNativeId: "turn-one",
+      };
+      const sync = yield* makeService({
+        "turn-t3": recorded,
+        "turn-one": { _tag: "Turns", turns: [], throughNativeId: "turn-one" },
+      });
+
+      assert.equal(yield* sync.service.sync(threadId), 1);
+      assert.equal(yield* sync.service.sync(threadId), 0);
+
+      assert.deepEqual(sync.anchors, ["turn-t3", "turn-one"]);
+      assert.equal((yield* projections.getThreadProjection(threadId)).runs.length, 2);
     }).pipe(Effect.provide(layerStores)),
   );
 });
@@ -973,5 +918,54 @@ describe("Pi sessions", () => {
 
       assert.deepEqual(sync.anchors, []);
     }).pipe(Effect.provide(layerStores)),
+  );
+});
+
+describe("a newest turn with no native ref", () => {
+  const providers = [
+    { provider: "claudeAgent", anchor: "a-t3", head: undefined, turn: "a-t3" },
+    { provider: "codex", anchor: "turn-t3", head: undefined, turn: "turn-t3" },
+    { provider: "pi", anchor: "leaf-1", head: "leaf-1", turn: "user-entry-1" },
+  ] as const;
+
+  it.effect.each(providers)(
+    "is passed over for the turn before it when it wrote nothing: $provider",
+    ({ provider, anchor, head, turn }) =>
+      Effect.gen(function* () {
+        yield* seed({
+          provider,
+          ...(head === undefined ? {} : { head }),
+          runs: [
+            { status: "completed", turn, turnStrength: "strong" },
+            // A Codex /goal control turn, or a Pi turn that wrote no entries.
+            { status: "completed", turn: "no-native-id" },
+          ],
+        });
+        const sync = yield* makeService({ [anchor]: turnsOf("one") });
+
+        assert.equal(yield* sync.service.sync(threadId), 1);
+
+        assert.deepEqual(sync.anchors, [anchor]);
+      }).pipe(Effect.provide(layerStores)),
+  );
+
+  it.effect.each(providers)(
+    "stops the sync when it left output, since nothing after it can be told apart: $provider",
+    ({ provider, head, turn }) =>
+      Effect.gen(function* () {
+        yield* seed({
+          provider,
+          ...(head === undefined ? {} : { head }),
+          runs: [
+            { status: "completed", turn, turnStrength: "strong" },
+            { status: "failed", turn: "no-native-id", output: true },
+          ],
+        });
+        const sync = yield* makeService({});
+
+        assert.equal(yield* sync.service.sync(threadId), 0);
+
+        assert.deepEqual(sync.anchors, []);
+      }).pipe(Effect.provide(layerStores)),
   );
 });

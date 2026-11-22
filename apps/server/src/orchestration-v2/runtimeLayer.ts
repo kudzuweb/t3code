@@ -16,7 +16,6 @@ import * as ProviderAuthService from "../provider/ProviderAuthService.ts";
 import * as ProviderInstallationGate from "../provider/ProviderInstallationGate.ts";
 import * as AgentSessionImporter from "../project/AgentSessionImporter.ts";
 import * as AgentSessionScanner from "../project/AgentSessionScanner.ts";
-import * as CodexSessionReader from "../project/CodexSessionReader.ts";
 import * as TranscriptSyncService from "../project/TranscriptSyncService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
@@ -282,21 +281,11 @@ const layerAgentSessionImporterProvided = AgentSessionImporter.layer.pipe(
   ),
 );
 
-const layerCodexSessionReaderProvided = CodexSessionReader.layer.pipe(
-  Layer.provide(
-    Layer.mergeAll(
-      layerProjectService,
-      IdAllocator.layer,
-      ProviderAdapterRegistry.layerFromProviderInstanceRegistry,
-    ),
-  ),
-);
-
 const layerTranscriptSyncProvided = TranscriptSyncService.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
       layerAgentSessionScannerProvided,
-      layerCodexSessionReaderProvided,
+      layerProjectService,
       layerOrchestratorProvided,
     ),
   ),

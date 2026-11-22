@@ -44,7 +44,7 @@ import * as ClaudeSessionChain from "./ClaudeSessionChain.ts";
 import { resolveCodexHomeLayout } from "../provider/Drivers/CodexHomeLayout.ts";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
-import { type CodexTurnStatus, isEndedCodexTurnStatus } from "./CodexTurns.ts";
+import { type CodexTurnStatus, codexTurnsAfter, isEndedCodexTurnStatus } from "./CodexTurns.ts";
 import { piHome, resolvePiSessionsDir } from "@t3tools/provider-pi/server/usage";
 import * as ServerSettings from "../serverSettings.ts";
 import { sourceControlDefinitions } from "../sourceControl/sourceControlDefinitions.ts";
@@ -167,6 +167,7 @@ const TranscriptRecord = Schema.Struct({
       model: Schema.optional(Schema.String),
       cwd: Schema.optional(Schema.String),
       history_base: Schema.optional(Schema.Unknown),
+      turn_id: Schema.optional(Schema.String),
       content: Schema.optional(Schema.Array(TranscriptContentBlock)),
       internal_chat_message_metadata_passthrough: Schema.optional(Schema.Unknown),
     }),
@@ -287,9 +288,9 @@ export class AgentSessionScanner extends Context.Service<
       input: AgentSessionKey & { readonly workspaceRoot: string },
     ) => Effect.Effect<AgentSessionRecentThread, AgentSessionScanError>;
     /**
-     * What the session gained after `anchorNativeId`. Claude and Pi sessions are read from their
-     * files; a Codex thread is read through its app server by `CodexSessionReader`. For Pi,
-     * `providerSessionId` is the session file's path.
+     * What the session gained after `anchorNativeId`, read from its file. For Pi,
+     * `providerSessionId` is the session file's path. A Codex rollout is found through
+     * `workspaceRoot`, the way the importer finds it, and its path is remembered.
      */
     readonly readTurnsAfter: (
       input: AgentSessionKey & {
@@ -297,6 +298,8 @@ export class AgentSessionScanner extends Context.Service<
         readonly anchorNativeId: string;
         /** A transcript still looking like this was already read, so it is not read again. */
         readonly unchangedSince?: TranscriptSignature;
+        /** The directory the session ran in, which a Codex rollout is looked up through. */
+        readonly workspaceRoot?: string;
       },
     ) => Effect.Effect<
       | (TurnsAfterAnchor & { readonly signature?: TranscriptSignature })
@@ -826,15 +829,25 @@ export function parseAgentSessionTranscript(
 
 // A rollout marks each turn's start and end with events; one without them, as older rollouts,
 // gives no sign that its last turn is running.
-function codexLastTurnStatus(records: ReadonlyArray<DecodedTranscriptRecord>): CodexTurnStatus {
-  let status: CodexTurnStatus = "completed";
+function codexLastTurn(records: ReadonlyArray<DecodedTranscriptRecord>): {
+  readonly turnId: string | undefined;
+  readonly status: CodexTurnStatus;
+} {
+  let last: { turnId: string | undefined; status: CodexTurnStatus } = {
+    turnId: undefined,
+    status: "completed",
+  };
   for (const record of records) {
     if (record.type !== "event_msg") continue;
-    if (record.payload?.type === "task_started") status = "inProgress";
-    else if (record.payload?.type === "task_complete") status = "completed";
-    else if (record.payload?.type === "turn_aborted") status = "interrupted";
+    if (record.payload?.type === "task_started") {
+      last = { turnId: record.payload.turn_id, status: "inProgress" };
+    } else if (record.payload?.type === "task_complete") {
+      last = { ...last, status: "completed" };
+    } else if (record.payload?.type === "turn_aborted") {
+      last = { ...last, status: "interrupted" };
+    }
   }
-  return status;
+  return last;
 }
 
 function parseAgentSessionRecords(
@@ -956,6 +969,7 @@ function parseAgentSessionRecords(
     return false;
   };
 
+  let codexTurn: string | undefined;
   let recordIndex = -1;
   for (const record of input.source === "pi" ? activePiBranch(records) : records) {
     recordIndex += 1;
@@ -1007,6 +1021,11 @@ function parseAgentSessionRecords(
       model = record.payload.model.trim();
       continue;
     }
+    // A message in an older rollout names no turn, so it belongs to the one the last start opened.
+    if (record.type === "event_msg" && record.payload?.type === "task_started") {
+      codexTurn = record.payload.turn_id ?? codexTurn;
+      continue;
+    }
     if (record.type === "event_msg" && record.payload?.type === "user_message") {
       const text = record.payload.message ?? "";
       if (text.trim().length === 0) continue;
@@ -1025,6 +1044,7 @@ function parseAgentSessionRecords(
         role: "user",
         text,
         createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
+        ...(codexTurn === undefined ? {} : { nativeId: codexTurn }),
         codexResponseUser: false,
       });
       continue;
@@ -1046,24 +1066,27 @@ function parseAgentSessionRecords(
       continue;
     }
     const codexNativeId =
-      record.payload.role === "user"
-        ? codexTurnId(record.payload.internal_chat_message_metadata_passthrough)
-        : null;
+      codexTurnId(record.payload.internal_chat_message_metadata_passthrough) ?? codexTurn;
     retainMessage({
       role: record.payload.role,
       text: extractedText,
       createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
-      ...(codexNativeId === null ? {} : { nativeId: codexNativeId }),
+      ...(codexNativeId === undefined ? {} : { nativeId: codexNativeId }),
       codexResponseUser: record.payload.role === "user",
     });
   }
 
   // A turn still running is left for the sync, which records it whole once it has finished.
+  const codexLast = input.source === "codex" ? codexLastTurn(records) : undefined;
   const lastTurnRunning =
     (input.source === "claudeAgent" && !isFinishedClaudeTurn(claudeFields.turn)) ||
-    (input.source === "codex" && !isEndedCodexTurnStatus(codexLastTurnStatus(records)));
+    (codexLast !== undefined && !isEndedCodexTurnStatus(codexLast.status));
   if (lastTurnRunning) {
-    const lastPrompt = messages.findLastIndex((message) => message.role === "user");
+    // Claude's turn starts at its last prompt; a Codex turn is every message that names it.
+    const lastPrompt =
+      codexLast === undefined
+        ? messages.findLastIndex((message) => message.role === "user")
+        : messages.findIndex((message) => message.nativeId === codexLast.turnId);
     // A session of one running turn has nothing earlier to show, so it stays whole.
     if (lastPrompt > 0 || (lastPrompt === 0 && droppedMessageCount > 0)) {
       const unfinished = messages.splice(lastPrompt);
@@ -1133,7 +1156,11 @@ function shouldRetainDecodedRecord(
   return (
     record.type === "session_meta" ||
     record.type === "turn_context" ||
-    (record.type === "event_msg" && record.payload?.type === "user_message") ||
+    (record.type === "event_msg" &&
+      (record.payload?.type === "user_message" ||
+        record.payload?.type === "task_started" ||
+        record.payload?.type === "task_complete" ||
+        record.payload?.type === "turn_aborted")) ||
     (record.type === "response_item" &&
       record.payload?.type === "message" &&
       (record.payload.role === "user" || record.payload.role === "assistant"))
@@ -2862,9 +2889,11 @@ export const make = Effect.gen(function* () {
           refreshCandidates,
         }),
       ).pipe(Stream.runHead);
-    // The cached collection can predate a session started since, so look again before giving up.
+    // The cached collection can predate a session started since, or name a file that has moved,
+    // so look again before giving up.
     const cached = yield* find(false);
-    const found = Option.isSome(cached) ? cached : yield* find(true);
+    const found =
+      Option.isSome(cached) && cached.value._tag !== "Skipped" ? cached : yield* find(true);
     return Option.getOrElse(found, (): AgentSessionRecentThread => ({ _tag: "Skipped" }));
   });
 
@@ -2944,9 +2973,58 @@ export const make = Effect.gen(function* () {
     };
   });
 
+  // Where each Codex session's rollout was last found, so a poll costs one stat of that file.
+  const codexRollouts = new Map<string, string>();
+
+  const readCodexTurnsAfter = Effect.fn("AgentSessionScanner.readCodexTurnsAfter")(function* (
+    session: AgentSessionKey,
+    anchorNativeId: string,
+    unchangedSince: TranscriptSignature | undefined,
+    workspaceRoot: string | undefined,
+  ) {
+    const key = `${session.providerInstanceId}\0${session.providerSessionId}`;
+    const knownPath = codexRollouts.get(key);
+    const known = knownPath === undefined ? Option.none() : yield* statOption(knownPath);
+    if (
+      unchangedSince !== undefined &&
+      Option.isSome(known) &&
+      known.value.type === "File" &&
+      unchangedSince.size === Number(known.value.size) &&
+      unchangedSince.mtimeMs ===
+        Option.match(known.value.mtime, { onNone: () => 0, onSome: (mtime) => mtime.getTime() })
+    ) {
+      return { _tag: "Unchanged" } as const;
+    }
+    // A rollout that moved, as when Codex compressed it, is found again the way the importer finds it.
+    if (workspaceRoot === undefined) return { _tag: "NoTranscript" } as const;
+    const found = yield* findProjectSession({ ...session, workspaceRoot });
+    if (found._tag !== "Importable") return { _tag: "NoTranscript" } as const;
+    codexRollouts.set(key, found.source.filePath);
+    return {
+      ...codexTurnsAfter(found.thread.messages, anchorNativeId),
+      // What the file looked like when it was read, so a change during the read shows next time.
+      signature: { size: found.source.size, mtimeMs: found.source.mtimeMs ?? 0 },
+    };
+  });
+
   const readTurnsAfter: AgentSessionScanner["Service"]["readTurnsAfter"] = Effect.fn(
     "AgentSessionScanner.readTurnsAfter",
-  )(function* ({ driver, providerInstanceId, providerSessionId, anchorNativeId, unchangedSince }) {
+  )(function* ({
+    driver,
+    providerInstanceId,
+    providerSessionId,
+    anchorNativeId,
+    unchangedSince,
+    workspaceRoot,
+  }) {
+    if (driver === "codex") {
+      return yield* readCodexTurnsAfter(
+        { providerInstanceId, providerSessionId },
+        anchorNativeId,
+        unchangedSince,
+        workspaceRoot,
+      );
+    }
     if (driver === "pi")
       return yield* readPiTurnsAfter(providerSessionId, anchorNativeId, unchangedSince);
     if (driver !== "claudeAgent") return { _tag: "Unsupported" } as const;

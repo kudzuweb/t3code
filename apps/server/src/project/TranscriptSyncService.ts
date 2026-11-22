@@ -13,13 +13,14 @@ import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 
 import { CLAUDE_PROVIDER, claudeTurnCursor } from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
 import { CODEX_DRIVER_KIND } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import type { ProjectionRecords } from "../orchestration-v2/ProjectionStore.ts";
 import * as AgentSessionScanner from "./AgentSessionScanner.ts";
-import * as CodexSessionReader from "./CodexSessionReader.ts";
+import * as ProjectService from "./ProjectService.ts";
 import { codexTurnCursor } from "./CodexTurns.ts";
 
 /**
@@ -79,7 +80,7 @@ const isTerminal = (run: OrchestrationV2Run) =>
 const make = Effect.gen(function* () {
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const scanner = yield* AgentSessionScanner.AgentSessionScanner;
-  const codexSessions = yield* CodexSessionReader.CodexSessionReader;
+  const projects = yield* ProjectService.ProjectService;
   const locks = yield* KeyedLock.make<ThreadId>();
   // What the last read of each provider thread's transcript saw, so an unchanged file is not read again.
   const lastRead = new Map<
@@ -87,13 +88,19 @@ const make = Effect.gen(function* () {
     { readonly anchor: string; readonly signature: AgentSessionScanner.TranscriptSignature }
   >();
 
-  // Where Codex says each thread's rollout file is, or null when it named none. Codex is read
-  // through its app server, so the rollout's size and mtime tell whether that read can be skipped.
-  const codexRollouts = new Map<ProviderThreadId, string | null>();
-
   const newestItemNativeId = (items: ReadonlyArray<OrchestrationV2TurnItem>): string | undefined =>
     items.findLast((item) => item.nativeItemRef?.nativeId != null)?.nativeItemRef?.nativeId ??
     undefined;
+
+  const leftOutput = Effect.fn("TranscriptSyncService.leftOutput")(function* (
+    threadId: ThreadId,
+    run: OrchestrationV2Run,
+  ) {
+    const { turnItems } = yield* orchestrator.getThreadRecords(threadId, ["turnItems"], {
+      turnItemRunIds: [run.id],
+    });
+    return turnItems.some((item) => item.type === "assistant_message" && item.text.trim() !== "");
+  });
 
   /**
    * Where the transcript was last shown: the newest run that reached this provider thread decides.
@@ -128,9 +135,19 @@ const make = Effect.gen(function* () {
       }
       const providerTurn = Orchestrator.providerTurnForRun(records, run);
       if (providerTurn === undefined) continue;
-      // A turn that never ended, or ended with no record to name (it failed before the provider
-      // wrote anything), may sit beside output of its own, so nothing after it can be told apart.
-      return endedTurnCursor(providerThread, providerTurn);
+      const cursor = endedTurnCursor(providerThread, providerTurn);
+      if (cursor !== null) return cursor;
+      // A turn with no native ref that wrote nothing never reached the provider's session, as
+      // with a Codex goal control turn, so the anchor stays where the turn before it left it. One
+      // that wrote something may sit beside output of its own, so nothing after it can be told apart.
+      if (
+        providerTurn.nativeTurnRef === null &&
+        providerTurnEnded(providerTurn) &&
+        !(yield* leftOutput(threadId, run))
+      ) {
+        continue;
+      }
+      return null;
     }
     const { turnItems } = yield* orchestrator.getThreadRecords(threadId, ["turnItems"], {
       turnItemRunIds: [null],
@@ -175,47 +192,20 @@ const make = Effect.gen(function* () {
     }
 
     const previous = lastRead.get(providerThread.id);
-    const readCodex = Effect.fn("TranscriptSyncService.readCodex")(function* () {
-      const rolloutPath = codexRollouts.get(providerThread.id);
-      if (rolloutPath === null) {
-        yield* Effect.logDebug("Codex named no rollout file, so its thread is read only once", {
-          threadId,
-        });
-        return { _tag: "Unchanged" } as const;
-      }
-      // The signature is taken before the read, so a change during it shows on the next sync.
-      const signature =
-        rolloutPath === undefined ? undefined : yield* codexSessions.rolloutSignature(rolloutPath);
-      if (
-        signature !== undefined &&
-        previous?.anchor === anchorNativeId &&
-        previous.signature.size === signature.size &&
-        previous.signature.mtimeMs === signature.mtimeMs
-      ) {
-        return { _tag: "Unchanged" } as const;
-      }
-      const codexRead = yield* codexSessions.readTurnsAfter({
-        thread,
-        providerThread,
-        anchorNativeId,
-      });
-      if (rolloutPath === undefined) {
-        codexRollouts.set(providerThread.id, codexRead.rolloutPath ?? null);
-      } else if (codexRead.rolloutPath !== undefined && codexRead.rolloutPath !== rolloutPath) {
-        codexRollouts.set(providerThread.id, codexRead.rolloutPath);
-      }
-      return signature === undefined ? codexRead : { ...codexRead, signature };
-    });
-    const read: TranscriptRead =
+    // A Codex rollout is found through the directory the thread works in.
+    const workspaceRoot =
       providerThread.driver === CODEX_DRIVER_KIND
-        ? yield* readCodex()
-        : yield* scanner.readTurnsAfter({
-            driver: providerThread.driver,
-            providerInstanceId: providerThread.providerInstanceId,
-            providerSessionId: nativeThread.nativeId,
-            anchorNativeId,
-            ...(previous?.anchor === anchorNativeId ? { unchangedSince: previous.signature } : {}),
-          });
+        ? (thread.worktreePath ??
+          Option.getOrUndefined(yield* projects.getById(thread.projectId))?.workspaceRoot)
+        : undefined;
+    const read: TranscriptRead = yield* scanner.readTurnsAfter({
+      driver: providerThread.driver,
+      providerInstanceId: providerThread.providerInstanceId,
+      providerSessionId: nativeThread.nativeId,
+      anchorNativeId,
+      ...(previous?.anchor === anchorNativeId ? { unchangedSince: previous.signature } : {}),
+      ...(workspaceRoot === undefined ? {} : { workspaceRoot }),
+    });
     if (read._tag === "Unchanged") return 0;
     // Only a read that leaves nothing to retry is remembered; a refused command reads again.
     const remember = (anchor: string) => {
