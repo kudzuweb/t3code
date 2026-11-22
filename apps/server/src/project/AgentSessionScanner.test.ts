@@ -1937,6 +1937,64 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
       }),
     );
 
+    it.effect(
+      "finds a session file once, then checks only that file until it changes or goes",
+      () =>
+        Effect.gen(function* () {
+          const path = yield* Path.Path;
+          const fileSystem = yield* FileSystem.FileSystem;
+          const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+          const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+          const line = (uuid: string, parentUuid: string | null, type: string) =>
+            encodeTranscriptRecord({
+              type,
+              uuid,
+              parentUuid,
+              sessionId: "claude-cached",
+              cwd: "/work/project",
+              timestamp: "2026-11-20T10:00:00.000Z",
+              message: { role: type, content: "text", stop_reason: "end_turn" },
+            });
+          const contents = `${line("u1", null, "user")}\n${line("a2", "u1", "assistant")}\n`;
+          const projects = path.join(claudeHomePath, "projects");
+          const original = path.join(projects, "-first", "claude-cached.jsonl");
+          yield* writeTranscript({ filePath: original, contents, mtimeMs: 1_000_000 });
+          const scanner = yield* AgentSessionScanner.AgentSessionScanner.pipe(
+            Effect.provide(
+              layerScannerTest({
+                claudeHomePath,
+                codexHomePath,
+                claudeChains: { "claude-cached": ["u1", "a2"] },
+              }),
+            ),
+          );
+          const read = (unchangedSince?: { readonly size: number; readonly mtimeMs: number }) =>
+            scanner.readTurnsAfter({
+              driver: ProviderDriverKind.make("claudeAgent"),
+              providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+              providerSessionId: "claude-cached",
+              anchorNativeId: "u1",
+              ...(unchangedSince === undefined ? {} : { unchangedSince }),
+            });
+
+          const first = yield* read();
+          const signature = "signature" in first ? first.signature : undefined;
+          expect(signature).toBeDefined();
+
+          // A newer copy elsewhere is not looked for while the remembered file is unchanged.
+          yield* writeTranscript({
+            filePath: path.join(projects, "-second", "claude-cached.jsonl"),
+            contents: `${contents}${contents}`,
+            mtimeMs: 3_000_000,
+          });
+          expect(yield* read(signature)).toEqual({ _tag: "Unchanged" });
+
+          // Once the remembered file is gone, the session is found again, in its new folder.
+          yield* fileSystem.remove(original);
+          expect(yield* read(signature)).toMatchObject({ _tag: "Turns" });
+        }),
+    );
+
     it.effect("lists titles from the head and tail of a transcript larger than the sample", () =>
       Effect.gen(function* () {
         const path = yield* Path.Path;

@@ -2788,6 +2788,8 @@ export const make = Effect.gen(function* () {
     return Option.getOrElse(found, (): AgentSessionRecentThread => ({ _tag: "Skipped" }));
   });
 
+  const transcriptPaths = new Map<string, string>();
+
   const readTurnsAfter: AgentSessionScanner["Service"]["readTurnsAfter"] = Effect.fn(
     "AgentSessionScanner.readTurnsAfter",
   )(function* ({ driver, providerInstanceId, providerSessionId, anchorNativeId, unchangedSince }) {
@@ -2813,11 +2815,8 @@ export const make = Effect.gen(function* () {
       typeof configuredHome === "string" ? configuredHome : hostEnvironment.CLAUDE_CONFIG_DIR,
     );
     const projectsDir = path.join(claudeHome, "projects");
-    // The same session id can sit in several project folders; the newest copy is the live one.
-    const projectFolders = yield* listDirectory(projectsDir);
-    const copies = yield* Effect.forEach(projectFolders, (folder) => {
-      const filePath = path.join(projectsDir, folder, `${providerSessionId}.jsonl`);
-      return statOption(filePath).pipe(
+    const statTranscript = (filePath: string) =>
+      statOption(filePath).pipe(
         Effect.map((info) =>
           Option.isSome(info) && info.value.type === "File"
             ? [
@@ -2833,9 +2832,30 @@ export const make = Effect.gen(function* () {
             : [],
         ),
       );
-    });
+    // A poll asks about every thread often, so an unchanged session costs one stat of the file
+    // found last time, not a listing of every project folder.
+    const cacheKey = `${providerInstanceId}\0${providerSessionId}`;
+    const rememberedPath = transcriptPaths.get(cacheKey);
+    if (unchangedSince !== undefined && rememberedPath?.startsWith(projectsDir + path.sep)) {
+      const [remembered] = yield* statTranscript(rememberedPath);
+      if (
+        remembered?.size === unchangedSince.size &&
+        remembered.mtimeMs === unchangedSince.mtimeMs
+      ) {
+        return { _tag: "Unchanged" } as const;
+      }
+    }
+    // The same session id can sit in several project folders; the newest copy is the live one.
+    const projectFolders = yield* listDirectory(projectsDir);
+    const copies = yield* Effect.forEach(projectFolders, (folder) =>
+      statTranscript(path.join(projectsDir, folder, `${providerSessionId}.jsonl`)),
+    );
     const transcript = copies.flat().toSorted((left, right) => right.mtimeMs - left.mtimeMs)[0];
-    if (transcript === undefined) return { _tag: "NoTranscript" } as const;
+    if (transcript === undefined) {
+      transcriptPaths.delete(cacheKey);
+      return { _tag: "NoTranscript" } as const;
+    }
+    transcriptPaths.set(cacheKey, transcript.filePath);
 
     const signature = { size: transcript.size, mtimeMs: transcript.mtimeMs };
     if (unchangedSince?.size === signature.size && unchangedSince.mtimeMs === signature.mtimeMs) {
