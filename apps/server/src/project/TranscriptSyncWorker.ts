@@ -36,10 +36,9 @@ export const layer = Layer.effectDiscard(
         .map((candidate) => candidate.threadId);
       if (threadIds.length > 0) yield* sync.syncMany(threadIds);
     }).pipe(
-      Effect.catchCause((cause) =>
-        Cause.hasInterruptsOnly(cause)
-          ? Effect.failCause(cause)
-          : Effect.logWarning("Transcript sync tick failed", { cause }),
+      Effect.catchCauseIf(
+        (cause) => !Cause.hasInterruptsOnly(cause),
+        (cause) => Effect.logWarning("Transcript sync tick failed", { cause }),
       ),
     );
 

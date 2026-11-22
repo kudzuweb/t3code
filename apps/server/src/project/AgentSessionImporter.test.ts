@@ -250,6 +250,7 @@ const makeImporter = Effect.fn(function* (
           ),
           realScan === undefined
             ? Layer.mock(AgentSessionScanner.AgentSessionScanner)({
+                supportsTranscriptSync: () => false,
                 recentThreads: () => Stream.fromIterable(candidates),
                 listProjectSessions: () =>
                   Effect.succeed({

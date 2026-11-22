@@ -237,6 +237,7 @@ const makeService = Effect.fn("TranscriptSyncService.test.makeService")(function
   }> = [];
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const scanner = Layer.mock(AgentSessionScanner.AgentSessionScanner)({
+    supportsTranscriptSync: () => true,
     readTurnsAfter: ({ anchorNativeId, unchangedSince }) =>
       Effect.sync(() => {
         asked.push({ anchor: anchorNativeId, unchangedSince });
@@ -487,6 +488,7 @@ it.effect("serializes triggers for a thread, and the later one finds the file un
           Layer.provide(
             Layer.mergeAll(
               Layer.mock(AgentSessionScanner.AgentSessionScanner)({
+                supportsTranscriptSync: () => true,
                 readTurnsAfter: ({ unchangedSince }) =>
                   Effect.gen(function* () {
                     asked.push(unchangedSince);
@@ -524,6 +526,7 @@ it.effect("starts a sync in the background without waiting for it", () =>
           Layer.provide(
             Layer.mergeAll(
               Layer.mock(AgentSessionScanner.AgentSessionScanner)({
+                supportsTranscriptSync: () => true,
                 readTurnsAfter: ({ anchorNativeId }) =>
                   Deferred.succeed(read, anchorNativeId).pipe(
                     Effect.as({ _tag: "NoTranscript" as const }),
@@ -554,6 +557,7 @@ it.effect("reads again after a dispatch the thread refused, though the file is u
           Layer.provide(
             Layer.mergeAll(
               Layer.mock(AgentSessionScanner.AgentSessionScanner)({
+                supportsTranscriptSync: () => true,
                 readTurnsAfter: ({ unchangedSince }) =>
                   Effect.gen(function* () {
                     asked.push(unchangedSince);
