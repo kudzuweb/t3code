@@ -1529,13 +1529,9 @@ export const make = Effect.gen(function* () {
               headRecords = decodeLines((yield* readRange(0, size)).split("\n"));
             } else {
               headRecords = decodeLines((yield* readRange(0, headEnd)).split("\n").slice(0, -1));
-              // The byte before the tail tells whether the tail starts on a line boundary.
+              // Starting one byte early makes the first line partial unless the tail starts a line.
               const tailText = yield* readRange(tailStart - 1, size - tailStart + 1);
-              tailRecords = decodeLines(
-                tailText.startsWith("\n")
-                  ? tailText.slice(1).split("\n")
-                  : tailText.split("\n").slice(1),
-              );
+              tailRecords = decodeLines(tailText.split("\n").slice(1));
             }
             let sampledRecords = [...headRecords, ...tailRecords];
             if (source === "pi" && tailRecords.length > 0 && !isPiBranchComplete(sampledRecords)) {
