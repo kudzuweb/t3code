@@ -639,6 +639,10 @@
       "types": "./src/issueLinks.ts",
       "default": "./src/issueLinks.ts"
     },
+    "./resume-session": {
+      "types": "./src/resumeSession.ts",
+      "default": "./src/resumeSession.ts"
+    },
     "./issue-selection": {
       "types": "./src/issueSelection.ts",
       "default": "./src/issueSelection.ts"
