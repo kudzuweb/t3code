@@ -142,6 +142,7 @@ function layerProjectionStore(
       countThreads: () => Effect.die("unused countThreads"),
       listActiveShellIndex: () => Effect.die("unused listActiveShellIndex"),
       listActiveThreads: () => Effect.die("unused listActiveThreads"),
+      listTranscriptSyncCandidates: () => Effect.die("unused listTranscriptSyncCandidates"),
       listOlderSettledThreads: () => Effect.die("unused listOlderSettledThreads"),
       readShellSnapshot: () => Effect.die("unused readShellSnapshot"),
       getThreadShell: () => Effect.die("unused getThreadShell"),

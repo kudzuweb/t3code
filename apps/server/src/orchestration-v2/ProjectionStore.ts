@@ -85,6 +85,7 @@ import {
   TurnItemId,
   NodeId,
   ProjectId,
+  ProviderDriverKind,
   ProviderInstanceId,
 } from "@t3tools/contracts";
 import { createOrchestrationV2TurnItemVisibility } from "@t3tools/shared/orchestrationV2Timeline";
@@ -535,6 +536,11 @@ export type ActiveThreadListEntry = Pick<
   | "updatedAt"
 >;
 
+export interface TranscriptSyncCandidate {
+  readonly threadId: ThreadId;
+  readonly driver: ProviderDriverKind;
+}
+
 export interface OlderSettledThreadsQuery {
   readonly before: OrchestrationV2OlderSettledCursor;
   readonly projectIds?: ReadonlyArray<ProjectId> | undefined;
@@ -642,6 +648,13 @@ export interface ProjectionStoreV2Shape {
   readonly listActiveThreads: (
     projectId?: ProjectId,
   ) => Effect.Effect<ReadonlyArray<ActiveThreadListEntry>, ProjectionStoreV2Error>;
+  /**
+   * Live threads updated since `updatedSince` whose active provider thread has a strong native
+   * session, with that provider thread's driver.
+   */
+  readonly listTranscriptSyncCandidates: (options: {
+    readonly updatedSince: DateTime.Utc;
+  }) => Effect.Effect<ReadonlyArray<TranscriptSyncCandidate>, ProjectionStoreV2Error>;
   /** Older settled thread ids below a cursor, newest settle first, and per-project counts. */
   readonly listOlderSettledThreads: (
     query: OlderSettledThreadsQuery,
@@ -9655,6 +9668,26 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       }));
     }, Effect.mapError(shellSnapshotReadError));
 
+    const listTranscriptSyncCandidates = Effect.fn("ProjectionStore.listTranscriptSyncCandidates")(
+      function* (options: { readonly updatedSince: DateTime.Utc }) {
+        const rows = yield* sql<{ readonly thread_id: string; readonly driver: string }>`
+          SELECT t.thread_id, json_extract(p.payload_json, '$.driver') AS driver
+          FROM orchestration_v2_projection_threads t
+          JOIN orchestration_v2_projection_provider_threads p
+            ON p.provider_thread_id = t.active_provider_thread_id
+          WHERE t.deleted_at IS NULL
+            AND t.archived_at IS NULL
+            AND t.updated_at >= ${DateTime.formatIso(options.updatedSince)}
+            AND json_extract(p.payload_json, '$.nativeThreadRef.strength') = 'strong'
+        `;
+        return rows.map((row): TranscriptSyncCandidate => ({
+          threadId: ThreadId.make(row.thread_id),
+          driver: ProviderDriverKind.make(row.driver),
+        }));
+      },
+      Effect.mapError(shellSnapshotReadError),
+    );
+
     const getThreadLinkMetadata = Effect.fn("ProjectionStore.getThreadLinkMetadata")(function* (
       threadIds: ReadonlyArray<ThreadId>,
     ) {
@@ -9847,6 +9880,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       countThreads: readOnReader(countThreads),
       listActiveShellIndex: readOnReader(listActiveShellIndex),
       listActiveThreads: readOnReader(listActiveThreads),
+      listTranscriptSyncCandidates: readOnReader(listTranscriptSyncCandidates),
       readShellSnapshot: readOnReader(readShellSnapshot),
       listOlderSettledThreads: readOnReader(listOlderSettledThreads),
       getThreadShell: readOnReader(getThreadShell),

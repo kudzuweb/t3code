@@ -283,6 +283,8 @@ export class AgentSessionScanner extends Context.Service<
     readonly findProjectSession: (
       input: AgentSessionKey & { readonly workspaceRoot: string },
     ) => Effect.Effect<AgentSessionRecentThread, AgentSessionScanError>;
+    /** Whether `readTurnsAfter` can read sessions of this driver. */
+    readonly supportsTranscriptSync: (driver: ProviderDriverKind) => boolean;
     /** What the session gained after `anchorNativeId`. Only Claude sessions can be read so far. */
     readonly readTurnsAfter: (
       input: AgentSessionKey & {
@@ -2790,10 +2792,12 @@ export const make = Effect.gen(function* () {
 
   const transcriptPaths = new Map<string, string>();
 
+  const supportsTranscriptSync = (driver: ProviderDriverKind) => driver === "claudeAgent";
+
   const readTurnsAfter: AgentSessionScanner["Service"]["readTurnsAfter"] = Effect.fn(
     "AgentSessionScanner.readTurnsAfter",
   )(function* ({ driver, providerInstanceId, providerSessionId, anchorNativeId, unchangedSince }) {
-    if (driver !== "claudeAgent") return { _tag: "Unsupported" } as const;
+    if (!supportsTranscriptSync(driver)) return { _tag: "Unsupported" } as const;
     const readError = (cause: unknown) =>
       new AgentSessionScanError({ operation: "read-transcript", cause });
     const settings = yield* serverSettings.getSettings.pipe(
@@ -2919,6 +2923,7 @@ export const make = Effect.gen(function* () {
     recentThreads,
     listProjectSessions,
     findProjectSession,
+    supportsTranscriptSync,
     readTurnsAfter,
   });
 });
