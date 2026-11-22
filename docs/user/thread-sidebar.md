@@ -61,6 +61,18 @@ in a new thread's model picker to add or remove them. A regular click returns to
 single model. Choose a base branch and send. Each selection starts a separate thread
 and worktree while you stay in the new thread composer. This requires a Git project.
 
+## Resume a session
+
+Resume session brings a Claude Code, Codex or Pi session you started in a
+terminal into T3 Code, the way `claude --resume` picks one in the terminal. Open
+it from the command palette (`Cmd/Ctrl+K`), from a project's context menu in the
+sidebar, or with `Cmd/Ctrl+Shift+U`. The list shows the project's sessions, newest first, and
+you can search by title, provider or branch.
+
+Choosing a session opens a thread that continues that same session, so the
+terminal sees the turns you take in T3 Code afterwards. A session that already
+has a thread opens that thread and is marked **In T3**.
+
 ## Pin and reorder threads
 
 Pin a thread from its menu to keep it above your active work.
@@ -246,6 +258,13 @@ when it has a PR, choose **Copy → Thread** from its context menu, or **Copy
 thread** from its long-press menu on mobile.
 **Thread ID** copies the bare ID for scripts and the `t3` CLI. See
 [keybindings](./keybindings.md) for custom configuration.
+
+To continue a Claude or Codex thread in a terminal, open the thread and choose
+**Copy → Resume command** from the title menu, or **Copy resume command** in the
+command palette, then paste it in a terminal. It changes to the thread's folder
+and resumes the same session, so turns from either side appear in the other.
+The command runs on the machine where the T3 server runs, which for a remote
+environment is not this device.
 
 ## Inspect agent work
 
