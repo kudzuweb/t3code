@@ -208,6 +208,10 @@ export function createOrchestrationEnvironmentAtoms<R, E>(
       label: "environment-data:orchestration:force-stop-thread",
       tag: ORCHESTRATION_V2_WS_METHODS.forceStopThread,
     }),
+    syncTranscriptTurns: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:orchestration:sync-transcript-turns",
+      tag: ORCHESTRATION_V2_WS_METHODS.syncTranscriptTurns,
+    }),
     turnItem: (target: {
       readonly environmentId: EnvironmentId;
       readonly input: OrchestrationV2GetTurnItemInput;
