@@ -31,6 +31,7 @@ export function useStableHandoffRuns(
           ordinal: run.ordinal,
           providerInstanceId: run.providerInstanceId,
           modelSelection: run.modelSelection,
+          ...(run.recordedFrom === undefined ? {} : { recordedFrom: run.recordedFrom }),
         }));
   setState({ source: runs, signature, value });
   return value;

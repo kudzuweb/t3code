@@ -4359,6 +4359,7 @@
   "36e4b8d2db087296": "Ab dieser Antwort forken",
   "c92a0bab54261695": "Auf diese Antwort antworten",
   "405a3e88ee6e62b3": "Die Änderungen dieser Runde in diesem Repository können nicht aufgelistet werden.",
+  "b6a53d1a5a4631b9": "Anfragen, die außerhalb von T3 Code gestellt wurden, können nicht geforkt werden",
   "f6958f38dc87c712": "Ab dieser Antwort forken",
   "72f8e14b1246d224": "Auf diese Antwort antworten",
   "01d7728e893c281d": "Zur Nachricht springen: {text}",
@@ -4404,6 +4405,7 @@
     },
     " herunterladen"
   ],
+  "b0e84e35de44a0c3": "Terminal",
   "31c5a7eb89641aba": "Ab hier bearbeiten",
   "918cd5477d0c0e9b": "Vollständige Nachricht anzeigen",
   "513b0929ca7dde1b": "Tool-Eingabe\n{input}",

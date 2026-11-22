@@ -73,6 +73,11 @@ Choosing a session opens a thread that continues that same session, so the
 terminal sees the turns you take in T3 Code afterwards. A session that already
 has a thread opens that thread and is marked **In T3**.
 
+For a Claude Code session, turns you take in the terminal afterwards appear in
+the thread, marked **Terminal**. Threads update on their own within about 10
+seconds, and every thread in the sidebar also updates when you return to the
+window. You can't fork from a Terminal turn.
+
 ## Pin and reorder threads
 
 Pin a thread from its menu to keep it above your active work.

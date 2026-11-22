@@ -4358,6 +4358,7 @@
   "36e4b8d2db087296": "Fork from this response",
   "c92a0bab54261695": "Reply to this response",
   "405a3e88ee6e62b3": "This turn's changes in this repository cannot be listed.",
+  "b6a53d1a5a4631b9": "Turns made outside T3 Code can't be forked from",
   "f6958f38dc87c712": "Fork from this response",
   "72f8e14b1246d224": "Reply to this response",
   "01d7728e893c281d": "Jump to message: {text}",
@@ -4403,6 +4404,7 @@
       "v": "v"
     }
   ],
+  "b0e84e35de44a0c3": "Terminal",
   "31c5a7eb89641aba": "Edit from here",
   "918cd5477d0c0e9b": "Show full message",
   "513b0929ca7dde1b": "Tool input\n{input}",

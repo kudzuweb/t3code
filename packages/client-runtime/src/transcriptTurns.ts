@@ -1,0 +1,111 @@
+import {
+  SYNC_TRANSCRIPT_TURNS_MAX_THREADS,
+  type EnvironmentId,
+  type ThreadId,
+} from "@t3tools/contracts";
+
+/** A run T3 recorded from a provider's transcript, for a turn made outside T3. */
+export function isTerminalRun(
+  run: { readonly recordedFrom?: "transcript" | undefined } | undefined,
+): boolean {
+  return run?.recordedFrom === "transcript";
+}
+
+/** The run a message belongs to, so a row can ask whether it was made outside T3. */
+export function findTerminalRun<
+  Run extends { readonly id: string; readonly recordedFrom?: "transcript" | undefined },
+>(runs: ReadonlyArray<Run>, runId: string | null): Run | undefined {
+  return runId === null ? undefined : runs.find((run) => run.id === runId);
+}
+
+export interface TranscriptSyncThread {
+  readonly environmentId: EnvironmentId;
+  readonly id: ThreadId;
+  readonly archivedAt: string | null;
+  readonly activeProviderThreadId: string | null;
+}
+
+export interface TranscriptSyncBatch {
+  readonly environmentId: EnvironmentId;
+  readonly threadIds: ReadonlyArray<ThreadId>;
+}
+
+/**
+ * The calls that bring a list of threads up to date with their sessions: each environment's
+ * threads that are not archived and have a provider session, in list order, within the server's
+ * limit per call. The server decides which of them it can read.
+ */
+export function planTranscriptSyncBatches(
+  threads: ReadonlyArray<TranscriptSyncThread>,
+): ReadonlyArray<TranscriptSyncBatch> {
+  const idsByEnvironment = new Map<EnvironmentId, Set<ThreadId>>();
+  for (const thread of threads) {
+    if (thread.archivedAt !== null || thread.activeProviderThreadId === null) continue;
+    const ids = idsByEnvironment.get(thread.environmentId) ?? new Set<ThreadId>();
+    ids.add(thread.id);
+    idsByEnvironment.set(thread.environmentId, ids);
+  }
+  return [...idsByEnvironment].flatMap(([environmentId, ids]) => {
+    const threadIds = [...ids];
+    return Array.from(
+      { length: Math.ceil(threadIds.length / SYNC_TRANSCRIPT_TURNS_MAX_THREADS) },
+      (_, index) => ({
+        environmentId,
+        threadIds: threadIds.slice(
+          index * SYNC_TRANSCRIPT_TURNS_MAX_THREADS,
+          (index + 1) * SYNC_TRANSCRIPT_TURNS_MAX_THREADS,
+        ),
+      }),
+    );
+  });
+}
+
+/**
+ * Sends each environment's threads to be synced, skipping environments the user cannot operate.
+ * An environment's chunks go one after another so a large sidebar does not flood the server;
+ * environments go side by side.
+ */
+export async function syncTranscriptTurnsOnFocus(input: {
+  readonly threads: ReadonlyArray<TranscriptSyncThread>;
+  readonly canSync: (environmentId: EnvironmentId) => boolean;
+  readonly send: (batch: TranscriptSyncBatch) => Promise<unknown>;
+}): Promise<void> {
+  const chunksByEnvironment = new Map<EnvironmentId, Array<TranscriptSyncBatch>>();
+  for (const batch of planTranscriptSyncBatches(input.threads)) {
+    if (!input.canSync(batch.environmentId)) continue;
+    chunksByEnvironment.set(batch.environmentId, [
+      ...(chunksByEnvironment.get(batch.environmentId) ?? []),
+      batch,
+    ]);
+  }
+  await Promise.all(
+    [...chunksByEnvironment.values()].map(async (chunks) => {
+      for (const chunk of chunks) await input.send(chunk);
+    }),
+  );
+}
+
+export interface WindowActivity {
+  readonly visible: boolean;
+  readonly focused: boolean;
+}
+
+/**
+ * Decides which return events to the window send a sync. One return can fire both a focus and a
+ * visibility event, so a return sends once until the user has left again.
+ */
+export function createReturnSyncGate() {
+  let sentSinceLeaving = false;
+  return {
+    /** Call on every activity change; leaving the window re-arms the next return. */
+    observe(activity: WindowActivity): void {
+      if (!activity.visible || !activity.focused) sentSinceLeaving = false;
+    },
+    /** Call on a focus or visibility event; true when it should send. */
+    returned(activity: WindowActivity): boolean {
+      if (!activity.visible || !activity.focused || sentSinceLeaving) return false;
+      sentSinceLeaving = true;
+      return true;
+    },
+  };
+}

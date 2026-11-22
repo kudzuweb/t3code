@@ -834,7 +834,7 @@ const layerUnusedConfigRpcServices = Layer.mergeAll(
   Layer.mock(AcpRegistrySupport.AcpRegistryCatalog)({}),
   Layer.mock(AcpRegistrySessions.AcpRegistrySessions)({}),
   Layer.mock(AgentSessionImporter.AgentSessionImporter)({}),
-  Layer.mock(AgentSessionScanner.AgentSessionScanner)({}),
+  Layer.mock(AgentSessionScanner.AgentSessionScanner)({ supportsTranscriptSync: () => false }),
   Layer.mock(TranscriptSyncService.TranscriptSyncService)({}),
   Layer.mock(AnalyticsService.AnalyticsService)({}),
   Layer.mock(AntigravityInstallation.AntigravityInstallation)({ managedDirectory: "/unused" }),

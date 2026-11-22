@@ -95,58 +95,55 @@ const layerRuntimeRepository = (imported: ScannerTestInput["importedTranscripts"
   });
 
 const layerScannerTest = (input: ScannerTestInput) =>
-  Layer.effect(AgentSessionScanner.AgentSessionScanner, AgentSessionScanner.make)
-    .pipe(
-      Layer.provide(input.processRunner ?? ProcessRunner.layer),
-      Layer.provide(
-        Layer.succeed(ClaudeSessionChain.ClaudeSessionChain, {
-          read: ({ sessionId, directory }) =>
-            Effect.sync(() => {
-              input.claudeChainDirectories?.push(directory);
-              return input.claudeChains?.[sessionId] ?? [];
-            }),
-        }),
-      ),
-    )
-    .pipe(
-      Layer.provide(
-        Layer.mergeAll(
-          ServerSettings.layerTest({
-            providerInstances: {
-              [ProviderInstanceId.make("claudeAgent")]: {
-                driver: ProviderDriverKind.make("claudeAgent"),
-                config: { homePath: input.claudeHomePath },
-              },
-              [ProviderInstanceId.make("codex")]: {
-                driver: ProviderDriverKind.make("codex"),
-                config: { homePath: input.codexHomePath },
-              },
-              // Keeps the default Pi instance off the developer's real ~/.pi.
-              [ProviderInstanceId.make("pi")]: {
-                driver: ProviderDriverKind.make("pi"),
-                enabled: true,
-                environment: [
-                  {
-                    name: "PI_CODING_AGENT_DIR",
-                    value: input.piAgentDir ?? `${input.claudeHomePath}/pi-agent`,
-                    sensitive: false,
-                  },
-                  { name: "PI_CODING_AGENT_SESSION_DIR", value: "", sensitive: false },
-                ],
-                config: {},
-              },
-              ...input.providerInstances,
-            },
+  Layer.effect(AgentSessionScanner.AgentSessionScanner, AgentSessionScanner.make).pipe(
+    Layer.provide(input.processRunner ?? ProcessRunner.layer),
+    Layer.provide(
+      Layer.succeed(ClaudeSessionChain.ClaudeSessionChain, {
+        read: ({ sessionId, directory }) =>
+          Effect.sync(() => {
+            input.claudeChainDirectories?.push(directory);
+            return input.claudeChains?.[sessionId] ?? [];
           }),
-          ServerConfig.layerTest(
-            input.claudeHomePath,
-            input.configBaseDir ?? { prefix: "t3code-scanner-config-" },
-          ),
-          layerProjectStore(input.importedWorkspaceRoots ?? []),
-          layerRuntimeRepository(input.importedTranscripts),
+      }),
+    ),
+    Layer.provide(
+      Layer.mergeAll(
+        ServerSettings.layerTest({
+          providerInstances: {
+            [ProviderInstanceId.make("claudeAgent")]: {
+              driver: ProviderDriverKind.make("claudeAgent"),
+              config: { homePath: input.claudeHomePath },
+            },
+            [ProviderInstanceId.make("codex")]: {
+              driver: ProviderDriverKind.make("codex"),
+              config: { homePath: input.codexHomePath },
+            },
+            // Keeps the default Pi instance off the developer's real ~/.pi.
+            [ProviderInstanceId.make("pi")]: {
+              driver: ProviderDriverKind.make("pi"),
+              enabled: true,
+              environment: [
+                {
+                  name: "PI_CODING_AGENT_DIR",
+                  value: input.piAgentDir ?? `${input.claudeHomePath}/pi-agent`,
+                  sensitive: false,
+                },
+                { name: "PI_CODING_AGENT_SESSION_DIR", value: "", sensitive: false },
+              ],
+              config: {},
+            },
+            ...input.providerInstances,
+          },
+        }),
+        ServerConfig.layerTest(
+          input.claudeHomePath,
+          input.configBaseDir ?? { prefix: "t3code-scanner-config-" },
         ),
+        layerProjectStore(input.importedWorkspaceRoots ?? []),
+        layerRuntimeRepository(input.importedTranscripts),
       ),
-    );
+    ),
+  );
 
 const runScan = (input: ScannerTestInput) =>
   Effect.gen(function* () {
@@ -1911,7 +1908,10 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
         });
         yield* writeTranscript({
           filePath: path.join(claudeHomePath, "projects", "-live", "claude-mismatch.jsonl"),
-          contents: transcript(line("u1", null, "user", "prompt")),
+          contents: transcript(
+            line("u1", null, "user", "prompt"),
+            line("a2", "u1", "assistant", "reply"),
+          ),
           mtimeMs: 2_000_000,
         });
         expect(yield* read("claude-mismatch", "claudeAgent", "u1")).toEqual({
@@ -1934,6 +1934,146 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
         expect(chainDirectories).toHaveLength(readCount);
         expect(yield* read("claude-gone", "claudeAgent", "a2")).toEqual({ _tag: "NoTranscript" });
         expect(yield* read("claude-live", "codex", "a2")).toEqual({ _tag: "Unsupported" });
+      }),
+    );
+
+    it.effect(
+      "finds a session file once, then checks only that file until it changes or goes",
+      () =>
+        Effect.gen(function* () {
+          const path = yield* Path.Path;
+          const fileSystem = yield* FileSystem.FileSystem;
+          const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+          const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+          const line = (uuid: string, parentUuid: string | null, type: string) =>
+            encodeTranscriptRecord({
+              type,
+              uuid,
+              parentUuid,
+              sessionId: "claude-cached",
+              cwd: "/work/project",
+              timestamp: "2026-11-20T10:00:00.000Z",
+              message: { role: type, content: "text", stop_reason: "end_turn" },
+            });
+          const contents = `${line("u1", null, "user")}\n${line("a2", "u1", "assistant")}\n`;
+          const projects = path.join(claudeHomePath, "projects");
+          const original = path.join(projects, "-first", "claude-cached.jsonl");
+          yield* writeTranscript({ filePath: original, contents, mtimeMs: 1_000_000 });
+          const scanner = yield* AgentSessionScanner.AgentSessionScanner.pipe(
+            Effect.provide(
+              layerScannerTest({
+                claudeHomePath,
+                codexHomePath,
+                claudeChains: { "claude-cached": ["u1", "a2"] },
+              }),
+            ),
+          );
+          const session = {
+            driver: ProviderDriverKind.make("claudeAgent"),
+            providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+            providerSessionId: "claude-cached",
+          };
+          const read = (
+            unchangedSince?: { readonly size: number; readonly mtimeMs: number },
+            useRememberedPath = false,
+          ) =>
+            scanner.readTurnsAfter({
+              ...session,
+              anchorNativeId: "u1",
+              ...(unchangedSince === undefined ? {} : { unchangedSince }),
+              ...(useRememberedPath ? { useRememberedPath } : {}),
+            });
+          expect(yield* scanner.peekTranscriptSignature(session)).toEqual(Option.none());
+
+          const first = yield* read();
+          const signature = "signature" in first ? first.signature : undefined;
+          expect(signature).toBeDefined();
+
+          expect(yield* scanner.peekTranscriptSignature(session)).toEqual(Option.some(signature));
+
+          // A newer copy elsewhere is not looked for while a poll finds the remembered file unchanged.
+          yield* writeTranscript({
+            filePath: path.join(projects, "-second", "claude-cached.jsonl"),
+            contents: `${contents}${contents}`,
+            mtimeMs: 3_000_000,
+          });
+          expect(yield* read(signature, true)).toEqual({ _tag: "Unchanged" });
+
+          // Any other trigger finds the newest copy, wherever Claude continued the session.
+          const newest = yield* read(signature);
+          expect(newest).toMatchObject({ _tag: "Turns" });
+          expect(yield* scanner.peekTranscriptSignature(session)).toEqual(
+            Option.some({ size: Buffer.byteLength(`${contents}${contents}`), mtimeMs: 3_000_000 }),
+          );
+
+          // Once the remembered file is gone, the poll finds the session again.
+          yield* fileSystem.remove(path.join(projects, "-second", "claude-cached.jsonl"));
+          expect(yield* scanner.peekTranscriptSignature(session)).toEqual(Option.none());
+          expect(yield* read(undefined, true)).toMatchObject({ _tag: "Turns" });
+
+          // Locating a file finds it without reading and remembers it for the poll's checks.
+          yield* writeTranscript({
+            filePath: path.join(projects, "-third", "claude-cached.jsonl"),
+            contents,
+            mtimeMs: 5_000_000,
+          });
+          const located = yield* scanner.locateTranscript(session);
+          expect(located).toEqual(
+            Option.some({ size: Buffer.byteLength(contents), mtimeMs: 5_000_000 }),
+          );
+          expect(yield* scanner.peekTranscriptSignature(session)).toEqual(located);
+        }),
+    );
+
+    it.effect("does not start the session reader when nothing follows the anchor", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const line = (uuid: string, parentUuid: string | null, type: string) =>
+          encodeTranscriptRecord({
+            type,
+            uuid,
+            parentUuid,
+            sessionId: "claude-quiet",
+            cwd: "/work/project",
+            timestamp: "2026-11-20T10:00:00.000Z",
+            message: { role: type, content: "text", stop_reason: "end_turn" },
+          });
+        yield* writeTranscript({
+          filePath: path.join(claudeHomePath, "projects", "-quiet", "claude-quiet.jsonl"),
+          contents: `${line("u1", null, "user")}\n${line("a2", "u1", "assistant")}\n`,
+          mtimeMs: 1_000_000,
+        });
+        const chainDirectories: Array<string | undefined> = [];
+        const scanner = yield* AgentSessionScanner.AgentSessionScanner.pipe(
+          Effect.provide(
+            layerScannerTest({
+              claudeHomePath,
+              codexHomePath,
+              claudeChains: { "claude-quiet": ["u1", "a2"] },
+              claudeChainDirectories: chainDirectories,
+            }),
+          ),
+        );
+        const read = (anchorNativeId: string) =>
+          scanner.readTurnsAfter({
+            driver: ProviderDriverKind.make("claudeAgent"),
+            providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+            providerSessionId: "claude-quiet",
+            anchorNativeId,
+          });
+
+        expect(yield* read("a2")).toMatchObject({
+          _tag: "Turns",
+          turns: [],
+          throughNativeId: "a2",
+          signature: { mtimeMs: 1_000_000 },
+        });
+        expect(chainDirectories).toEqual([]);
+
+        yield* read("u1");
+        expect(chainDirectories).toHaveLength(1);
       }),
     );
 
@@ -4520,10 +4660,12 @@ describe("claudeTurnsAfter", () => {
       record("u0", null, "user", "earlier"),
       record("a0", "u0", "assistant", "done"),
     ];
-    const read = (entries: ReadonlyArray<ReturnType<typeof record>>) =>
+    const read = (
+      entries: ReadonlyArray<Parameters<typeof AgentSessionScanner.claudeTurnsAfter>[0][number]>,
+    ) =>
       AgentSessionScanner.claudeTurnsAfter(
         [...earlier, ...entries],
-        ["u0", "a0", ...entries.map((entry) => entry.uuid)],
+        ["u0", "a0", ...entries.flatMap((entry) => (entry.uuid === undefined ? [] : [entry.uuid]))],
         "a0",
         fallback,
       );

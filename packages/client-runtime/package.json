@@ -531,6 +531,10 @@
       "types": "./src/threadReference.ts",
       "default": "./src/threadReference.ts"
     },
+    "./transcript-turns": {
+      "types": "./src/transcriptTurns.ts",
+      "default": "./src/transcriptTurns.ts"
+    },
     "./pull-request-project-filter": {
       "types": "./src/pullRequestProjectFilter.ts",
       "default": "./src/pullRequestProjectFilter.ts"

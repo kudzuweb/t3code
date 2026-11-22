@@ -16,6 +16,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
@@ -163,12 +164,16 @@ it.effect(
       assert.deepEqual(
         recorded.map((run) => [run.ordinal, run.status, run.providerThreadId, run.id]),
         [
-          [2, "completed", providerThreadId, "transcript-run:native-session:a-user"],
-          [3, "completed", providerThreadId, "transcript-run:native-session:b-user"],
+          [2, "completed", providerThreadId, RunId.make("transcript-run:native-session:a-user")],
+          [3, "completed", providerThreadId, RunId.make("transcript-run:native-session:b-user")],
         ],
       );
       assert.deepEqual(
-        recorded.map((run) => [run.requestedAt, run.completedAt].map(DateTime.formatIso)),
+        recorded.map((run) =>
+          [run.requestedAt, run.completedAt].map((at) =>
+            at === null ? null : DateTime.formatIso(at),
+          ),
+        ),
         [
           ["2026-11-20T10:01:00.000Z", "2026-11-20T10:01:30.000Z"],
           ["2026-11-20T10:02:00.000Z", "2026-11-20T10:02:30.000Z"],
@@ -315,6 +320,27 @@ it.effect("skips turns recorded under an earlier provider thread of the same nat
     assert.deepEqual(
       (yield* projections.getThreadProjection(threadId)).runs.map((run) => run.ordinal),
       [1, 2],
+    );
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("recording an older terminal turn never moves the thread's updated time back", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(Date.parse("2026-12-01T00:00:00.000Z"));
+    const { orchestrator, projections } = yield* setup("completed");
+    const before = yield* projections.getThread(threadId);
+
+    yield* orchestrator.dispatch(record("record-older-turn", 1, [turn("a", 1)]));
+
+    const after = yield* projections.getThread(threadId);
+    assert.isTrue(
+      DateTime.toEpochMillis(after.updatedAt) >= DateTime.toEpochMillis(before.updatedAt),
+    );
+    // The run keeps the turn's real time, which the unseen dot compares.
+    const recorded = (yield* projections.getThreadProjection(threadId)).runs.at(-1);
+    assert.equal(
+      recorded?.completedAt && DateTime.formatIso(recorded.completedAt),
+      "2026-11-20T10:01:30.000Z",
     );
   }).pipe(Effect.provide(layerTest)),
 );

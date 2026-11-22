@@ -11151,6 +11151,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             threadId: command.threadId,
             providerInstanceId: thread.providerInstanceId,
             ...fields,
+            // An event moves the thread's updated time to its own, so an older turn must not.
+            occurredAt: DateTime.isLessThan(fields.occurredAt, thread.updatedAt)
+              ? thread.updatedAt
+              : fields.occurredAt,
           } as OrchestrationV2DomainEvent,
         ]);
 
