@@ -8,6 +8,7 @@ import {
 } from "../commandPaletteStore";
 import { overlayModeForCommand } from "../components/CommandPalette.logic";
 import { APPEARANCE_OPTIONS, notifyThemeSaveFailure } from "../components/CommandPaletteThemeItems";
+import { openResumeSessionDialog } from "../components/resumeSession/resumeSessionDialogState";
 import { toggleThemeEditorForTheme } from "../components/settings/themeEditorStore";
 import { toastManager } from "../components/ui/toast";
 import { getThemeSnapshot, setAppearanceMode } from "../hooks/useTheme";
@@ -102,6 +103,12 @@ export function installCommandPaletteCommands(
       "commandPalette.toggle": toggleOverlay("commandPalette.toggle"),
       "filePicker.toggle": toggleOverlay("filePicker.toggle"),
       "projectSearch.toggle": toggleOverlay("projectSearch.toggle"),
+      "agentSessions.resume": (event) => {
+        consume(event);
+        if (event.repeat) return;
+        dispatchCommandPalette({ _tag: "SetOpen", open: false });
+        openResumeSessionDialog();
+      },
     },
     {
       ...options,

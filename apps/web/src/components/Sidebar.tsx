@@ -73,6 +73,7 @@ import {
   ChevronDownIcon,
   FolderIcon,
   FolderPlusIcon,
+  HistoryIcon,
   PlusIcon,
   SettingsIcon,
 } from "lucide-react";
@@ -165,6 +166,7 @@ import { readEnvironmentScope, useEnvironmentScope } from "../state/session";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { canShareWithGuestAtom } from "./chat/guestShareAvailability";
 import { openGuestShareDialog } from "./chat/guestShareDialogState";
+import { openResumeSessionDialog } from "./resumeSession/resumeSessionDialogState";
 import {
   buildThreadRouteParams,
   resolveActiveThreadRouteRef,
@@ -1265,6 +1267,15 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
       openProjectSettings(projectGroup);
     },
   );
+  const handleResumeSession = useStableCallback(
+    (event: ReactMouseEvent<HTMLElement>, projectGroup: SidebarProjectSnapshot) => {
+      event.preventDefault();
+      event.stopPropagation();
+      suppressNextScopeChangeRef.current = true;
+      dispatchProjectScopeMenu({ type: "project-settings-opened" });
+      openResumeSessionDialog(scopeProjectRef(projectGroup.environmentId, projectGroup.id));
+    },
+  );
   const startThreadInProjectFolder = useStableCallback((group: SidebarProjectSnapshot) => {
     if (isMobile) setOpenMobile(false);
     void handleNewThread(scopeProjectRef(group.environmentId, group.id));
@@ -1282,6 +1293,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
           api.contextMenu.show(
             [
               { id: "new-thread", label: gt("New thread") },
+              { id: "resume-session", label: gt("Resume session…") },
               { id: "copy-path", label: gt("Copy path") },
               ...(canPinProject(group)
                 ? [
@@ -1300,6 +1312,9 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
         switch (clicked.value) {
           case "new-thread":
             startThreadInProjectFolder(group);
+            return;
+          case "resume-session":
+            openResumeSessionDialog(scopeProjectRef(group.environmentId, group.id));
             return;
           case "copy-path":
             copyPathToClipboard(group.workspaceRoot, { path: group.workspaceRoot });
@@ -3252,6 +3267,19 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                                       onToggle={() => toggleProjectGroupPin(project)}
                                     />
                                   ) : null
+                                }
+                                resume={
+                                  <Button
+                                    size="icon-xs"
+                                    variant="ghost-muted"
+                                    tabIndex={-1}
+                                    aria-hidden="true"
+                                    title={gt("Resume session…")}
+                                    onPointerDown={(event) => event.stopPropagation()}
+                                    onClick={(event) => handleResumeSession(event, project)}
+                                  >
+                                    <HistoryIcon className="size-3.5" />
+                                  </Button>
                                 }
                                 settings={
                                   <Button
