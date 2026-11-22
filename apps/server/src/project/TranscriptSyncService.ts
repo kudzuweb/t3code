@@ -3,14 +3,17 @@ import {
   OrchestrationV2SyncTranscriptTurnsError,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2Run,
+  type OrchestrationV2TurnItem,
+  type ProviderThreadId,
   type ThreadId,
 } from "@t3tools/contracts";
-import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
+import type { ProjectionRecords } from "../orchestration-v2/ProjectionStore.ts";
 import * as AgentSessionScanner from "./AgentSessionScanner.ts";
 
 /**
@@ -43,26 +46,53 @@ const isNativeRecordId = (nativeId: string) => !nativeId.startsWith("turn:");
 const make = Effect.gen(function* () {
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const scanner = yield* AgentSessionScanner.AgentSessionScanner;
-  const locks = yield* KeyedLock.make<ThreadId>();
+  const running = new Map<
+    ThreadId,
+    Deferred.Deferred<number, OrchestrationV2SyncTranscriptTurnsError>
+  >();
+  // What the last read of each provider thread's transcript saw, so an unchanged file is not read again.
+  const lastRead = new Map<
+    ProviderThreadId,
+    { readonly anchor: string; readonly signature: AgentSessionScanner.TranscriptSignature }
+  >();
 
-  const anchorFor = (input: {
-    readonly latestT3Run: OrchestrationV2Run | undefined;
-    readonly providerThread: OrchestrationV2ProviderThread;
-    readonly nativeTurnId: string | undefined;
-  }): string | undefined => {
-    const synced = input.providerThread.nativeMetadata?.transcriptSync;
-    const t3RunSinceSync =
-      input.latestT3Run !== undefined &&
-      input.latestT3Run.ordinal > (synced?.throughRunOrdinal ?? 0);
-    if (!t3RunSinceSync) return synced?.throughNativeId;
-    // A turn that ended without a native id, such as a failed or interrupted one, may sit beside
-    // output of its own in the transcript, so nothing after it can be told apart.
-    return input.nativeTurnId !== undefined && isNativeRecordId(input.nativeTurnId)
-      ? input.nativeTurnId
-      : undefined;
-  };
+  const newestItemNativeId = (items: ReadonlyArray<OrchestrationV2TurnItem>): string | undefined =>
+    items.findLast((item) => item.nativeItemRef?.nativeId != null)?.nativeItemRef?.nativeId ??
+    undefined;
 
-  const syncLocked = Effect.fn("TranscriptSyncService.sync")(function* (threadId: ThreadId) {
+  /**
+   * Where the transcript was last shown: the newest run that reached this provider thread decides.
+   * Runs that never started wrote nothing to the transcript, so they are passed over. Null means
+   * the transcript cannot be placed, so nothing is read.
+   */
+  const anchorFor = Effect.fn("TranscriptSyncService.anchorFor")(function* (
+    threadId: ThreadId,
+    records: ProjectionRecords<"runs" | "attempts" | "providerThreads" | "providerTurns">,
+    providerThread: OrchestrationV2ProviderThread,
+  ) {
+    const newestFirst = records.runs.toSorted((left, right) => right.ordinal - left.ordinal);
+    for (const run of newestFirst) {
+      if (run.providerThreadId !== providerThread.id) continue;
+      if (run.recordedFrom === "transcript") {
+        const { turnItems } = yield* orchestrator.getThreadRecords(threadId, ["turnItems"], {
+          turnItemRunIds: [run.id],
+        });
+        return newestItemNativeId(turnItems) ?? null;
+      }
+      const providerTurn = Orchestrator.providerTurnForRun(records, run);
+      if (providerTurn === undefined) continue;
+      // A turn that ended without a native id, such as a failed or interrupted one, may sit beside
+      // output of its own in the transcript, so nothing after it can be told apart.
+      const nativeId = providerTurn.nativeTurnRef?.nativeId;
+      return nativeId != null && isNativeRecordId(nativeId) ? nativeId : null;
+    }
+    const { turnItems } = yield* orchestrator.getThreadRecords(threadId, ["turnItems"], {
+      turnItemRunIds: [null],
+    });
+    return newestItemNativeId(turnItems) ?? null;
+  });
+
+  const syncOnce = Effect.fn("TranscriptSyncService.sync")(function* (threadId: ThreadId) {
     yield* Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": threadId });
     const records = yield* orchestrator.getThreadRecords(threadId, [
       "runs",
@@ -83,30 +113,27 @@ const make = Effect.gen(function* () {
     ) {
       return 0;
     }
+    // A rollback resumes the next T3 turn at its head, which leaves out what the terminal added.
+    if (providerThread.nativeConversationHeadRef !== null) return 0;
 
-    const latestT3Run = runs
-      .filter((run) => run.recordedFrom === undefined)
-      .toSorted((left, right) => right.ordinal - left.ordinal)[0];
-    const latestT3Turn =
-      latestT3Run?.providerThreadId === providerThread.id
-        ? Orchestrator.providerTurnForRun(records, latestT3Run)
-        : undefined;
-    const anchorNativeId = anchorFor({
-      latestT3Run,
-      providerThread,
-      nativeTurnId: latestT3Turn?.nativeTurnRef?.nativeId,
-    });
-    if (anchorNativeId === undefined) {
+    const anchorNativeId = yield* anchorFor(threadId, records, providerThread);
+    if (anchorNativeId === null) {
       yield* Effect.logDebug("Transcript sync has no anchor", { threadId });
       return 0;
     }
 
+    const previous = lastRead.get(providerThread.id);
     const read = yield* scanner.readTurnsAfter({
       driver: providerThread.driver,
       providerInstanceId: providerThread.providerInstanceId,
       providerSessionId: nativeThread.nativeId,
       anchorNativeId,
+      ...(previous?.anchor === anchorNativeId ? { unchangedSince: previous.signature } : {}),
     });
+    if (read._tag === "Unchanged") return 0;
+    if (read.signature !== undefined) {
+      lastRead.set(providerThread.id, { anchor: anchorNativeId, signature: read.signature });
+    }
     if (read._tag === "AnchorNotFound") {
       yield* Effect.logWarning("Transcript sync could not find its anchor in the session", {
         threadId,
@@ -117,7 +144,7 @@ const make = Effect.gen(function* () {
     if (read._tag !== "Turns" || read.turns.length === 0) return 0;
 
     const latestRunOrdinal = runs.reduce((max, run) => Math.max(max, run.ordinal), 0);
-    return yield* orchestrator
+    const recorded = yield* orchestrator
       .dispatch({
         type: "transcript_turns.record",
         // The expected ordinal is part of the id because a refused command may be sent again.
@@ -128,23 +155,37 @@ const make = Effect.gen(function* () {
         providerThreadId: providerThread.id,
         expectedLatestRunOrdinal: latestRunOrdinal,
         turns: read.turns,
-        throughNativeId: read.throughNativeId,
       })
       .pipe(
         Effect.as(read.turns.length),
         // The thread changed since it was read; the next trigger reads it again.
         Effect.catchTags({ OrchestratorCommandRejectedError: () => Effect.succeed(0) }),
       );
+    if (recorded > 0 && read.signature !== undefined) {
+      lastRead.set(providerThread.id, { anchor: read.throughNativeId, signature: read.signature });
+    }
+    return recorded;
   });
 
+  // A trigger that arrives while a sync of the thread is running takes that sync's answer.
   const sync: TranscriptSyncService["Service"]["sync"] = (threadId) =>
-    locks
-      .withLock(threadId, syncLocked(threadId))
-      .pipe(
+    Effect.suspend(() => {
+      const inFlight = running.get(threadId);
+      if (inFlight !== undefined) return Deferred.await(inFlight);
+      const done = Deferred.makeUnsafe<number, OrchestrationV2SyncTranscriptTurnsError>();
+      running.set(threadId, done);
+      return syncOnce(threadId).pipe(
         Effect.mapError(
           (cause) => new OrchestrationV2SyncTranscriptTurnsError({ threadId, cause }),
         ),
+        Effect.onExit((exit) =>
+          Effect.sync(() => {
+            running.delete(threadId);
+            Deferred.doneUnsafe(done, exit);
+          }),
+        ),
       );
+    });
 
   const syncInBackground: TranscriptSyncService["Service"]["syncInBackground"] = (threadId) =>
     sync(threadId).pipe(

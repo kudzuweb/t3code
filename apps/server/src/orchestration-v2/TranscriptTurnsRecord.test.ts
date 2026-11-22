@@ -137,7 +137,6 @@ const record = (
   commandId: string,
   expectedLatestRunOrdinal: number,
   turns: ReadonlyArray<OrchestrationV2TranscriptTurn>,
-  throughNativeId = turns.at(-1)?.assistantNativeId ?? "none",
 ) =>
   ({
     type: "transcript_turns.record",
@@ -146,7 +145,6 @@ const record = (
     providerThreadId,
     expectedLatestRunOrdinal,
     turns,
-    throughNativeId,
   }) as const;
 
 it.effect(
@@ -187,10 +185,25 @@ it.effect(
           "the run's user message exists",
         );
       }
-      assert.deepEqual(after.providerThreads[0]?.nativeMetadata?.transcriptSync, {
-        throughNativeId: "b-assistant",
-        throughRunOrdinal: 3,
-      });
+      // The native ids on the last items are what the next sync anchors on.
+      assert.deepEqual(
+        recorded.map((run) =>
+          after.turnItems
+            .filter((item) => item.runId === run.id)
+            .map((item) => [item.type, item.nativeItemRef?.nativeId, item.nativeItemRef?.strength]),
+        ),
+        [
+          [
+            ["user_message", "a-user", "strong"],
+            ["assistant_message", "a-assistant", "strong"],
+          ],
+          [
+            ["user_message", "b-user", "strong"],
+            ["assistant_message", "b-assistant", "strong"],
+          ],
+        ],
+      );
+      assert.isNull(after.providerThreads[0]?.nativeMetadata ?? null);
 
       const stored = yield* events.read({ threadId }).pipe(Stream.runCollect);
       assert.notInclude(
@@ -255,5 +268,25 @@ it.effect("refuses a fork whose source is a recorded terminal turn", () =>
 
     assert.include(String(Reflect.get(refused, "cause")), "made outside T3");
     assert.isNull(yield* projections.getThreadShell(targetThreadId));
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("writes nothing for turns it already recorded, even under a new command id", () =>
+  Effect.gen(function* () {
+    const { orchestrator, projections } = yield* setup("completed");
+    yield* orchestrator.dispatch(record("first-read", 1, [turn("a", 1)]));
+    const before = yield* projections.getThreadProjection(threadId);
+
+    // A second read of the same turns arrives after the first was recorded.
+    yield* orchestrator.dispatch(record("second-read", 2, [turn("a", 1)]));
+    assert.deepEqual(yield* projections.getThreadProjection(threadId), before);
+
+    // New turns beside an already recorded one are recorded after it.
+    yield* orchestrator.dispatch(record("third-read", 2, [turn("a", 1), turn("b", 2)]));
+    const after = yield* projections.getThreadProjection(threadId);
+    assert.deepEqual(
+      after.runs.map((run) => run.ordinal),
+      [1, 2, 3],
+    );
   }).pipe(Effect.provide(layerTest)),
 );

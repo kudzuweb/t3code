@@ -1205,10 +1205,6 @@ export const OrchestrationV2ProviderThreadNativeMetadata = Schema.Struct({
   claudeAttachmentBudget: Schema.optional(
     Schema.Struct({ bytesUsed: NonNegativeInt, pagesUsed: NonNegativeInt }),
   ),
-  /** How far into the native transcript T3 has shown, and the run ordinal that was latest then. */
-  transcriptSync: Schema.optional(
-    Schema.Struct({ throughNativeId: TrimmedNonEmptyString, throughRunOrdinal: NonNegativeInt }),
-  ),
 });
 export type OrchestrationV2ProviderThreadNativeMetadata =
   typeof OrchestrationV2ProviderThreadNativeMetadata.Type;
@@ -4035,8 +4031,6 @@ const OrchestrationV2InternalCommand = Schema.Union([
     /** The latest run ordinal the reader saw, 0 when the thread had no runs. */
     expectedLatestRunOrdinal: NonNegativeInt,
     turns: Schema.Array(OrchestrationV2TranscriptTurn),
-    /** The last native record these turns consumed. */
-    throughNativeId: TrimmedNonEmptyString,
   }),
 ]);
 export type OrchestrationV2InternalCommand = typeof OrchestrationV2InternalCommand.Type;

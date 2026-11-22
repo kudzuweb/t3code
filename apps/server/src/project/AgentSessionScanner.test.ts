@@ -70,6 +70,8 @@ interface ScannerTestInput {
   readonly processRunner?: Layer.Layer<ProcessRunner.ProcessRunner>;
   /** What the Claude session reader reports as the live chain of uuids, by session id. */
   readonly claudeChains?: Readonly<Record<string, ReadonlyArray<string>>>;
+  /** Collects the directory each chain read was given. */
+  readonly claudeChainDirectories?: Array<string | undefined>;
 }
 
 const layerRuntimeRepository = (imported: ScannerTestInput["importedTranscripts"]) =>
@@ -98,7 +100,11 @@ const layerScannerTest = (input: ScannerTestInput) =>
       Layer.provide(input.processRunner ?? ProcessRunner.layer),
       Layer.provide(
         Layer.succeed(ClaudeSessionChain.ClaudeSessionChain, {
-          read: ({ sessionId }) => Effect.succeed(input.claudeChains?.[sessionId] ?? []),
+          read: ({ sessionId, directory }) =>
+            Effect.sync(() => {
+              input.claudeChainDirectories?.push(directory);
+              return input.claudeChains?.[sessionId] ?? [];
+            }),
         }),
       ),
     )
@@ -1845,6 +1851,7 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
             uuid,
             parentUuid,
             sessionId: "claude-live",
+            cwd: "/work/project",
             timestamp: "2026-11-20T10:00:00.000Z",
             message: { role: type, content, stop_reason: "end_turn" },
           });
@@ -1867,12 +1874,14 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
           contents: transcript(line("u1", null, "user", "imported prompt")),
           mtimeMs: 1_000_000,
         });
+        const chainDirectories: Array<string | undefined> = [];
         const scanner = yield* AgentSessionScanner.AgentSessionScanner.pipe(
           Effect.provide(
             layerScannerTest({
               claudeHomePath,
               codexHomePath,
               claudeChains: { "claude-live": ["u1", "a2", "u3", "a4"] },
+              claudeChainDirectories: chainDirectories,
             }),
           ),
         );
@@ -1891,9 +1900,26 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
             { userNativeId: "u3", userText: "terminal prompt", assistantText: "terminal reply" },
           ],
         });
-        expect(yield* read("claude-live", "claudeAgent", "nope")).toEqual({
+        // The chain comes from the project the file was read from.
+        expect(chainDirectories).toEqual(["/work/project"]);
+        expect(yield* read("claude-live", "claudeAgent", "nope")).toMatchObject({
           _tag: "AnchorNotFound",
         });
+        // A transcript that has not changed since a read is not read again.
+        const first = yield* read("claude-live", "claudeAgent", "a2");
+        const signature = "signature" in first ? first.signature : undefined;
+        expect(signature).toEqual({ size: Buffer.byteLength(live), mtimeMs: 2_000_000 });
+        const readCount = chainDirectories.length;
+        expect(
+          yield* scanner.readTurnsAfter({
+            driver: ProviderDriverKind.make("claudeAgent"),
+            providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+            providerSessionId: "claude-live",
+            anchorNativeId: "a2",
+            ...(signature === undefined ? {} : { unchangedSince: signature }),
+          }),
+        ).toEqual({ _tag: "Unchanged" });
+        expect(chainDirectories).toHaveLength(readCount);
         expect(yield* read("claude-gone", "claudeAgent", "a2")).toEqual({ _tag: "NoTranscript" });
         expect(yield* read("claude-live", "codex", "a2")).toEqual({ _tag: "Unsupported" });
       }),
@@ -3067,6 +3093,15 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
                 content: [{ type: "tool_use", id: "toolu_1", name: "Bash", input: {} }],
               },
             }),
+            record({
+              type: "assistant",
+              message: {
+                role: "assistant",
+                model: "claude-sonnet-5-5",
+                stop_reason: "end_turn",
+                content: "Latest reply",
+              },
+            }),
             record({ type: "custom-title", customTitle: "Renamed conversation" }),
             record({ type: "ai-title", aiTitle: "Newest title" }),
             record({ type: "attachment", sessionId: "latest-session" }),
@@ -3089,6 +3124,7 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
               { role: "user", text: "First prompt" },
               { role: "assistant", text: "First reply" },
               { role: "user", text: "Latest prompt" },
+              { role: "assistant", text: "Latest reply" },
             ],
           },
         ]);
@@ -3123,6 +3159,7 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
             // Tool and progress records push the file past the 100,000-record limit.
             ...Array.from({ length: 100_000 }, () => "{}"),
             record({ type: "user", message: { role: "user", content: "Latest prompt" } }),
+            record({ type: "assistant", message: { role: "assistant", content: "Latest reply" } }),
           ].join("\n"),
           mtimeMs: nowMs - 60_000,
         });
@@ -3136,9 +3173,9 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
         expect(outcomes.map((outcome) => outcome._tag)).toEqual(["Importable"]);
         const thread = outcomes[0]?._tag === "Importable" ? outcomes[0].thread : undefined;
         expect(thread?.messages[0]).toMatchObject({ role: "user", text: "First prompt" });
-        expect(thread?.messages.at(-1)).toMatchObject({ role: "user", text: "Latest prompt" });
+        expect(thread?.messages.at(-1)).toMatchObject({ role: "assistant", text: "Latest reply" });
         expect(thread?.messages).toHaveLength(200);
-        expect(thread?.omittedMessageCount).toBe(middleCount + 2 - 200);
+        expect(thread?.omittedMessageCount).toBe(middleCount + 3 - 200);
       }),
     );
 
@@ -4451,6 +4488,42 @@ describe("claudeTurnsAfter", () => {
     ]);
   });
 
+  it("imports without a last turn that has not finished, and a later sync records it whole", () => {
+    const importOfRecords = (entries: ReadonlyArray<unknown>) =>
+      AgentSessionScanner.parseAgentSessionTranscript({
+        contents: entries.map((entry) => JSON.stringify(entry)).join("\n"),
+        source: "claudeAgent",
+        providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+        fallbackSessionId: "claude-session",
+        lastActiveAtMs: Date.parse("2026-11-20T12:00:00.000Z"),
+      });
+    const history = [
+      record("u1", null, "user", "first prompt"),
+      record("a2", "u1", "assistant", "first reply"),
+    ];
+    const prompt = record("u3", "a2", "user", "second prompt");
+    const midReply = record("a4", "u3", "assistant", "second reply", { stopReason: "tool_use" });
+    const texts = (entries: ReadonlyArray<unknown>) =>
+      importOfRecords(entries)?.messages.map((message) => message.text);
+
+    expect(texts([...history, prompt])).toEqual(["first prompt", "first reply"]);
+    expect(texts([...history, prompt, midReply])).toEqual(["first prompt", "first reply"]);
+    expect(texts([...history, prompt, record("a4", "u3", "assistant", "second reply")])).toEqual([
+      "first prompt",
+      "first reply",
+      "second prompt",
+      "second reply",
+    ]);
+
+    const anchor = importOfRecords([...history, prompt, midReply])?.messages.at(-1)?.nativeId ?? "";
+    const finished = [...history, prompt, record("a4", "u3", "assistant", "second reply")];
+    expect(
+      userIds(
+        AgentSessionScanner.claudeTurnsAfter(finished, ["u1", "a2", "u3", "a4"], anchor, fallback),
+      ),
+    ).toEqual(["u3"]);
+  });
+
   it("carries each record's uuid through the import as its native id", () => {
     expect(importOf(records.length)?.messages.map((message) => message.nativeId)).toEqual([
       "u1",
@@ -4460,7 +4533,6 @@ describe("claudeTurnsAfter", () => {
       "u8",
       "a9",
       "a10",
-      "u11",
     ]);
   });
 });

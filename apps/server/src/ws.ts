@@ -2354,6 +2354,7 @@ export const layerWsRpc = (
           Stream.unwrap(
             Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(
               Effect.andThen(threadViewers.view(input.threadId)),
+              // Runs as the server whatever the subscriber's scope: it only mirrors the transcript.
               Effect.tap(transcriptSync.syncInBackground(input.threadId)),
               Effect.andThen(subscribeOrchestrationV2Thread(input)),
             ),

@@ -22,15 +22,20 @@ export async function runClaudeHistoryWorker(
   const result =
     method === "getSessionMessages"
       ? await getSessionMessages(sessionId, options)
-      : method === "forkSession"
-        ? await forkSession(sessionId, options).then(async (forked) => {
-            const headMessageId = await getSessionMessages(forked.sessionId, options)
-              .then((messages) => messages.at(-1)?.uuid)
-              .catch(() => undefined);
-            return headMessageId === undefined ? forked : { ...forked, headMessageId };
-          })
-        : (() => {
-            throw new Error("Unknown Claude history operation.");
-          })();
+      : // Only the order of the live chain; the messages themselves can be many megabytes.
+        method === "getSessionUuids"
+        ? await getSessionMessages(sessionId, options).then((messages) =>
+            messages.map((message) => message.uuid),
+          )
+        : method === "forkSession"
+          ? await forkSession(sessionId, options).then(async (forked) => {
+              const headMessageId = await getSessionMessages(forked.sessionId, options)
+                .then((messages) => messages.at(-1)?.uuid)
+                .catch(() => undefined);
+              return headMessageId === undefined ? forked : { ...forked, headMessageId };
+            })
+          : (() => {
+              throw new Error("Unknown Claude history operation.");
+            })();
   process.stdout.write(JSON.stringify(result));
 }

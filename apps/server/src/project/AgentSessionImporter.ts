@@ -152,8 +152,13 @@ type HistoryMessage = Omit<AgentSessionScanner.AgentSessionThreadMessage, "role"
   readonly role: AgentSessionScanner.AgentSessionThreadMessage["role"] | "reasoning";
 };
 
+// Codex records carry no per-message id, so only Claude and Pi items can name their native record.
+const nativeRefDriver = (driver: ProviderDriverKind) =>
+  driver === "claudeAgent" || driver === "pi" ? driver : null;
+
 function messageEvents(input: {
   readonly threadId: ThreadId;
+  readonly nativeDriver: ProviderDriverKind | null;
   readonly index: number;
   readonly message: HistoryMessage;
 }): ReadonlyArray<OrchestrationV2DomainEvent> {
@@ -171,7 +176,15 @@ function messageEvents(input: {
     nodeId: null,
     providerThreadId: null,
     providerTurnId: null,
-    nativeItemRef: null,
+    // The next transcript sync reads from the last imported item's native record.
+    nativeItemRef:
+      input.nativeDriver === null || input.message.nativeId === undefined
+        ? null
+        : {
+            driver: input.nativeDriver,
+            nativeId: input.message.nativeId,
+            strength: "strong" as const,
+          },
     parentItemId: null,
     ordinal,
     status: "completed" as const,
@@ -364,7 +377,6 @@ const make = Effect.gen(function* () {
       });
     const createdAt = dateTime(thread.createdAt);
     const updatedAt = dateTime(thread.updatedAt);
-    const lastImportedNativeId = thread.messages.at(-1)?.nativeId;
     const appThread: OrchestrationV2AppThread = {
       createdBy: "system",
       creationSource: "server",
@@ -420,14 +432,6 @@ const make = Effect.gen(function* () {
       handoffIds: [],
       forkedFrom: null,
       pendingBackgroundTasks: [],
-      // The next transcript sync starts after the last record this import shows.
-      ...(lastImportedNativeId === undefined
-        ? {}
-        : {
-            nativeMetadata: {
-              transcriptSync: { throughNativeId: lastImportedNativeId, throughRunOrdinal: 0 },
-            },
-          }),
       createdAt,
       updatedAt,
     };
@@ -471,7 +475,9 @@ const make = Effect.gen(function* () {
               },
             ]
           : []),
-        ...thread.messages.flatMap((message, index) => messageEvents({ threadId, index, message })),
+        ...thread.messages.flatMap((message, index) =>
+          messageEvents({ threadId, index, message, nativeDriver: nativeRefDriver(driver) }),
+        ),
         {
           id: EventId.make(`${IMPORT_EVENT_PREFIX}:provider-thread:${providerThreadId}`),
           type: "provider-thread.updated",
@@ -827,7 +833,7 @@ const make = Effect.gen(function* () {
           yield* eventSink.write({
             events: [
               ...messages.flatMap((message, index) =>
-                messageEvents({ threadId: input.threadId, index, message }),
+                messageEvents({ threadId: input.threadId, index, message, nativeDriver: null }),
               ),
               {
                 id: EventId.make(`${IMPORT_EVENT_PREFIX}:thread:${input.threadId}:native-history`),

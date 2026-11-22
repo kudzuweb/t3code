@@ -7,9 +7,7 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import { runClaudeWorker } from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
 
-const decodeChain = Schema.decodeUnknownEffect(
-  Schema.fromJsonString(Schema.Array(Schema.Struct({ uuid: Schema.String }))),
-);
+const decodeChain = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Array(Schema.String)));
 
 /**
  * The uuids of a Claude session's live conversation, in order, as Claude Code's own session
@@ -21,6 +19,8 @@ export class ClaudeSessionChain extends Context.Service<
     readonly read: (input: {
       readonly sessionId: string;
       readonly environment: NodeJS.ProcessEnv;
+      /** The project the session belongs to, so Claude reads the same file as the caller. */
+      readonly directory?: string;
     }) => Effect.Effect<ReadonlyArray<string>, unknown>;
   }
 >()("t3/project/ClaudeSessionChain") {}
@@ -31,10 +31,14 @@ export const layer = Layer.effect(
     const path = yield* Path.Path;
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     return ClaudeSessionChain.of({
-      read: ({ sessionId, environment }) =>
-        runClaudeWorker({ method: "getSessionMessages", sessionId, environment }).pipe(
+      read: ({ sessionId, environment, directory }) =>
+        runClaudeWorker({
+          method: "getSessionUuids",
+          sessionId,
+          environment,
+          ...(directory === undefined ? {} : { options: { dir: directory } }),
+        }).pipe(
           Effect.flatMap(decodeChain),
-          Effect.map((messages) => messages.map((message) => message.uuid)),
           Effect.provideService(Path.Path, path),
           Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
         ),

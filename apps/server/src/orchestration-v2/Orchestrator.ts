@@ -11153,9 +11153,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           } as OrchestrationV2DomainEvent,
         ]);
 
-      for (const [index, turn] of command.turns.entries()) {
+      // A turn recorded by an earlier read is skipped, so reading the same turns again is a no-op.
+      const recordedRunIds = new Set(projection.runs.map((run) => run.id));
+      const runIdOf = (turn: (typeof command.turns)[number]) =>
+        RunId.make(`transcript-run:${idKey}:${turn.userNativeId}`);
+      const fresh = command.turns.filter((turn) => !recordedRunIds.has(runIdOf(turn)));
+      for (const [index, turn] of fresh.entries()) {
         const ordinal = latestOrdinal + index + 1;
-        const runId = RunId.make(`transcript-run:${idKey}:${turn.userNativeId}`);
+        const runId = runIdOf(turn);
         const userAt = DateTime.makeUnsafe(turn.userAt);
         const assistantAt =
           turn.assistantAt === null ? userAt : DateTime.makeUnsafe(turn.assistantAt);
@@ -11216,7 +11221,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             nodeId: null,
             providerThreadId: command.providerThreadId,
             providerTurnId: null,
-            nativeItemRef: null,
+            // The next sync reads from the native record of the newest item.
+            nativeItemRef: {
+              driver: providerThread.driver,
+              nativeId: input.nativeId,
+              strength: "strong" as const,
+            },
             parentItemId: null,
             ordinal: 0,
             status: "completed" as const,
@@ -11272,27 +11282,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           });
         }
       }
-
-      const now = yield* DateTime.now;
-      yield* event(
-        "provider-thread",
-        command.throughNativeId,
-        { occurredAt: now },
-        {
-          type: "provider-thread.updated",
-          payload: {
-            ...providerThread,
-            nativeMetadata: {
-              ...providerThread.nativeMetadata,
-              transcriptSync: {
-                throughNativeId: command.throughNativeId,
-                throughRunOrdinal: latestOrdinal + command.turns.length,
-              },
-            },
-            updatedAt: now,
-          },
-        },
-      );
     },
   );
 
@@ -16459,6 +16448,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           // A read can answer a watch again before a push's reopen lands; nothing is left to clear.
           command.type === "thread.pull-request-watch.checks-reopen" ||
           command.type === "thread.interrupt.unresponsive" ||
+          // Every turn was recorded by an earlier read.
+          command.type === "transcript_turns.record" ||
           command.type === "thread.stop" ||
           command.type === "subagent.stop" ||
           // Closing a share again, or after it ended, is not an error.
