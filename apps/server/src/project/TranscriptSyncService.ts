@@ -87,6 +87,10 @@ const make = Effect.gen(function* () {
     { readonly anchor: string; readonly signature: AgentSessionScanner.TranscriptSignature }
   >();
 
+  // Where Codex says each thread's rollout file is, or null when it named none. Codex is read
+  // through its app server, so the rollout's size and mtime tell whether that read can be skipped.
+  const codexRollouts = new Map<ProviderThreadId, string | null>();
+
   const newestItemNativeId = (items: ReadonlyArray<OrchestrationV2TurnItem>): string | undefined =>
     items.findLast((item) => item.nativeItemRef?.nativeId != null)?.nativeItemRef?.nativeId ??
     undefined;
@@ -171,10 +175,40 @@ const make = Effect.gen(function* () {
     }
 
     const previous = lastRead.get(providerThread.id);
-    // Codex is read through its app-server, which has no file to compare, so it is read each time.
+    const readCodex = Effect.fn("TranscriptSyncService.readCodex")(function* () {
+      const rolloutPath = codexRollouts.get(providerThread.id);
+      if (rolloutPath === null) {
+        yield* Effect.logDebug("Codex named no rollout file, so its thread is read only once", {
+          threadId,
+        });
+        return { _tag: "Unchanged" } as const;
+      }
+      // The signature is taken before the read, so a change during it shows on the next sync.
+      const signature =
+        rolloutPath === undefined ? undefined : yield* codexSessions.rolloutSignature(rolloutPath);
+      if (
+        signature !== undefined &&
+        previous?.anchor === anchorNativeId &&
+        previous.signature.size === signature.size &&
+        previous.signature.mtimeMs === signature.mtimeMs
+      ) {
+        return { _tag: "Unchanged" } as const;
+      }
+      const codexRead = yield* codexSessions.readTurnsAfter({
+        thread,
+        providerThread,
+        anchorNativeId,
+      });
+      if (rolloutPath === undefined) {
+        codexRollouts.set(providerThread.id, codexRead.rolloutPath ?? null);
+      } else if (codexRead.rolloutPath !== undefined && codexRead.rolloutPath !== rolloutPath) {
+        codexRollouts.set(providerThread.id, codexRead.rolloutPath);
+      }
+      return signature === undefined ? codexRead : { ...codexRead, signature };
+    });
     const read: TranscriptRead =
       providerThread.driver === CODEX_DRIVER_KIND
-        ? yield* codexSessions.readTurnsAfter({ thread, providerThread, anchorNativeId })
+        ? yield* readCodex()
         : yield* scanner.readTurnsAfter({
             driver: providerThread.driver,
             providerInstanceId: providerThread.providerInstanceId,

@@ -252,12 +252,22 @@ const makeService = Effect.fn("TranscriptSyncService.test.makeService")(function
   codexReads: Record<string, AgentSessionScanner.TurnsAfterAnchor> = {},
 ) {
   const codexAsked: Array<string> = [];
+  // The Codex session's rollout file: where the app server says it is and what a stat shows.
+  // By default it is located but cannot be stat'ed, so every sync reads.
+  const codexRollout: {
+    path: string | undefined;
+    signature: AgentSessionScanner.TranscriptSignature | undefined;
+  } = { path: "/codex/rollout.jsonl", signature: undefined };
   const codexReader = Layer.mock(CodexSessionReader.CodexSessionReader)({
     readTurnsAfter: ({ anchorNativeId }) =>
       Effect.sync(() => {
         codexAsked.push(anchorNativeId);
-        return codexReads[anchorNativeId] ?? { _tag: "AnchorNotFound" as const };
+        return {
+          ...(codexReads[anchorNativeId] ?? { _tag: "AnchorNotFound" as const }),
+          ...(codexRollout.path === undefined ? {} : { rolloutPath: codexRollout.path }),
+        };
       }),
+    rolloutSignature: () => Effect.sync(() => codexRollout.signature),
   });
   const asked: Array<{
     readonly anchor: string;
@@ -290,6 +300,7 @@ const makeService = Effect.fn("TranscriptSyncService.test.makeService")(function
     service,
     asked,
     codexAsked,
+    codexRollout,
     get anchors() {
       return asked.map((entry) => entry.anchor);
     },
@@ -690,6 +701,56 @@ describe("Codex sessions", () => {
 
       assert.deepEqual(sync.codexAsked, ["turn-t3", "a-one", "a-one"]);
       assert.equal((yield* projections.getThreadProjection(threadId)).runs.length, 2);
+    }).pipe(Effect.provide(layerStores)),
+  );
+
+  it.effect("reads again only when the rollout file has changed", () =>
+    Effect.gen(function* () {
+      yield* seed({
+        provider: "codex",
+        runs: [{ status: "completed", turn: "turn-t3", turnStrength: "strong" }],
+      });
+      const empty = { _tag: "Turns", turns: [], throughNativeId: "turn-t3" } as const;
+      const sync = yield* makeService({}, { "turn-t3": empty });
+      const first = { size: 10, mtimeMs: 1 };
+      sync.codexRollout.signature = first;
+
+      // The first read finds where the rollout is, and the second remembers what it looked like.
+      yield* sync.service.sync(threadId);
+      yield* sync.service.sync(threadId);
+      assert.deepEqual(sync.codexAsked, ["turn-t3", "turn-t3"]);
+
+      yield* sync.service.sync(threadId);
+      assert.deepEqual(sync.codexAsked, ["turn-t3", "turn-t3"]);
+
+      sync.codexRollout.signature = { size: 20, mtimeMs: 2 };
+      yield* sync.service.sync(threadId);
+      assert.deepEqual(sync.codexAsked, ["turn-t3", "turn-t3", "turn-t3"]);
+
+      // A rollout that is gone, as when Codex compressed it, is read through the app server.
+      sync.codexRollout.signature = undefined;
+      yield* sync.service.sync(threadId);
+      assert.equal(sync.codexAsked.length, 4);
+    }).pipe(Effect.provide(layerStores)),
+  );
+
+  it.effect("reads a session whose rollout cannot be located only once", () =>
+    Effect.gen(function* () {
+      yield* seed({
+        provider: "codex",
+        runs: [{ status: "completed", turn: "turn-t3", turnStrength: "strong" }],
+      });
+      const sync = yield* makeService(
+        {},
+        { "turn-t3": { _tag: "Turns", turns: [], throughNativeId: "turn-t3" } },
+      );
+      sync.codexRollout.path = undefined;
+
+      yield* sync.service.sync(threadId);
+      yield* sync.service.sync(threadId);
+      yield* sync.service.sync(threadId);
+
+      assert.deepEqual(sync.codexAsked, ["turn-t3"]);
     }).pipe(Effect.provide(layerStores)),
   );
 

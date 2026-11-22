@@ -9,7 +9,9 @@ import {
 } from "@t3tools/contracts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as DateTime from "effect/DateTime";
+import * as FileSystem from "effect/FileSystem";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
@@ -50,6 +52,7 @@ const providerThread = (now: DateTime.Utc): OrchestrationV2ProviderThread => ({
 // What `thread/read` with `includeTurns` returns for the thread.
 const codexThread = {
   id: "codex-thread-1",
+  path: "/codex/sessions/rollout-1.jsonl",
   turns: [
     {
       id: "turn-shown",
@@ -96,6 +99,7 @@ const makeReader = Effect.fn("CodexSessionReader.test.makeReader")(function* (pa
           Layer.mergeAll(
             ProviderAdapterRegistry.layerFromAdapters([adapter]),
             IdAllocator.layer,
+            NodeServices.layer,
             Layer.mock(ProjectService.ProjectService)({
               getById: () => Effect.succeedSome({ workspaceRoot: "/work/project" } as never),
             }),
@@ -133,6 +137,7 @@ it.effect(
           },
         ],
         throughNativeId: "a-terminal",
+        rolloutPath: "/codex/sessions/rollout-1.jsonl",
       });
       assert.deepStrictEqual(yield* Ref.get(calls), ["open:codex-thread-1:/work/project", "read"]);
       assert.equal(yield* Ref.get(closed), true);
@@ -151,4 +156,23 @@ it.effect(
       });
       assert.deepStrictEqual(result, { _tag: "NoTranscript" });
     }),
+);
+
+it.effect("signs a rollout by its size and the newest change to it or the folder holding it", () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const directory = yield* fileSystem.makeTempDirectoryScoped();
+    const rollout = `${directory}/rollout-1.jsonl`;
+    yield* fileSystem.writeFileString(rollout, "12345");
+    const { reader } = yield* makeReader(codexThread);
+
+    const signed = yield* reader.rolloutSignature(rollout);
+    assert.equal(signed?.size, 5);
+    // A rollout Codex rewrote as a sibling file still changes the folder.
+    yield* fileSystem.utimes(directory, 5_000, 5_000);
+    yield* fileSystem.utimes(rollout, 1_000, 1_000);
+    assert.equal((yield* reader.rolloutSignature(rollout))?.mtimeMs, 5_000_000);
+    yield* fileSystem.remove(rollout);
+    assert.equal(yield* reader.rolloutSignature(rollout), undefined);
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
