@@ -77,6 +77,7 @@ import {
   PaletteIcon,
   RotateCcwIcon,
   SettingsIcon,
+  TerminalIcon,
   MonitorIcon,
   PinIcon,
   PinOffIcon,
@@ -106,6 +107,8 @@ import { useDesktopLocalBootstraps } from "../connection/useDesktopLocalBootstra
 import { useHandleNewThread } from "../hooks/useHandleNewThread";
 import { useOpenPanelPullRequestUrl } from "../hooks/useOpenPanelPullRequestUrl";
 import { copyThreadReference } from "../lib/copyThreadReference";
+import { useThreadResumeCommand } from "../state/threadResumeCommand";
+import { copyResumeCommand } from "../lib/copyResumeCommand";
 import {
   queueWorkspaceFocusFromPalette,
   restoreWorkspaceFocusFromPalette,
@@ -540,6 +543,20 @@ function OpenCommandPaletteDialog(props: {
     if (activeThreadReferenceCopyTarget === null) return;
     await copyThreadReference(activeThreadReferenceCopyTarget);
   };
+  const activeThreadRef =
+    activeThread && pathname !== "/pull-requests"
+      ? scopeThreadRef(activeThread.environmentId, activeThread.id)
+      : null;
+  const activeThreadResumeCommand = useThreadResumeCommand(
+    activeThreadRef,
+    activeThread?.worktreePath ??
+      projects.find(
+        (project) =>
+          project.environmentId === activeThread?.environmentId &&
+          project.id === activeThread?.projectId,
+      )?.workspaceRoot ??
+      null,
+  );
   // Threads the sidebar shows under their parent open there, so opening a project never lands on one.
   const delegatedUnderParent = useDelegatedUnderParent();
   const threads = useVisibleThreadShells().filter(
@@ -1503,6 +1520,18 @@ function OpenCommandPaletteDialog(props: {
       icon: <LinkIcon className={ITEM_ICON_CLASS} />,
       shortcutCommand: "thread.copyReference",
       run: copyActiveThreadReference,
+    });
+  }
+
+  if (activeThreadResumeCommand !== null) {
+    actionItems.push({
+      kind: "action",
+      value: "action:copy-resume-command",
+      searchTerms: ["copy", "resume", "terminal", "command", "claude", "codex", "cli"],
+      title: gt("Copy resume command"),
+      description: gt("Continue this thread's session in a terminal"),
+      icon: <TerminalIcon className={ITEM_ICON_CLASS} />,
+      run: () => copyResumeCommand(activeThreadResumeCommand),
     });
   }
 

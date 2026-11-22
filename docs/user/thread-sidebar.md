@@ -259,6 +259,13 @@ thread** from its long-press menu on mobile.
 **Thread ID** copies the bare ID for scripts and the `t3` CLI. See
 [keybindings](./keybindings.md) for custom configuration.
 
+To continue a Claude or Codex thread in a terminal, open the thread and choose
+**Copy → Resume command** from the title menu, or **Copy resume command** in the
+command palette, then paste it in a terminal. It changes to the thread's folder
+and resumes the same session, so turns from either side appear in the other.
+The command runs on the machine where the T3 server runs, which for a remote
+environment is not this device.
+
 ## Inspect agent work
 
 **Limited** means the provider stopped on a usage or rate limit. The conversation

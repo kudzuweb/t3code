@@ -1,0 +1,20 @@
+# kudzuweb/t3code
+
+This is Mauria's fork of `pingdotgg/t3code`. It adds a way to resume Claude Code, Codex and Pi sessions started in a terminal from inside T3, and it keeps the two views of a session in step. Everything else is upstream.
+
+## Differences from upstream
+
+| Change                                                                                                                                                                                             | Where                                                                                                                                             | Drop when                                                                                                                       |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| The carried fix from upstream PR #38528 makes a Claude turn see messages added to its session in a terminal.                                                                                       | `apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts`                                                                                    | Upstream merges #38528.                                                                                                         |
+| The server lists a project's Claude Code, Codex and Pi sessions of any age and imports one chosen session, through `agentSessions.list` and `agentSessions.importOne`.                             | `packages/contracts/src/agentSessions.ts`, `apps/server/src/project/AgentSessionScanner.ts`, `apps/server/src/project/AgentSessionImporter.ts`    | This is a fork feature and stays.                                                                                               |
+| The native-thread ownership guard counts only live threads, so a session whose T3 thread was deleted can be imported again as a new thread. Upstream's guard (#15634) also counts deleted threads. | `apps/server/src/orchestration-v2/EventSink.ts`                                                                                                   | This stays while the fork keeps reimporting deleted threads' sessions; check it on every upstream merge that touches the guard. |
+| A thread's menu and the command palette can copy the terminal command that continues the thread's Claude Code or Codex session, such as `cd '<dir>' && claude --resume '<id>'`.                    | `packages/client-runtime/src/resumeCommand.ts`, `apps/web/src/components/threadActionMenu.logic.ts`, `apps/web/src/components/CommandPalette.tsx` | This is a fork feature and stays.                                                                                               |
+
+## Syncing with upstream
+
+Run `git fetch upstream`, `git checkout main`, `git merge upstream/main`, then push `main` to `origin`. The fork's `main` is published, so it is merged and never rebased. When a carried upstream fix lands upstream, the merge will usually resolve it, and its row in the table above is then removed.
+
+## Pull requests
+
+Fork PRs are opened with `gh pr create --repo kudzuweb/t3code --base main`, because `gh` run in a fork otherwise targets upstream.

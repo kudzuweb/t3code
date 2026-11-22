@@ -26,6 +26,16 @@ const baseState: ThreadActionMenuState = {
 };
 
 describe("buildThreadActionMenuItems", () => {
+  it.each([
+    [false, false],
+    [true, true],
+  ])("offers the resume command only when one resolves (%s)", (canCopyResumeCommand, offered) => {
+    const copyChildren = buildThreadActionMenuItems({ ...baseState, canCopyResumeCommand }).find(
+      (item) => item.id === "copy",
+    )?.children;
+    expect(copyChildren?.some((item) => item.id === "copy-resume-command")).toBe(offered);
+  });
+
   it.each([false, true])(
     "disables both lifecycle directions without permission (reversed: %s)",
     (reversed) => {
