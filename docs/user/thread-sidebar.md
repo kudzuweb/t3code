@@ -74,7 +74,8 @@ terminal sees the turns you take in T3 Code afterwards. A session that already
 has a thread opens that thread and is marked **In T3**.
 
 For a Claude Code session, turns you take in the terminal afterwards appear in
-the thread, marked **Terminal**, when you open the thread or return to the
+the thread, marked **Terminal**. Threads update on their own within about 10
+seconds, and every thread in the sidebar also updates when you return to the
 window. You can't fork from a Terminal turn.
 
 ## Pin and reorder threads
