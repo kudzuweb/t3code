@@ -163,8 +163,8 @@ it.effect(
       assert.deepEqual(
         recorded.map((run) => [run.ordinal, run.status, run.providerThreadId, run.id]),
         [
-          [2, "completed", providerThreadId, "transcript-run:provider-thread:transcript:a-user"],
-          [3, "completed", providerThreadId, "transcript-run:provider-thread:transcript:b-user"],
+          [2, "completed", providerThreadId, "transcript-run:native-session:a-user"],
+          [3, "completed", providerThreadId, "transcript-run:native-session:b-user"],
         ],
       );
       assert.deepEqual(
@@ -287,6 +287,34 @@ it.effect("writes nothing for turns it already recorded, even under a new comman
     assert.deepEqual(
       after.runs.map((run) => run.ordinal),
       [1, 2, 3],
+    );
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("skips turns recorded under an earlier provider thread of the same native session", () =>
+  Effect.gen(function* () {
+    const { orchestrator, projections } = yield* setup("completed");
+    yield* orchestrator.dispatch(record("under-first", 1, [turn("a", 1)]));
+    const before = yield* projections.getThreadProjection(threadId);
+    const now = yield* DateTime.now;
+
+    // An instance switch moves the same native session to a new provider thread.
+    const switchedTo = ProviderThreadId.make("provider-thread:switched");
+    yield* projections.apply({
+      id: EventId.make("transcript:switched-provider-thread"),
+      type: "provider-thread.updated",
+      threadId,
+      occurredAt: now,
+      payload: { ...before.providerThreads[0]!, id: switchedTo },
+    });
+    yield* orchestrator.dispatch({
+      ...record("under-second", 2, [turn("a", 1)]),
+      providerThreadId: switchedTo,
+    });
+
+    assert.deepEqual(
+      (yield* projections.getThreadProjection(threadId)).runs.map((run) => run.ordinal),
+      [1, 2],
     );
   }).pipe(Effect.provide(layerTest)),
 );

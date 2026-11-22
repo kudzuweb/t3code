@@ -1880,7 +1880,11 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
             layerScannerTest({
               claudeHomePath,
               codexHomePath,
-              claudeChains: { "claude-live": ["u1", "a2", "u3", "a4"] },
+              claudeChains: {
+                "claude-live": ["u1", "a2", "u3", "a4"],
+                // The session reader found a different copy of this session than the scanner did.
+                "claude-mismatch": ["other-1", "other-2"],
+              },
               claudeChainDirectories: chainDirectories,
             }),
           ),
@@ -1900,10 +1904,18 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
             { userNativeId: "u3", userText: "terminal prompt", assistantText: "terminal reply" },
           ],
         });
-        // The chain comes from the project folder the file was found in.
-        expect(chainDirectories).toEqual(["-live"]);
+        // The SDK documents `dir` as the project directory, which the file's own records name.
+        expect(chainDirectories).toEqual(["/work/project"]);
         expect(yield* read("claude-live", "claudeAgent", "nope")).toMatchObject({
           _tag: "AnchorNotFound",
+        });
+        yield* writeTranscript({
+          filePath: path.join(claudeHomePath, "projects", "-live", "claude-mismatch.jsonl"),
+          contents: transcript(line("u1", null, "user", "prompt")),
+          mtimeMs: 2_000_000,
+        });
+        expect(yield* read("claude-mismatch", "claudeAgent", "u1")).toEqual({
+          _tag: "NoTranscript",
         });
         // A transcript that has not changed since a read is not read again.
         const first = yield* read("claude-live", "claudeAgent", "a2");

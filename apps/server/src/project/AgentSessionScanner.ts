@@ -2838,21 +2838,9 @@ export const make = Effect.gen(function* () {
     if (transcript === undefined) return { _tag: "NoTranscript" } as const;
 
     const signature = { size: transcript.size, mtimeMs: transcript.mtimeMs };
-    const projectFolder = path.basename(path.dirname(transcript.filePath));
     if (unchangedSince?.size === signature.size && unchangedSince.mtimeMs === signature.mtimeMs) {
       return { _tag: "Unchanged" } as const;
     }
-
-    // Read for the folder the file was found in, so the chain and the records are one session; the
-    // chain comes first, so the file is never behind it.
-    const chain = yield* claudeChain
-      .read({
-        sessionId: providerSessionId,
-        environment: { ...hostEnvironment, CLAUDE_CONFIG_DIR: claudeHome },
-        directory: projectFolder,
-      })
-      .pipe(Effect.mapError(readError));
-    if (chain.length === 0) return { _tag: "NoTranscript" } as const;
 
     const records: Array<DecodedTranscriptRecord> = [];
     let recordBytes = 0;
@@ -2887,6 +2875,19 @@ export const make = Effect.gen(function* () {
       ),
       Effect.mapError(readError),
     );
+    // The SDK documents `dir` as the session's project directory, which its records name.
+    const projectDirectory = records.find((record) => record.cwd !== undefined)?.cwd;
+    const chain = yield* claudeChain
+      .read({
+        sessionId: providerSessionId,
+        environment: { ...hostEnvironment, CLAUDE_CONFIG_DIR: claudeHome },
+        ...(projectDirectory === undefined ? {} : { directory: projectDirectory }),
+      })
+      .pipe(Effect.mapError(readError));
+    // A chain whose first record this file lacks was read from another copy of the session.
+    if (chain[0] === undefined || !records.some((record) => record.uuid === chain[0])) {
+      return { _tag: "NoTranscript" } as const;
+    }
     return {
       ...claudeTurnsAfter(records, chain, anchorNativeId, DateTime.formatIso(yield* DateTime.now)),
       signature,

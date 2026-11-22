@@ -11135,7 +11135,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         });
       }
 
-      const idKey = `${command.providerThreadId}`;
+      // Keyed by the native session, which an instance switch carries to a new provider thread.
+      const idKey = providerThread.nativeThreadRef?.nativeId ?? providerThread.id;
       const event = (
         kind: string,
         nativeId: string,
