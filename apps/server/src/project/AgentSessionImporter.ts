@@ -6,6 +6,7 @@ import {
   isRuntimeModeAbove,
   AgentSessionImportProjectChangedError,
   AgentSessionImportProjectNotFoundError,
+  AgentSessionNotFoundError,
   AgentSessionScanError,
   AgentSessionUnresumableSessionError,
   EventId,
@@ -15,8 +16,14 @@ import {
   ThreadId,
   TurnItemId,
   type AgentSessionImportInput,
+  type AgentSessionImportOneInput,
+  type AgentSessionImportOneResult,
   type AgentSessionImportResult,
   type AgentSessionSource,
+  type AgentSessionListInput,
+  type AgentSessionListResult,
+  type AgentSessionSummary,
+  type ProviderInstanceId,
   type RuntimeMode,
   type OrchestrationV2AppThread,
   type OrchestrationV2ConversationMessage,
@@ -33,6 +40,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/sql/SqlClient";
 
 import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -48,6 +56,8 @@ import * as ProjectService from "./ProjectService.ts";
 const isProjectionStoreThreadNotFoundError = Schema.is(
   ProjectionStore.ProjectionStoreThreadNotFoundError,
 );
+
+const isUnresumableSessionError = Schema.is(AgentSessionUnresumableSessionError);
 
 const IMPORT_EVENT_PREFIX = "agent-session-import:v2";
 const CLAUDE_SESSION_ID_PATTERN =
@@ -208,6 +218,7 @@ const make = Effect.gen(function* () {
   const registry = yield* ProviderAdapterRegistry.ProviderAdapterRegistryV2;
   const threadCommands = yield* ThreadCommandExecutor.ThreadCommandExecutor;
   const settingsService = yield* ServerSettings.ServerSettingsService;
+  const sql = yield* SqlClient.SqlClient;
   const ceiling = settingsService.managedPolicy?.limits?.maxRuntimeMode;
   const loadProject = Effect.fn("AgentSessionImporter.loadProject")(function* (
     projectId: ProjectId,
@@ -525,6 +536,113 @@ const make = Effect.gen(function* () {
     return { importedCount, skippedCount } satisfies AgentSessionImportResult;
   });
 
+  const findOwnerThread = Effect.fn("AgentSessionImporter.findOwnerThread")(function* (input: {
+    readonly projectId: ProjectId;
+    readonly providerInstanceId: ProviderInstanceId;
+    readonly nativeThreadId: string;
+  }) {
+    const rows = yield* sql<{ readonly thread_id: string }>`
+      SELECT provider.thread_id
+      FROM orchestration_v2_projection_provider_threads AS provider
+      JOIN orchestration_v2_projection_threads AS thread ON thread.thread_id = provider.thread_id
+      WHERE provider.provider_instance_id = ${input.providerInstanceId}
+        AND json_extract(provider.payload_json, '$.nativeThreadRef.nativeId') = ${input.nativeThreadId}
+        AND thread.project_id = ${input.projectId}
+        AND thread.deleted_at IS NULL
+      ORDER BY thread.updated_at DESC
+      LIMIT 1
+    `.pipe(
+      Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-projects", cause })),
+    );
+    return rows[0] ? ThreadId.make(rows[0].thread_id) : null;
+  });
+
+  const listSessions = Effect.fn("AgentSessionImporter.listSessions")(function* (
+    input: AgentSessionListInput,
+  ) {
+    const project = yield* loadProject(input.projectId);
+    const listing = yield* scanner.listProjectSessions(project.workspaceRoot);
+    const sessions = yield* Effect.forEach(
+      listing.sessions,
+      Effect.fn(function* ({ source, title, lastActiveAt, worktree }) {
+        return {
+          provider: source.provider,
+          providerInstanceId: source.providerInstanceId,
+          providerSessionId: source.providerSessionId,
+          title,
+          lastActiveAt,
+          worktree,
+          threadId: yield* findOwnerThread({
+            projectId: input.projectId,
+            providerInstanceId: source.providerInstanceId,
+            nativeThreadId: nativeThreadIdOf(source),
+          }),
+        } satisfies AgentSessionSummary;
+      }),
+      { concurrency: 8 },
+    );
+    return { sessions, truncated: listing.truncated } satisfies AgentSessionListResult;
+  });
+
+  /**
+   * Opens a session as a thread. A thread that already holds the session is returned as it
+   * is, even when the transcript has grown since, because T3 may have continued that thread.
+   */
+  const importSession = Effect.fn("AgentSessionImporter.importSession")(function* (
+    input: AgentSessionImportOneInput,
+  ) {
+    const project = yield* loadProject(input.projectId);
+    const held = (nativeThreadId: string) =>
+      findOwnerThread({
+        projectId: input.projectId,
+        providerInstanceId: input.providerInstanceId,
+        nativeThreadId,
+      }).pipe(
+        Effect.map((threadId): AgentSessionImportOneResult | null =>
+          threadId === null ? null : { threadId, imported: false },
+        ),
+      );
+    const alreadyHeld = yield* held(input.providerSessionId);
+    if (alreadyHeld !== null) return alreadyHeld;
+
+    const found = yield* scanner.findProjectSession({
+      workspaceRoot: project.workspaceRoot,
+      providerInstanceId: input.providerInstanceId,
+      providerSessionId: input.providerSessionId,
+    });
+    if (found._tag !== "Importable") {
+      return yield* new AgentSessionNotFoundError({
+        projectId: input.projectId,
+        providerSessionId: input.providerSessionId,
+      });
+    }
+    const heldByFile = yield* held(nativeThreadIdOf(found.source));
+    if (heldByFile !== null) return heldByFile;
+
+    const outcome = yield* importThread({
+      outcome: found,
+      projectId: input.projectId,
+      workspaceRoot: project.workspaceRoot,
+      runtimeMode: yield* importRuntimeMode(input.projectId, project),
+    }).pipe(
+      Effect.catchIf(
+        (cause) => !isUnresumableSessionError(cause),
+        (cause) => Effect.die(cause),
+      ),
+    );
+    const threadId = ThreadId.make(
+      `import:${found.source.providerInstanceId}:${found.source.providerSessionId}`,
+    );
+    if (outcome === "imported") return { threadId, imported: true };
+    return (
+      (yield* held(nativeThreadIdOf(found.source))) ??
+      (yield* new AgentSessionUnresumableSessionError({
+        source: found.source.provider,
+        providerSessionId: found.source.providerSessionId,
+      }))
+    );
+  });
+
   /**
    * Loading a native session replays its history only into the adapter's own
    * snapshot, so copy that snapshot into the thread as run-less history. The
@@ -623,7 +741,7 @@ const make = Effect.gen(function* () {
     return yield* commit(messages);
   });
 
-  return { importRecentAgentThreads, importNativeHistory };
+  return { importRecentAgentThreads, importNativeHistory, listSessions, importSession };
 });
 
 type AgentSessionImporterShape = Effect.Success<typeof make>;

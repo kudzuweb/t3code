@@ -89,6 +89,7 @@ const MAX_IMPORTED_MESSAGES = 200;
 const MAX_IMPORT_HISTORY_BYTES = 32 * 1024 * 1024;
 const MAX_IMPORT_BYTES = 4 * 1024 * 1024 * 1024;
 const MAX_IMPORT_TRANSCRIPTS = 100;
+const MAX_LISTED_SESSIONS = 200;
 const MAX_IMPORT_RECORDS = 100_000;
 
 /**
@@ -231,6 +232,18 @@ export type AgentSessionRecentThread =
   | { readonly _tag: "Duplicate"; readonly source: AgentSessionImportSource }
   | { readonly _tag: "Skipped" };
 
+export interface AgentSessionKey {
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly providerSessionId: string;
+}
+
+export interface AgentSessionListing {
+  readonly source: AgentSessionImportSource;
+  readonly title: string;
+  readonly lastActiveAt: string;
+  readonly worktree: { readonly path: string; readonly branch: string | null } | null;
+}
+
 export class AgentSessionScanner extends Context.Service<
   AgentSessionScanner,
   {
@@ -239,10 +252,33 @@ export class AgentSessionScanner extends Context.Service<
       workspaceRoot: string,
       completedSources?: ReadonlyArray<AgentSessionImportSource>,
     ) => Stream.Stream<AgentSessionRecentThread, AgentSessionScanError>;
+    /** Every session of the project and its worktrees, newest first, with no age limit. */
+    readonly listProjectSessions: (
+      workspaceRoot: string,
+      limit?: number,
+    ) => Effect.Effect<
+      { readonly sessions: ReadonlyArray<AgentSessionListing>; readonly truncated: boolean },
+      AgentSessionScanError
+    >;
+    readonly findProjectSession: (
+      input: AgentSessionKey & { readonly workspaceRoot: string },
+    ) => Effect.Effect<AgentSessionRecentThread, AgentSessionScanError>;
   }
 >()("t3/project/AgentSessionScanner") {}
 
 type AgentSessionSource = AgentSessionProjectCandidate["sources"][number];
+
+interface RecentThreadOptions {
+  /** Null reads transcripts of any age. */
+  readonly windowMs: number | null;
+  readonly transcriptLimit: number;
+  readonly session?: AgentSessionKey;
+}
+
+const IMPORT_OPTIONS: RecentThreadOptions = {
+  windowMs: RECENT_THREAD_WINDOW_MS,
+  transcriptLimit: MAX_IMPORT_TRANSCRIPTS,
+};
 
 interface RawCandidate {
   readonly cwd: string;
@@ -2049,13 +2085,15 @@ export const make = Effect.gen(function* () {
   const prepareRecentThreads = Effect.fn("AgentSessionScanner.prepareRecentThreads")(function* (
     workspaceRoot: string,
     completedSources: ReadonlyArray<AgentSessionImportSource>,
+    options: RecentThreadOptions,
   ) {
     const root = path.resolve(expandHomePath(workspaceRoot, homeDir));
     const realRoot = yield* fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root));
     if (isExcludedProjectPath(root) || isExcludedProjectPath(realRoot)) return Stream.empty;
     const rootIdentity = yield* directoryIdentity(root);
     const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
-    const cutoffMs = nowMs - RECENT_THREAD_WINDOW_MS;
+    const cutoffMs =
+      options.windowMs === null ? Number.NEGATIVE_INFINITY : nowMs - options.windowMs;
 
     // Imports recorded since a budget-truncated collection can free budget for transcripts it cut off.
     if (cachedCandidates === null || cachedCandidates.metadataTruncated) {
@@ -2107,6 +2145,12 @@ export const make = Effect.gen(function* () {
       readonly transcript: RawCandidate["transcripts"][number] & { readonly mtimeMs: number };
     }> = [];
     for (const candidate of candidates) {
+      if (
+        options.session !== undefined &&
+        candidate.providerInstanceId !== options.session.providerInstanceId
+      ) {
+        continue;
+      }
       const expanded = expandHomePath(candidate.cwd.trim(), homeDir);
       if (!path.isAbsolute(expanded)) continue;
       const resolved = path.resolve(expanded);
@@ -2133,6 +2177,15 @@ export const make = Effect.gen(function* () {
       }
       return left.transcript.filePath.localeCompare(right.transcript.filePath);
     });
+    // Only a transcript's records name its session, but file names almost always carry the id.
+    const wantedSessionId = options.session?.providerSessionId;
+    if (wantedSessionId !== undefined) {
+      eligibleTranscripts.sort(
+        (left, right) =>
+          Number(right.transcript.filePath.includes(wantedSessionId)) -
+          Number(left.transcript.filePath.includes(wantedSessionId)),
+      );
+    }
 
     const completedByFile = Map.groupBy(
       completedSources,
@@ -2141,7 +2194,7 @@ export const make = Effect.gen(function* () {
     const importedSessions = new Set<string>();
     const codexThreadNamesByHome = new Map<string, ReadonlyMap<string, string>>();
     let bytesRemaining = MAX_IMPORT_BYTES;
-    let transcriptsRemaining = MAX_IMPORT_TRANSCRIPTS;
+    let transcriptsRemaining = options.transcriptLimit;
     const codexRolloutPaths = new Map<ProviderInstanceId, ReadonlyMap<string, string>>();
     const codexRolloutPath = (providerInstanceId: ProviderInstanceId, rolloutId: string) => {
       let paths = codexRolloutPaths.get(providerInstanceId);
@@ -2284,6 +2337,12 @@ export const make = Effect.gen(function* () {
           if (parsedThread === null) {
             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
           }
+          if (
+            options.session !== undefined &&
+            parsedThread.providerSessionId !== options.session.providerSessionId
+          ) {
+            return Option.none<AgentSessionRecentThread>();
+          }
           let savedTitle: string | undefined;
           if (candidate.source === "codex") {
             const names =
@@ -2321,9 +2380,49 @@ export const make = Effect.gen(function* () {
   const recentThreads: AgentSessionScanner["Service"]["recentThreads"] = (
     workspaceRoot,
     completedSources = [],
-  ) => Stream.unwrap(prepareRecentThreads(workspaceRoot, completedSources));
+  ) => Stream.unwrap(prepareRecentThreads(workspaceRoot, completedSources, IMPORT_OPTIONS));
 
-  return AgentSessionScanner.of({ scan, recentThreads });
+  const listProjectSessions: AgentSessionScanner["Service"]["listProjectSessions"] = Effect.fn(
+    "AgentSessionScanner.listProjectSessions",
+  )(function* (workspaceRoot, limit = MAX_LISTED_SESSIONS) {
+    const listings = yield* Stream.unwrap(
+      prepareRecentThreads(workspaceRoot, [], {
+        windowMs: null,
+        transcriptLimit: MAX_TRANSCRIPTS_PER_SOURCE,
+      }),
+    ).pipe(
+      Stream.filter((outcome) => outcome._tag === "Importable"),
+      Stream.map((outcome): AgentSessionListing => ({
+        source: outcome.source,
+        title: outcome.thread.title,
+        lastActiveAt: outcome.thread.updatedAt,
+        worktree: outcome.worktree,
+      })),
+      Stream.take(limit + 1),
+      Stream.runCollect,
+    );
+    return { sessions: listings.slice(0, limit), truncated: listings.length > limit };
+  });
+
+  const findProjectSession: AgentSessionScanner["Service"]["findProjectSession"] = Effect.fn(
+    "AgentSessionScanner.findProjectSession",
+  )(function* ({ workspaceRoot, ...session }) {
+    const outcome = yield* Stream.unwrap(
+      prepareRecentThreads(workspaceRoot, [], {
+        windowMs: null,
+        transcriptLimit: MAX_TRANSCRIPTS_PER_SOURCE,
+        session,
+      }),
+    ).pipe(Stream.runHead);
+    return Option.getOrElse(outcome, (): AgentSessionRecentThread => ({ _tag: "Skipped" }));
+  });
+
+  return AgentSessionScanner.of({
+    scan,
+    recentThreads,
+    listProjectSessions,
+    findProjectSession,
+  });
 });
 
 export const layer = Layer.effect(AgentSessionScanner, make).pipe(
