@@ -29,6 +29,7 @@ export type ThreadActionMenuId =
   | "copy-branch"
   | "copy-thread"
   | "copy-thread-id"
+  | "copy-resume-command"
   | "archive"
   | "delete";
 
@@ -123,6 +124,8 @@ export interface ThreadActionMenuState {
   readonly canShareWithGuest?: boolean;
   /** A No project thread with its own folder, on a server that can promote it. */
   readonly canTurnIntoProject?: boolean;
+  /** The thread's provider session can be continued from a terminal. */
+  readonly canCopyResumeCommand?: boolean;
 }
 
 /** Local navigation, read markers, and copying remain available to read-only clients. */
@@ -138,6 +141,7 @@ export function threadActionRequiresOperate(action: ThreadActionMenuId): boolean
     "copy-branch",
     "copy-thread",
     "copy-thread-id",
+    "copy-resume-command",
   ].includes(action);
 }
 
@@ -291,6 +295,19 @@ export function buildThreadActionMenuItems(
           icon: "message-square",
         },
         { id: "copy-thread-id", label: resolve(msg("Thread ID")), icon: "hash" },
+        ...(state.canCopyResumeCommand
+          ? [
+              {
+                id: "copy-resume-command" as const,
+                label: resolve(
+                  msg("Resume command", {
+                    $context: "copy the terminal command that resumes the thread",
+                  }),
+                ),
+                icon: "terminal",
+              },
+            ]
+          : []),
       ],
     },
     { id: "project-settings", label: resolve(msg("Project settings")), icon: "settings" },

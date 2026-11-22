@@ -61,6 +61,7 @@ vi.mock("../state/entities", () => ({
   }),
   useProjects: () => [{ id: "project", environmentId: "secondary" }],
 }));
+vi.mock("../state/threadResumeCommand", () => ({ readThreadResumeCommand: () => null }));
 vi.mock("../state/environments", () => ({ usePrimaryEnvironmentId: () => "primary" }));
 vi.mock("../state/threads", () => ({ threadEnvironment: { updateMetadata: "metadata" } }));
 vi.mock("../state/use-atom-command", () => ({
