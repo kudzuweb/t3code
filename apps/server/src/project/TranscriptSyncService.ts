@@ -8,15 +8,19 @@ import {
   type ProviderThreadId,
   type ThreadId,
 } from "@t3tools/contracts";
+import { PI_PROVIDER } from "@t3tools/provider-pi/server";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
-import { claudeTurnCursor } from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
+import { CLAUDE_PROVIDER, claudeTurnCursor } from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
+import { CODEX_DRIVER_KIND } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import type { ProjectionRecords } from "../orchestration-v2/ProjectionStore.ts";
 import * as AgentSessionScanner from "./AgentSessionScanner.ts";
+import * as CodexSessionReader from "./CodexSessionReader.ts";
+import { codexTurnCursor } from "./CodexTurns.ts";
 
 /**
  * Brings a thread up to date with turns made in its native session outside T3. A turn T3 cannot
@@ -35,11 +39,35 @@ export class TranscriptSyncService extends Context.Service<
   }
 >()("t3/project/TranscriptSyncService") {}
 
+type TranscriptRead = Effect.Success<
+  ReturnType<AgentSessionScanner.AgentSessionScanner["Service"]["readTurnsAfter"]>
+>;
+
 const providerTurnEnded = (turn: OrchestrationV2ProviderTurn) =>
   turn.status === "completed" ||
   turn.status === "interrupted" ||
   turn.status === "failed" ||
   turn.status === "cancelled";
+
+/**
+ * Where an ended T3 turn left its provider's session, or null when that cannot be told. Claude
+ * and Codex name it in the turn. Pi's turn names only the entry it started at, and the end of the
+ * turn is the provider thread's head, which the same write set when it captured the turn's entries.
+ */
+const endedTurnCursor = (
+  providerThread: OrchestrationV2ProviderThread,
+  turn: OrchestrationV2ProviderTurn,
+): string | null => {
+  if (!providerTurnEnded(turn)) return null;
+  if (providerThread.driver === CLAUDE_PROVIDER) return claudeTurnCursor(turn);
+  if (providerThread.driver === CODEX_DRIVER_KIND) return codexTurnCursor(turn);
+  if (providerThread.driver === PI_PROVIDER) {
+    return turn.nativeTurnRef?.strength === "strong"
+      ? (providerThread.nativeConversationHeadRef?.nativeId ?? null)
+      : null;
+  }
+  return null;
+};
 
 const isTerminal = (run: OrchestrationV2Run) =>
   run.status !== "preparing" &&
@@ -51,6 +79,7 @@ const isTerminal = (run: OrchestrationV2Run) =>
 const make = Effect.gen(function* () {
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const scanner = yield* AgentSessionScanner.AgentSessionScanner;
+  const codexSessions = yield* CodexSessionReader.CodexSessionReader;
   const locks = yield* KeyedLock.make<ThreadId>();
   // What the last read of each provider thread's transcript saw, so an unchanged file is not read again.
   const lastRead = new Map<
@@ -84,6 +113,8 @@ const make = Effect.gen(function* () {
     );
     const newestFirst = records.runs.toSorted((left, right) => right.ordinal - left.ordinal);
     for (const run of newestFirst) {
+      // A run a rollback removed no longer shows where the session stands.
+      if (run.status === "rolled_back") continue;
       if (run.providerThreadId === null || !sessionThreadIds.has(run.providerThreadId)) continue;
       if (run.recordedFrom === "transcript") {
         const { turnItems } = yield* orchestrator.getThreadRecords(threadId, ["turnItems"], {
@@ -93,9 +124,9 @@ const make = Effect.gen(function* () {
       }
       const providerTurn = Orchestrator.providerTurnForRun(records, run);
       if (providerTurn === undefined) continue;
-      // A turn that never ended, or ended with no record uuid (it failed before Claude wrote
-      // anything), may sit beside output of its own, so nothing after it can be told apart.
-      return providerTurnEnded(providerTurn) ? claudeTurnCursor(providerTurn) : null;
+      // A turn that never ended, or ended with no record to name (it failed before the provider
+      // wrote anything), may sit beside output of its own, so nothing after it can be told apart.
+      return endedTurnCursor(providerThread, providerTurn);
     }
     const { turnItems } = yield* orchestrator.getThreadRecords(threadId, ["turnItems"], {
       turnItemRunIds: [null],
@@ -125,7 +156,13 @@ const make = Effect.gen(function* () {
       return 0;
     }
     // A rollback resumes the next T3 turn at its head, which leaves out what the terminal added.
-    if (providerThread.nativeConversationHeadRef !== null) return 0;
+    // Pi keeps its head there after every turn, so only the other providers read it as a rollback.
+    if (
+      providerThread.driver !== PI_PROVIDER &&
+      providerThread.nativeConversationHeadRef !== null
+    ) {
+      return 0;
+    }
 
     const anchorNativeId = yield* anchorFor(threadId, records, providerThread);
     if (anchorNativeId === null) {
@@ -134,13 +171,17 @@ const make = Effect.gen(function* () {
     }
 
     const previous = lastRead.get(providerThread.id);
-    const read = yield* scanner.readTurnsAfter({
-      driver: providerThread.driver,
-      providerInstanceId: providerThread.providerInstanceId,
-      providerSessionId: nativeThread.nativeId,
-      anchorNativeId,
-      ...(previous?.anchor === anchorNativeId ? { unchangedSince: previous.signature } : {}),
-    });
+    // Codex is read through its app-server, which has no file to compare, so it is read each time.
+    const read: TranscriptRead =
+      providerThread.driver === CODEX_DRIVER_KIND
+        ? yield* codexSessions.readTurnsAfter({ thread, providerThread, anchorNativeId })
+        : yield* scanner.readTurnsAfter({
+            driver: providerThread.driver,
+            providerInstanceId: providerThread.providerInstanceId,
+            providerSessionId: nativeThread.nativeId,
+            anchorNativeId,
+            ...(previous?.anchor === anchorNativeId ? { unchangedSince: previous.signature } : {}),
+          });
     if (read._tag === "Unchanged") return 0;
     // Only a read that leaves nothing to retry is remembered; a refused command reads again.
     const remember = (anchor: string) => {

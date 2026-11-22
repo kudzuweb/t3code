@@ -1,4 +1,4 @@
-import { assert, it } from "@effect/vitest";
+import { assert, describe, it } from "@effect/vitest";
 import {
   CommandId,
   EventId,
@@ -15,6 +15,7 @@ import {
   TurnItemId,
   type OrchestrationV2TranscriptTurn,
 } from "@t3tools/contracts";
+import { PI_PROVIDER } from "@t3tools/provider-pi/server";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -30,6 +31,7 @@ import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ProviderReplayHarness from "../orchestration-v2/testkit/ProviderReplayHarness.ts";
 import * as AgentSessionScanner from "./AgentSessionScanner.ts";
+import * as CodexSessionReader from "./CodexSessionReader.ts";
 import * as TranscriptSyncService from "./TranscriptSyncService.ts";
 
 const instanceId = ProviderInstanceId.make("claudeAgent");
@@ -68,7 +70,7 @@ const terminalTurn: OrchestrationV2TranscriptTurn = {
 };
 
 type SeedRun = {
-  readonly status: "completed" | "running" | "failed" | "cancelled";
+  readonly status: "completed" | "running" | "failed" | "cancelled" | "rolled_back";
   /**
    * What the run left in the provider: its native turn id, `"no-native-id"` for a turn without
    * one, or `"never-started"` for a run that never reached the provider.
@@ -87,7 +89,12 @@ const seed = Effect.fn("TranscriptSyncService.test.seed")(function* (input: {
   /** Native ids of imported history items, which have no run. */
   readonly importedItems?: ReadonlyArray<string>;
   readonly nativeConversationHeadRef?: boolean;
+  /** The driver of the native session; Claude unless the test says otherwise. */
+  readonly provider?: "claudeAgent" | "codex" | "pi";
+  /** The native record a provider that keeps its position there, such as Pi, left after its last turn. */
+  readonly head?: string;
 }) {
+  const kind = ProviderDriverKind.make(input.provider ?? "claudeAgent");
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const now = yield* DateTime.now;
@@ -112,7 +119,7 @@ const seed = Effect.fn("TranscriptSyncService.test.seed")(function* (input: {
       type: "provider-thread.updated",
       threadId,
       occurredAt: now,
-      payload: { ...providerThreadAt(now, false), id: earlierProviderThreadId },
+      payload: { ...providerThreadAt(now, false, kind), id: earlierProviderThreadId },
     });
   }
   yield* projections.apply({
@@ -120,7 +127,7 @@ const seed = Effect.fn("TranscriptSyncService.test.seed")(function* (input: {
     type: "provider-thread.updated",
     threadId,
     occurredAt: now,
-    payload: providerThreadAt(now, input.nativeConversationHeadRef === true),
+    payload: providerThreadAt(now, input.nativeConversationHeadRef === true, kind, input.head),
   });
   for (const [index, nativeId] of (input.importedItems ?? []).entries()) {
     yield* projections.apply({
@@ -135,7 +142,7 @@ const seed = Effect.fn("TranscriptSyncService.test.seed")(function* (input: {
         nodeId: null,
         providerThreadId: null,
         providerTurnId: null,
-        nativeItemRef: { driver, nativeId, strength: "strong" },
+        nativeItemRef: { driver: kind, nativeId, strength: "strong" },
         parentItemId: null,
         ordinal: index + 1,
         status: "completed",
@@ -193,7 +200,7 @@ const seed = Effect.fn("TranscriptSyncService.test.seed")(function* (input: {
           nativeTurnRef:
             run.turn === "no-native-id"
               ? null
-              : { driver, nativeId: run.turn, strength: run.turnStrength ?? "weak" },
+              : { driver: kind, nativeId: run.turn, strength: run.turnStrength ?? "weak" },
           ordinal,
           status: run.turnStatus ?? "completed",
           startedAt: now,
@@ -205,17 +212,25 @@ const seed = Effect.fn("TranscriptSyncService.test.seed")(function* (input: {
   return projections;
 });
 
-const providerThreadAt = (now: DateTime.Utc, pinnedHead: boolean) => ({
+const providerThreadAt = (
+  now: DateTime.Utc,
+  pinnedHead: boolean,
+  kind: ProviderDriverKind = driver,
+  head?: string,
+) => ({
   id: providerThreadId,
-  driver,
+  driver: kind,
   providerInstanceId: instanceId,
   providerSessionId: null,
   appThreadId: threadId,
   ownerNodeId: null,
-  nativeThreadRef: { driver, nativeId: "native-session", strength: "strong" as const },
-  nativeConversationHeadRef: pinnedHead
-    ? { driver, nativeId: "rolled-back-head", strength: "weak" as const }
-    : null,
+  nativeThreadRef: { driver: kind, nativeId: "native-session", strength: "strong" as const },
+  nativeConversationHeadRef:
+    head !== undefined
+      ? { driver: kind, nativeId: head, strength: "strong" as const }
+      : pinnedHead
+        ? { driver: kind, nativeId: "rolled-back-head", strength: "weak" as const }
+        : null,
   status: "idle" as const,
   firstRunOrdinal: null,
   lastRunOrdinal: null,
@@ -227,10 +242,23 @@ const providerThreadAt = (now: DateTime.Utc, pinnedHead: boolean) => ({
 
 const signature = { size: 100, mtimeMs: 5 };
 
+// Claude and Pi sessions are read as files and Codex through its app-server, so a test that reads
+// no Codex thread gets a reader that fails when asked.
+const layerNoCodexReader = Layer.mock(CodexSessionReader.CodexSessionReader)({});
+
 /** A sync whose reader answers with `reads[anchor]` and remembers what it was asked. */
 const makeService = Effect.fn("TranscriptSyncService.test.makeService")(function* (
   reads: Record<string, AgentSessionScanner.TurnsAfterAnchor>,
+  codexReads: Record<string, AgentSessionScanner.TurnsAfterAnchor> = {},
 ) {
+  const codexAsked: Array<string> = [];
+  const codexReader = Layer.mock(CodexSessionReader.CodexSessionReader)({
+    readTurnsAfter: ({ anchorNativeId }) =>
+      Effect.sync(() => {
+        codexAsked.push(anchorNativeId);
+        return codexReads[anchorNativeId] ?? { _tag: "AnchorNotFound" as const };
+      }),
+  });
   const asked: Array<{
     readonly anchor: string;
     readonly unchangedSince: AgentSessionScanner.TranscriptSignature | undefined;
@@ -249,7 +277,11 @@ const makeService = Effect.fn("TranscriptSyncService.test.makeService")(function
     Effect.provide(
       TranscriptSyncService.layer.pipe(
         Layer.provide(
-          Layer.mergeAll(scanner, Layer.succeed(Orchestrator.OrchestratorV2, orchestrator)),
+          Layer.mergeAll(
+            scanner,
+            codexReader,
+            Layer.succeed(Orchestrator.OrchestratorV2, orchestrator),
+          ),
         ),
       ),
     ),
@@ -257,6 +289,7 @@ const makeService = Effect.fn("TranscriptSyncService.test.makeService")(function
   return {
     service,
     asked,
+    codexAsked,
     get anchors() {
       return asked.map((entry) => entry.anchor);
     },
@@ -486,6 +519,7 @@ it.effect("serializes triggers for a thread, and the later one finds the file un
         TranscriptSyncService.layer.pipe(
           Layer.provide(
             Layer.mergeAll(
+              layerNoCodexReader,
               Layer.mock(AgentSessionScanner.AgentSessionScanner)({
                 readTurnsAfter: ({ unchangedSince }) =>
                   Effect.gen(function* () {
@@ -523,6 +557,7 @@ it.effect("starts a sync in the background without waiting for it", () =>
         TranscriptSyncService.layer.pipe(
           Layer.provide(
             Layer.mergeAll(
+              layerNoCodexReader,
               Layer.mock(AgentSessionScanner.AgentSessionScanner)({
                 readTurnsAfter: ({ anchorNativeId }) =>
                   Deferred.succeed(read, anchorNativeId).pipe(
@@ -553,6 +588,7 @@ it.effect("reads again after a dispatch the thread refused, though the file is u
         TranscriptSyncService.layer.pipe(
           Layer.provide(
             Layer.mergeAll(
+              layerNoCodexReader,
               Layer.mock(AgentSessionScanner.AgentSessionScanner)({
                 readTurnsAfter: ({ unchangedSince }) =>
                   Effect.gen(function* () {
@@ -602,3 +638,279 @@ it.effect("reads again after a dispatch the thread refused, though the file is u
     assert.deepEqual(asked, [undefined, undefined]);
   }).pipe(Effect.provide(layerStores)),
 );
+
+describe("Codex sessions", () => {
+  it.effect.each([
+    {
+      name: "a T3 run anchors on the turn id its provider turn ended with",
+      seeded: {
+        provider: "codex",
+        runs: [{ status: "completed", turn: "turn-t3", turnStrength: "strong" }],
+      },
+      anchor: "turn-t3",
+    },
+    {
+      name: "imported history anchors on the native id of its last item",
+      seeded: { provider: "codex", runs: [], importedItems: ["turn-a", "turn-b"] },
+      anchor: "turn-b",
+    },
+  ] as const)("reads through the Codex reader when $name", ({ seeded, anchor }) =>
+    Effect.gen(function* () {
+      const projections = yield* seed(seeded);
+      const sync = yield* makeService({}, { [anchor]: turnsOf("one") });
+
+      assert.equal(yield* sync.service.sync(threadId), 1);
+
+      assert.deepEqual(sync.codexAsked, [anchor]);
+      assert.deepEqual(sync.anchors, []);
+      assert.equal(
+        (yield* projections.getThreadProjection(threadId)).runs.at(-1)?.recordedFrom,
+        "transcript",
+      );
+    }).pipe(Effect.provide(layerStores)),
+  );
+
+  it.effect("moves its anchor to the recorded turn and writes nothing when read again", () =>
+    Effect.gen(function* () {
+      const projections = yield* seed({
+        provider: "codex",
+        runs: [{ status: "completed", turn: "turn-t3", turnStrength: "strong" }],
+      });
+      const sync = yield* makeService(
+        {},
+        {
+          "turn-t3": turnsOf("one"),
+          "a-one": { _tag: "Turns", turns: [], throughNativeId: "a-one" },
+        },
+      );
+
+      assert.equal(yield* sync.service.sync(threadId), 1);
+      assert.equal(yield* sync.service.sync(threadId), 0);
+      assert.equal(yield* sync.service.sync(threadId), 0);
+
+      assert.deepEqual(sync.codexAsked, ["turn-t3", "a-one", "a-one"]);
+      assert.equal((yield* projections.getThreadProjection(threadId)).runs.length, 2);
+    }).pipe(Effect.provide(layerStores)),
+  );
+
+  it.effect("writes nothing when the anchor is not in the Codex thread", () =>
+    Effect.gen(function* () {
+      const projections = yield* seed({
+        provider: "codex",
+        runs: [{ status: "completed", turn: "turn-t3", turnStrength: "strong" }],
+      });
+      const sync = yield* makeService({}, {});
+
+      assert.equal(yield* sync.service.sync(threadId), 0);
+
+      assert.deepEqual(sync.codexAsked, ["turn-t3"]);
+      assert.equal((yield* projections.getThreadProjection(threadId)).runs.length, 1);
+    }).pipe(Effect.provide(layerStores)),
+  );
+
+  it.effect.each([
+    {
+      name: "the latest run's provider turn has no Codex turn id",
+      seeded: { provider: "codex", runs: [{ status: "failed", turn: "no-native-id" }] },
+    },
+    {
+      name: "the latest run's Codex turn id is weak",
+      seeded: { provider: "codex", runs: [{ status: "completed", turn: "turn-t3" }] },
+    },
+    {
+      name: "the provider turn never ended",
+      seeded: {
+        provider: "codex",
+        runs: [
+          { status: "completed", turn: "turn-t3", turnStrength: "strong", turnStatus: "running" },
+        ],
+      },
+    },
+    {
+      name: "a rollback pinned the native conversation head",
+      seeded: {
+        provider: "codex",
+        runs: [{ status: "completed", turn: "turn-t3", turnStrength: "strong" }],
+        nativeConversationHeadRef: true,
+      },
+    },
+  ] as const)("does not read the Codex thread when $name", ({ seeded }) =>
+    Effect.gen(function* () {
+      yield* seed(seeded);
+      const sync = yield* makeService({}, { "turn-t3": turnsOf("one") });
+
+      assert.equal(yield* sync.service.sync(threadId), 0);
+
+      assert.deepEqual(sync.codexAsked, []);
+    }).pipe(Effect.provide(layerStores)),
+  );
+});
+
+describe("Pi sessions", () => {
+  it.effect("anchors on the leaf entry its last T3 turn ended at, though the head is set", () =>
+    Effect.gen(function* () {
+      const projections = yield* seed({
+        provider: "pi",
+        head: "leaf-1",
+        runs: [{ status: "completed", turn: "user-entry-1", turnStrength: "strong" }],
+      });
+      const sync = yield* makeService({ "leaf-1": turnsOf("one") });
+
+      assert.equal(yield* sync.service.sync(threadId), 1);
+
+      assert.deepEqual(sync.anchors, ["leaf-1"]);
+      assert.equal(
+        (yield* projections.getThreadProjection(threadId)).runs.at(-1)?.recordedFrom,
+        "transcript",
+      );
+    }).pipe(Effect.provide(layerStores)),
+  );
+
+  it.effect("anchors on the last imported entry when no T3 turn has run", () =>
+    Effect.gen(function* () {
+      yield* seed({ provider: "pi", runs: [], importedItems: ["entry-1", "entry-2"] });
+      const sync = yield* makeService({ "entry-2": turnsOf("one") });
+
+      assert.equal(yield* sync.service.sync(threadId), 1);
+
+      assert.deepEqual(sync.anchors, ["entry-2"]);
+    }).pipe(Effect.provide(layerStores)),
+  );
+
+  it.effect("follows a T3 turn after a terminal turn to the head that turn left", () =>
+    Effect.gen(function* () {
+      const projections = yield* seed({
+        provider: "pi",
+        head: "leaf-1",
+        runs: [{ status: "completed", turn: "user-entry-1", turnStrength: "strong" }],
+      });
+      const sync = yield* makeService({ "leaf-1": turnsOf("one"), "leaf-2": turnsOf("two") });
+      assert.equal(yield* sync.service.sync(threadId), 1);
+
+      // A second T3 turn follows the terminal turn and moves the head.
+      const now = yield* DateTime.now;
+      yield* projections.apply({
+        id: EventId.make("sync:run:pi-again"),
+        type: "run.created",
+        threadId,
+        occurredAt: now,
+        payload: {
+          id: RunId.make("run:pi-again"),
+          threadId,
+          ordinal: 3,
+          providerInstanceId: instanceId,
+          modelSelection,
+          providerThreadId,
+          userMessageId: MessageId.make("message:pi-again"),
+          rootNodeId: null,
+          activeAttemptId: RunAttemptId.make("attempt:pi-again"),
+          status: "completed",
+          requestedAt: now,
+          startedAt: now,
+          completedAt: now,
+          checkpointId: null,
+          contextHandoffId: null,
+        },
+      });
+      yield* projections.apply({
+        id: EventId.make("sync:turn:pi-again"),
+        type: "provider-turn.updated",
+        threadId,
+        occurredAt: now,
+        payload: {
+          id: ProviderTurnId.make("provider-turn:pi-again"),
+          providerThreadId,
+          nodeId: NodeId.make("node:pi-again"),
+          runAttemptId: RunAttemptId.make("attempt:pi-again"),
+          nativeTurnRef: { driver: PI_PROVIDER, nativeId: "user-entry-2", strength: "strong" },
+          ordinal: 2,
+          status: "completed",
+          startedAt: now,
+          completedAt: now,
+        },
+      });
+      yield* projections.apply({
+        id: EventId.make("sync:provider-thread:pi-again"),
+        type: "provider-thread.updated",
+        threadId,
+        occurredAt: now,
+        payload: providerThreadAt(now, false, PI_PROVIDER, "leaf-2"),
+      });
+      assert.equal(yield* sync.service.sync(threadId), 1);
+
+      assert.deepEqual(sync.anchors, ["leaf-1", "leaf-2"]);
+      assert.equal((yield* projections.getThreadProjection(threadId)).runs.length, 4);
+    }).pipe(Effect.provide(layerStores)),
+  );
+
+  it.effect(
+    "writes nothing when the user rewound the session, so the head is not on its branch",
+    () =>
+      Effect.gen(function* () {
+        const projections = yield* seed({
+          provider: "pi",
+          head: "leaf-1",
+          runs: [{ status: "completed", turn: "user-entry-1", turnStrength: "strong" }],
+        });
+        const sync = yield* makeService({});
+
+        assert.equal(yield* sync.service.sync(threadId), 0);
+
+        assert.deepEqual(sync.anchors, ["leaf-1"]);
+        assert.equal((yield* projections.getThreadProjection(threadId)).runs.length, 1);
+      }).pipe(Effect.provide(layerStores)),
+  );
+
+  it.effect("anchors on the head a rollback left, passing over the runs it removed", () =>
+    Effect.gen(function* () {
+      yield* seed({
+        provider: "pi",
+        head: "fork-leaf",
+        runs: [
+          { status: "completed", turn: "user-entry-1", turnStrength: "strong" },
+          { status: "rolled_back", turn: "no-native-id" },
+        ],
+      });
+      const sync = yield* makeService({ "fork-leaf": turnsOf("one") });
+
+      assert.equal(yield* sync.service.sync(threadId), 1);
+
+      assert.deepEqual(sync.anchors, ["fork-leaf"]);
+    }).pipe(Effect.provide(layerStores)),
+  );
+
+  it.effect.each([
+    {
+      name: "the latest run's provider turn holds a weak synthetic ref, as after a stale cursor",
+      seeded: {
+        provider: "pi",
+        head: "leaf-1",
+        runs: [{ status: "completed", turn: "turn:synthetic" }],
+      },
+    },
+    {
+      name: "the latest run's provider turn left no entry ref",
+      seeded: {
+        provider: "pi",
+        head: "leaf-1",
+        runs: [{ status: "failed", turn: "no-native-id" }],
+      },
+    },
+    {
+      name: "the provider thread has no head",
+      seeded: {
+        provider: "pi",
+        runs: [{ status: "completed", turn: "user-entry-1", turnStrength: "strong" }],
+      },
+    },
+  ] as const)("does not read the Pi session when $name", ({ seeded }) =>
+    Effect.gen(function* () {
+      yield* seed(seeded);
+      const sync = yield* makeService({ "leaf-1": turnsOf("one") });
+
+      assert.equal(yield* sync.service.sync(threadId), 0);
+
+      assert.deepEqual(sync.anchors, []);
+    }).pipe(Effect.provide(layerStores)),
+  );
+});

@@ -1140,7 +1140,7 @@ describe("importing one session", () => {
     }).pipe(Effect.scoped, Effect.provide(persistence)),
   );
 
-  it.effect("leaves the native item refs of a Codex import empty", () =>
+  it.effect("carries the native ids of a Codex import's items, as Claude and Pi imports do", () =>
     Effect.gen(function* () {
       const projections = yield* ProjectionStore.ProjectionStoreV2;
       const source = candidate(CODEX_MODEL_SELECTION, "codex-session");
@@ -1149,7 +1149,10 @@ describe("importing one session", () => {
       const imported = yield* importer.importSession(source);
 
       const records = yield* projections.getThreadRecords(imported.threadId, ["turnItems"]);
-      expect(records.turnItems.map((item) => item.nativeItemRef)).toEqual([null, null]);
+      expect(records.turnItems.map((item) => item.nativeItemRef)).toEqual([
+        { driver: "codex", nativeId: "codex-session:first", strength: "strong" },
+        { driver: "codex", nativeId: "codex-session:last", strength: "strong" },
+      ]);
     }).pipe(Effect.scoped, Effect.provide(persistence)),
   );
 

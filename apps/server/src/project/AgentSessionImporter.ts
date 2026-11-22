@@ -152,9 +152,9 @@ type HistoryMessage = Omit<AgentSessionScanner.AgentSessionThreadMessage, "role"
   readonly role: AgentSessionScanner.AgentSessionThreadMessage["role"] | "reasoning";
 };
 
-// Codex records carry no per-message id, so only Claude and Pi items can name their native record.
+// A Codex rollout names a turn, not a message, so its items carry that turn's id.
 const nativeRefDriver = (driver: ProviderDriverKind) =>
-  driver === "claudeAgent" || driver === "pi" ? driver : null;
+  driver === "claudeAgent" || driver === "codex" || driver === "pi" ? driver : null;
 
 function messageEvents(input: {
   readonly threadId: ThreadId;
