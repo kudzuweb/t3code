@@ -6048,6 +6048,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         cause: forkableSourceRunStatusError(sourceRun),
       });
     }
+    // Its run has no provider turn, so no native cutoff exists and the fork could include later turns.
+    if (sourceRun?.recordedFrom === "transcript") {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: "A turn made outside T3 cannot be forked from. Fork from a turn made in T3.",
+      });
+    }
     const sourceProviderThread =
       sourceRun === null ? undefined : providerThreadForRun(sourceProjection, sourceRun);
     const now = command.createdAt ?? (yield* DateTime.now);

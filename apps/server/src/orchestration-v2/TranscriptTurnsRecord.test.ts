@@ -231,3 +231,29 @@ it.effect.each([
     assert.equal((yield* projections.getThreadProjection(threadId)).runs.length, 2);
   }).pipe(Effect.provide(layerTest)),
 );
+
+it.effect("refuses a fork whose source is a recorded terminal turn", () =>
+  Effect.gen(function* () {
+    const { orchestrator, projections } = yield* setup("completed");
+    yield* orchestrator.dispatch(record("record-before-fork", 1, [turn("a", 1)]));
+    const recorded = (yield* projections.getThreadProjection(threadId)).runs.find(
+      (run) => run.recordedFrom === "transcript",
+    )!;
+    const targetThreadId = ThreadId.make("thread:fork-target");
+
+    const refused = yield* orchestrator
+      .dispatch({
+        type: "thread.fork",
+        commandId: CommandId.make("fork-terminal-turn"),
+        sourceThreadId: threadId,
+        targetThreadId,
+        sourcePoint: { type: "run", runId: recorded.id },
+        createdBy: "user",
+        creationSource: "web",
+      })
+      .pipe(Effect.flip);
+
+    assert.include(String(Reflect.get(refused, "cause")), "made outside T3");
+    assert.isNull(yield* projections.getThreadShell(targetThreadId));
+  }).pipe(Effect.provide(layerTest)),
+);
