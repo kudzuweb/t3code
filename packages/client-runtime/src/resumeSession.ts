@@ -4,8 +4,8 @@ import type { MFunctionType } from "gt-i18n/types";
 
 import { thrownErrorMessage } from "./errors/translatable.ts";
 
-/** What choosing the row does: import it, open the thread already holding it, or nothing. */
-export type ResumeSessionRowState = "resume" | "open" | "deleted";
+/** What choosing the row does: import it, or open the thread already holding it. */
+export type ResumeSessionRowState = "resume" | "open";
 
 export interface ResumeSessionRow {
   readonly key: string;
@@ -26,7 +26,6 @@ const PROVIDER_LABELS: Readonly<Record<AgentSessionSource, string>> = {
 };
 
 function rowState(session: AgentSessionSummary): ResumeSessionRowState {
-  if (session.heldBy === "deleted") return "deleted";
   return session.threadId === null ? "resume" : "open";
 }
 
@@ -65,8 +64,6 @@ export function resumeSessionErrorMessage(
   resolve: MFunctionType = mFallback,
 ): string {
   switch ((error as { readonly _tag?: string } | null)?._tag) {
-    case "AgentSessionDeletedThreadError":
-      return resolve(msg("This session's thread was deleted in T3."));
     case "AgentSessionNotFoundError":
       return resolve(msg("This session is no longer in the project."));
     case "AgentSessionUnreadableError":

@@ -71,8 +71,7 @@ you can search by title, provider or branch.
 
 Choosing a session opens a thread that continues that same session, so the
 terminal sees the turns you take in T3 Code afterwards. A session that already
-has a thread opens that thread and is marked **In T3**. A session whose thread
-you deleted is marked **Deleted in T3** and cannot be chosen again.
+has a thread opens that thread and is marked **In T3**.
 
 ## Pin and reorder threads
 

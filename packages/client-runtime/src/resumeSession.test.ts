@@ -25,12 +25,10 @@ describe("buildResumeSessionRows", () => {
     const rows = buildResumeSessionRows([
       session({ id: "new" }),
       session({ id: "held", threadId: ThreadId.make("thread-1") }),
-      session({ id: "gone", threadId: ThreadId.make("thread-2"), heldBy: "deleted" }),
     ]);
     expect(rows.map((row) => [row.session.providerSessionId, row.state])).toEqual([
       ["new", "resume"],
       ["held", "open"],
-      ["gone", "deleted"],
     ]);
     expect(rows[1]?.threadId).toBe("thread-1");
   });
@@ -66,9 +64,9 @@ describe("filterResumeSessionRows", () => {
 });
 
 describe("resumeSessionErrorMessage", () => {
-  it("names a deleted owner thread and falls back for unknown failures", () => {
-    expect(resumeSessionErrorMessage({ _tag: "AgentSessionDeletedThreadError" })).toBe(
-      "This session's thread was deleted in T3.",
+  it("names an unresumable session and falls back for unknown failures", () => {
+    expect(resumeSessionErrorMessage({ _tag: "AgentSessionUnresumableSessionError" })).toBe(
+      "This session cannot be resumed.",
     );
     expect(resumeSessionErrorMessage("boom")).toBe("Could not resume the session.");
   });

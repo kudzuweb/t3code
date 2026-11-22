@@ -112,7 +112,7 @@ function ProjectSessions(props: { readonly projectRef: ScopedProjectRef }) {
   };
 
   const choose = async (row: ResumeSessionRow) => {
-    if (resumingKey !== null || row.state === "deleted") return;
+    if (resumingKey !== null) return;
     setFailure(null);
     if (row.state === "open" && row.threadId !== null) {
       openThread(row.threadId);
@@ -192,7 +192,7 @@ function ProjectSessions(props: { readonly projectRef: ScopedProjectRef }) {
                 row={row}
                 selected={index === selectedIndex}
                 resuming={resumingKey === row.key}
-                disabled={!canChoose || row.state === "deleted" || resumingKey !== null}
+                disabled={!canChoose || resumingKey !== null}
                 onHover={() => setSelectedIndex(index)}
                 onChoose={() => void choose(row)}
               />
@@ -261,7 +261,6 @@ function SessionRow(props: {
       className={cn(
         "flex w-full min-w-0 flex-col gap-0.5 px-3 py-1.5 text-left hover:bg-accent/60 disabled:pointer-events-none",
         props.selected && "bg-accent text-accent-foreground",
-        row.state === "deleted" && "opacity-60",
       )}
       disabled={props.disabled}
       onMouseEnter={props.onHover}
@@ -273,11 +272,6 @@ function SessionRow(props: {
         {row.state === "open" ? (
           <Badge size="sm" variant="secondary">
             <T>In T3</T>
-          </Badge>
-        ) : null}
-        {row.state === "deleted" ? (
-          <Badge size="sm" variant="outline">
-            <T>Deleted in T3</T>
           </Badge>
         ) : null}
       </span>
