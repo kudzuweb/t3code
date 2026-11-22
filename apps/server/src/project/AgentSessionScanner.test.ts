@@ -4459,6 +4459,37 @@ describe("claudeTurnsAfter", () => {
     );
   });
 
+  it("keeps the text that follows non-visible user records in the same turn", () => {
+    const continued = [
+      record("u1", null, "user", "prompt"),
+      record("a2", "u1", "assistant", "reply before the hook"),
+      record("u3", "a2", "user", "Stop hook feedback: keep going", { isMeta: true }),
+      record("a4", "u3", "assistant", "reply after the hook"),
+      record("u5", "a4", "user", "<task-notification>background task done</task-notification>"),
+      record("a6", "u5", "assistant", "reply to the notification"),
+      record("u7", "a6", "user", "next prompt"),
+      record("a8", "u7", "assistant", "next reply"),
+    ];
+    const turns = AgentSessionScanner.claudeTurnsAfter(
+      [record("u0", null, "user", "earlier"), ...continued],
+      ["u0", ...continued.map((entry) => entry.uuid)],
+      "u0",
+      fallback,
+    );
+    expect(turns).toMatchObject({
+      _tag: "Turns",
+      turns: [
+        {
+          userNativeId: "u1",
+          assistantNativeId: "a6",
+          assistantText:
+            "reply before the hook\n\nreply after the hook\n\nreply to the notification",
+        },
+        { userNativeId: "u7", assistantText: "next reply" },
+      ],
+    });
+  });
+
   it("records a last turn only once it has finished", () => {
     const base = ["u1", "a2", "u3", "a4"];
     const turn = (stopReason: string | null) => [
