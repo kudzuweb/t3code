@@ -1,5 +1,10 @@
 import { assert, it } from "@effect/vitest";
-import { ProviderDriverKind, ThreadId } from "@t3tools/contracts";
+import {
+  ProviderDriverKind,
+  ProviderInstanceId,
+  ProviderThreadId,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
@@ -20,7 +25,7 @@ const startWorker = Effect.fn("TranscriptSyncWorker.test.startWorker")(function*
   readonly candidates: () => ReturnType<
     ProjectionStore.ProjectionStoreV2Shape["listTranscriptSyncCandidates"]
   >;
-  readonly syncMany?: (threadIds: ReadonlyArray<ThreadId>) => Effect.Effect<number>;
+  readonly pollMany?: () => Effect.Effect<number>;
 }) {
   const queries: Array<DateTime.Utc> = [];
   const synced: Array<ReadonlyArray<ThreadId>> = [];
@@ -38,16 +43,24 @@ const startWorker = Effect.fn("TranscriptSyncWorker.test.startWorker")(function*
             supportsTranscriptSync: (driver) => driver === claude,
           }),
           Layer.mock(TranscriptSyncService.TranscriptSyncService)({
-            syncMany: (threadIds) =>
-              Effect.sync(() => synced.push(threadIds)).pipe(
-                Effect.andThen(input.syncMany?.(threadIds) ?? Effect.succeed(0)),
-              ),
+            pollMany: (candidates) =>
+              Effect.sync(() =>
+                synced.push(candidates.map((candidate) => candidate.threadId)),
+              ).pipe(Effect.andThen(input.pollMany?.() ?? Effect.succeed(0))),
           }),
         ),
       ),
     ),
   );
   return { queries, synced };
+});
+
+const candidate = (threadId: ThreadId, driver: ProviderDriverKind) => ({
+  threadId,
+  driver,
+  providerThreadId: ProviderThreadId.make(`provider-thread:${threadId}`),
+  providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+  nativeId: `native:${threadId}`,
 });
 
 const a = ThreadId.make("thread:a");
@@ -58,9 +71,9 @@ it.effect("syncs the supported candidates once at start and again every interval
     const worker = yield* startWorker({
       candidates: () =>
         Effect.succeed([
-          { threadId: a, driver: claude },
-          { threadId: ThreadId.make("thread:unsupported"), driver: other },
-          { threadId: b, driver: claude },
+          candidate(a, claude),
+          candidate(ThreadId.make("thread:unsupported"), other),
+          candidate(b, claude),
         ]),
     });
     yield* Effect.yieldNow;
@@ -95,8 +108,8 @@ it.effect("does not start a tick while the previous one is still running", () =>
   Effect.gen(function* () {
     const release = yield* Deferred.make<void>();
     const worker = yield* startWorker({
-      candidates: () => Effect.succeed([{ threadId: a, driver: claude }]),
-      syncMany: () => Deferred.await(release).pipe(Effect.as(0)),
+      candidates: () => Effect.succeed([candidate(a, claude)]),
+      pollMany: () => Deferred.await(release).pipe(Effect.as(0)),
     });
     yield* Effect.yieldNow;
 
@@ -117,7 +130,7 @@ it.effect("keeps running after a tick fails", () =>
         Effect.suspend(() =>
           ++attempts === 1
             ? Effect.die("the projection read failed")
-            : Effect.succeed([{ threadId: a, driver: claude }]),
+            : Effect.succeed([candidate(a, claude)]),
         ),
     });
     yield* Effect.yieldNow;

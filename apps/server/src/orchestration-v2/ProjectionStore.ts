@@ -50,7 +50,6 @@ import type {
   OrchestrationV2ThreadProjection,
   OrchestrationV2TurnItem,
   GuestShareId,
-  ProviderThreadId,
   ProviderTurnId,
   RunAttemptId,
 } from "@t3tools/contracts";
@@ -87,6 +86,7 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderThreadId,
 } from "@t3tools/contracts";
 import { createOrchestrationV2TurnItemVisibility } from "@t3tools/shared/orchestrationV2Timeline";
 import {
@@ -539,6 +539,9 @@ export type ActiveThreadListEntry = Pick<
 export interface TranscriptSyncCandidate {
   readonly threadId: ThreadId;
   readonly driver: ProviderDriverKind;
+  readonly providerThreadId: ProviderThreadId;
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly nativeId: string;
 }
 
 export interface OlderSettledThreadsQuery {
@@ -9670,8 +9673,19 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
 
     const listTranscriptSyncCandidates = Effect.fn("ProjectionStore.listTranscriptSyncCandidates")(
       function* (options: { readonly updatedSince: DateTime.Utc }) {
-        const rows = yield* sql<{ readonly thread_id: string; readonly driver: string }>`
-          SELECT t.thread_id, json_extract(p.payload_json, '$.driver') AS driver
+        const rows = yield* sql<{
+          readonly thread_id: string;
+          readonly provider_thread_id: string;
+          readonly driver: string;
+          readonly provider_instance_id: string;
+          readonly native_id: string;
+        }>`
+          SELECT
+            t.thread_id,
+            p.provider_thread_id,
+            json_extract(p.payload_json, '$.driver') AS driver,
+            json_extract(p.payload_json, '$.providerInstanceId') AS provider_instance_id,
+            json_extract(p.payload_json, '$.nativeThreadRef.nativeId') AS native_id
           FROM orchestration_v2_projection_threads t
           JOIN orchestration_v2_projection_provider_threads p
             ON p.provider_thread_id = t.active_provider_thread_id
@@ -9679,10 +9693,15 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             AND t.archived_at IS NULL
             AND t.updated_at >= ${DateTime.formatIso(options.updatedSince)}
             AND json_extract(p.payload_json, '$.nativeThreadRef.strength') = 'strong'
+            AND json_extract(p.payload_json, '$.nativeThreadRef.nativeId') IS NOT NULL
+          ORDER BY t.updated_at DESC
         `;
         return rows.map((row): TranscriptSyncCandidate => ({
           threadId: ThreadId.make(row.thread_id),
           driver: ProviderDriverKind.make(row.driver),
+          providerThreadId: ProviderThreadId.make(row.provider_thread_id),
+          providerInstanceId: ProviderInstanceId.make(row.provider_instance_id),
+          nativeId: row.native_id,
         }));
       },
       Effect.mapError(shellSnapshotReadError),

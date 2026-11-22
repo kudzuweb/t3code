@@ -31,10 +31,10 @@ export const layer = Layer.effectDiscard(
       const candidates = yield* projections.listTranscriptSyncCandidates({
         updatedSince: DateTime.subtractDuration(now, TRANSCRIPT_SYNC_ACTIVITY_WINDOW),
       });
-      const threadIds = candidates
-        .filter((candidate) => scanner.supportsTranscriptSync(candidate.driver))
-        .map((candidate) => candidate.threadId);
-      if (threadIds.length > 0) yield* sync.syncMany(threadIds);
+      const supported = candidates.filter((candidate) =>
+        scanner.supportsTranscriptSync(candidate.driver),
+      );
+      if (supported.length > 0) yield* sync.pollMany(supported);
     }).pipe(
       Effect.catchCauseIf(
         (cause) => !Cause.hasInterruptsOnly(cause),

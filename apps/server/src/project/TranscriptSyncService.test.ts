@@ -21,6 +21,8 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import { CodexProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
@@ -229,18 +231,43 @@ const signature = { size: 100, mtimeMs: 5 };
 
 /** A sync whose reader answers with `reads[anchor]` and remembers what it was asked. */
 const makeService = Effect.fn("TranscriptSyncService.test.makeService")(function* (
-  reads: Record<string, AgentSessionScanner.TurnsAfterAnchor>,
+  reads: Record<string, AgentSessionScanner.TurnsAfterAnchor | { readonly _tag: "NoTranscript" }>,
+  options: {
+    readonly supported?: boolean;
+    /** What the scanner's cached file reports for a poll; none when it has not found the file. */
+    readonly peek?: Option.Option<AgentSessionScanner.TranscriptSignature>;
+  } = {},
 ) {
   const asked: Array<{
     readonly anchor: string;
     readonly unchangedSince: AgentSessionScanner.TranscriptSignature | undefined;
   }> = [];
-  const orchestrator = yield* Orchestrator.OrchestratorV2;
+  const polled: Array<boolean> = [];
+  const realOrchestrator = yield* Orchestrator.OrchestratorV2;
+  /** The fields each projection read asked for, so a test can see what a sync read. */
+  const recordReads: Array<ReadonlyArray<string>> = [];
+  const orchestrator = {
+    ...realOrchestrator,
+    getThreadRecords: (
+      threadId: ThreadId,
+      fields: ReadonlyArray<string>,
+      ...rest: Array<never>
+    ) => {
+      recordReads.push(fields);
+      return (realOrchestrator.getThreadRecords as (...args: Array<unknown>) => never)(
+        threadId,
+        fields,
+        ...rest,
+      );
+    },
+  } as unknown as typeof realOrchestrator;
   const scanner = Layer.mock(AgentSessionScanner.AgentSessionScanner)({
-    supportsTranscriptSync: () => true,
-    readTurnsAfter: ({ anchorNativeId, unchangedSince }) =>
+    supportsTranscriptSync: () => options.supported ?? true,
+    peekTranscriptSignature: () => Effect.succeed(options.peek ?? Option.none()),
+    readTurnsAfter: ({ anchorNativeId, unchangedSince, useRememberedPath }) =>
       Effect.sync(() => {
         asked.push({ anchor: anchorNativeId, unchangedSince });
+        polled.push(useRememberedPath === true);
         return unchangedSince !== undefined
           ? ({ _tag: "Unchanged" } as const)
           : { ...(reads[anchorNativeId] ?? { _tag: "AnchorNotFound" as const }), signature };
@@ -258,6 +285,8 @@ const makeService = Effect.fn("TranscriptSyncService.test.makeService")(function
   return {
     service,
     asked,
+    polled,
+    recordReads,
     get anchors() {
       return asked.map((entry) => entry.anchor);
     },
@@ -679,5 +708,120 @@ it.effect("reads nothing when the session has no native id to find a transcript 
     assert.equal(yield* sync.service.sync(threadId), 0);
 
     assert.deepEqual(sync.asked, []);
+  }).pipe(Effect.provide(layerStores)),
+);
+
+const candidateFor = (id: ThreadId = threadId) => ({
+  threadId: id,
+  driver,
+  providerThreadId,
+  providerInstanceId: instanceId,
+  nativeId: "native-session",
+});
+
+it.effect("a poll over unchanged sessions reads nothing from the projection", () =>
+  Effect.gen(function* () {
+    yield* seed({ runs: [{ status: "completed", turn: "a-t3" }] });
+    const sync = yield* makeService(
+      { "a-t3": { _tag: "Turns", turns: [], throughNativeId: "a-t3" } },
+      { peek: Option.some(signature) },
+    );
+    yield* sync.service.sync(threadId);
+    const readsAfterFirstSync = sync.recordReads.length;
+
+    assert.equal(yield* sync.service.pollMany([candidateFor()]), 0);
+
+    assert.equal(sync.recordReads.length, readsAfterFirstSync);
+    assert.equal(sync.asked.length, 1);
+  }).pipe(Effect.provide(layerStores)),
+);
+
+it.effect("a poll syncs a session whose file changed since it was read", () =>
+  Effect.gen(function* () {
+    yield* seed({ runs: [{ status: "completed", turn: "a-t3" }] });
+    const sync = yield* makeService(
+      { "a-t3": { _tag: "Turns", turns: [], throughNativeId: "a-t3" } },
+      { peek: Option.some({ size: 999, mtimeMs: 9 }) },
+    );
+    yield* sync.service.sync(threadId);
+
+    yield* sync.service.pollMany([candidateFor()]);
+
+    assert.equal(sync.asked.length, 2);
+    assert.deepEqual(sync.polled, [false, true]);
+  }).pipe(Effect.provide(layerStores)),
+);
+
+it.effect("a poll starts at most the cold-read limit of sessions it has never read", () =>
+  Effect.gen(function* () {
+    const sync = yield* makeService({});
+    const candidates = Array.from(
+      { length: TranscriptSyncService.TRANSCRIPT_SYNC_COLD_READS_PER_TICK + 2 },
+      (_, index) => candidateFor(ThreadId.make(`thread:cold-${index}`)),
+    );
+
+    yield* sync.service.pollMany(candidates);
+
+    assert.equal(
+      sync.recordReads.length,
+      TranscriptSyncService.TRANSCRIPT_SYNC_COLD_READS_PER_TICK,
+    );
+  }).pipe(Effect.provide(layerStores)),
+);
+
+it.effect(
+  "a poll leaves a missing session alone for five minutes, but a focus sync looks again",
+  () =>
+    Effect.gen(function* () {
+      yield* seed({ runs: [{ status: "completed", turn: "a-t3" }] });
+      const sync = yield* makeService({ "a-t3": { _tag: "NoTranscript" } });
+
+      yield* sync.service.pollMany([candidateFor()]);
+      yield* sync.service.pollMany([candidateFor()]);
+      assert.equal(sync.asked.length, 1);
+
+      yield* sync.service.sync(threadId);
+      assert.equal(sync.asked.length, 2);
+
+      yield* TestClock.adjust(TranscriptSyncService.TRANSCRIPT_SYNC_NO_TRANSCRIPT_RECHECK);
+      yield* sync.service.pollMany([candidateFor()]);
+      assert.equal(sync.asked.length, 3);
+    }).pipe(Effect.provide(layerStores)),
+);
+
+it.effect("a batch drops a thread whose driver has no reader before reading its history", () =>
+  Effect.gen(function* () {
+    yield* seed({ runs: [{ status: "completed", turn: "a-t3" }] });
+    const sync = yield* makeService({ "a-t3": turnsOf("one") }, { supported: false });
+
+    assert.equal(yield* sync.service.syncMany([threadId]), 0);
+
+    assert.deepEqual(sync.asked, []);
+    assert.isFalse(sync.recordReads.some((fields) => fields.includes("runs")));
+  }).pipe(Effect.provide(layerStores)),
+);
+
+it.effect("recording a terminal turn moves the thread's updated time to that turn", () =>
+  Effect.gen(function* () {
+    const projections = yield* seed({ runs: [{ status: "completed", turn: "a-t3" }] });
+    const sync = yield* makeService({ "a-t3": turnsOf("one") });
+
+    yield* sync.service.sync(threadId);
+
+    const thread = yield* projections.getThread(threadId);
+    assert.equal(DateTime.toEpochMillis(thread.updatedAt), Date.parse(terminalTurn.assistantAt!));
+  }).pipe(Effect.provide(layerStores)),
+);
+
+it.effect("a poll does not keep retrying a thread that has no anchor", () =>
+  Effect.gen(function* () {
+    yield* seed({ runs: [] });
+    const sync = yield* makeService({});
+
+    yield* sync.service.pollMany([candidateFor()]);
+    const readsAfterFirstPoll = sync.recordReads.length;
+    yield* sync.service.pollMany([candidateFor()]);
+
+    assert.equal(sync.recordReads.length, readsAfterFirstPoll);
   }).pipe(Effect.provide(layerStores)),
 );

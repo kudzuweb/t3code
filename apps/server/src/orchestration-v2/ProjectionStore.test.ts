@@ -2225,6 +2225,16 @@ const transcriptSyncCandidatesAreLiveStrongRecentThreads = Effect.gen(function* 
   });
 
   assert.deepEqual(
+    candidates.find((candidate) => candidate.threadId === "thread:transcript-live"),
+    {
+      threadId: ThreadId.make("thread:transcript-live"),
+      driver: ProviderDriverKind.make("claudeAgent"),
+      providerThreadId: ProviderThreadId.make("provider-thread:thread:transcript-live"),
+      providerInstanceId,
+      nativeId: "native:thread:transcript-live",
+    },
+  );
+  assert.deepEqual(
     candidates.map((candidate) => [candidate.threadId, candidate.driver]).toSorted(),
     [
       [ThreadId.make("thread:transcript-live"), "claudeAgent"],

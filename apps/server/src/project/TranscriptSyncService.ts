@@ -5,13 +5,18 @@ import {
   type OrchestrationV2ProviderTurn,
   type OrchestrationV2Run,
   type OrchestrationV2TurnItem,
+  type ProviderDriverKind,
+  type ProviderInstanceId,
   type ProviderThreadId,
   type ThreadId,
 } from "@t3tools/contracts";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as Context from "effect/Context";
+import * as Clock from "effect/Clock";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 
 import { claudeTurnCursor } from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
@@ -35,12 +40,35 @@ export class TranscriptSyncService extends Context.Service<
      * logged and the rest still sync.
      */
     readonly syncMany: (threadIds: ReadonlyArray<ThreadId>) => Effect.Effect<number>;
+    /**
+     * One tick of the poll: syncs the candidates whose session file changed, and a limited number
+     * the server has not read yet. A candidate whose file is unchanged costs one stat and no
+     * projection read. Returns the total recorded; a failure is logged per thread.
+     */
+    readonly pollMany: (
+      candidates: ReadonlyArray<TranscriptSyncPollCandidate>,
+    ) => Effect.Effect<number>;
     /** Starts a sync and returns at once; a failure is logged, never raised. */
     readonly syncInBackground: (threadId: ThreadId) => Effect.Effect<void>;
   }
 >()("t3/project/TranscriptSyncService") {}
 
+/** A thread the poll may sync, with what the file check needs to find its session. */
+export interface TranscriptSyncPollCandidate {
+  readonly threadId: ThreadId;
+  readonly driver: ProviderDriverKind;
+  readonly providerThreadId: ProviderThreadId;
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly nativeId: string;
+}
+
 const SYNC_MANY_CONCURRENCY = 4;
+
+/** How many sessions a tick may read for the first time, so a server start spreads its reads out. */
+export const TRANSCRIPT_SYNC_COLD_READS_PER_TICK = 10;
+
+/** How long the poll leaves a session it could not find alone. Opening and focus look at once. */
+export const TRANSCRIPT_SYNC_NO_TRANSCRIPT_RECHECK = Duration.minutes(5);
 
 const providerTurnEnded = (turn: OrchestrationV2ProviderTurn) =>
   turn.status === "completed" ||
@@ -60,6 +88,9 @@ const make = Effect.gen(function* () {
   const scanner = yield* AgentSessionScanner.AgentSessionScanner;
   const locks = yield* KeyedLock.make<ThreadId>();
   // What the last read of each provider thread's transcript saw, so an unchanged file is not read again.
+  // When a provider thread last had nothing to read (no file, or no anchor), so the poll does not
+  // look at it every tick.
+  const quietSince = new Map<ProviderThreadId, number>();
   const lastRead = new Map<
     ProviderThreadId,
     { readonly anchor: string; readonly signature: AgentSessionScanner.TranscriptSignature }
@@ -110,8 +141,26 @@ const make = Effect.gen(function* () {
     return newestItemNativeId(turnItems) ?? null;
   });
 
-  const syncOnce = Effect.fn("TranscriptSyncService.sync")(function* (threadId: ThreadId) {
+  const syncOnce = Effect.fn("TranscriptSyncService.sync")(function* (
+    threadId: ThreadId,
+    pollingRememberedPath: boolean,
+  ) {
     yield* Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": threadId });
+    // Provider threads are few, so they are read first to rule out a thread with nothing to read
+    // before loading its run history.
+    const head = yield* orchestrator.getThreadRecords(threadId, ["providerThreads"]);
+    const headProviderThread = head.providerThreads.find(
+      (candidate) => candidate.id === head.thread.activeProviderThreadId,
+    );
+    if (
+      head.thread.deletedAt !== null ||
+      headProviderThread === undefined ||
+      headProviderThread.nativeThreadRef?.strength !== "strong" ||
+      headProviderThread.nativeThreadRef.nativeId === null ||
+      !scanner.supportsTranscriptSync(headProviderThread.driver)
+    ) {
+      return 0;
+    }
     const records = yield* orchestrator.getThreadRecords(threadId, [
       "runs",
       "attempts",
@@ -119,26 +168,19 @@ const make = Effect.gen(function* () {
       "providerTurns",
     ]);
     const { thread, runs } = records;
-    if (thread.deletedAt !== null || !runs.every(isTerminal)) return 0;
+    if (!runs.every(isTerminal)) return 0;
     const providerThread = records.providerThreads.find(
       (candidate) => candidate.id === thread.activeProviderThreadId,
     );
-    const nativeThread = providerThread?.nativeThreadRef;
-    const nativeSessionId = nativeThread?.nativeId;
-    if (
-      providerThread === undefined ||
-      nativeThread == null ||
-      nativeThread.strength !== "strong" ||
-      nativeSessionId == null
-    ) {
-      return 0;
-    }
+    const nativeSessionId = providerThread?.nativeThreadRef?.nativeId;
+    if (providerThread === undefined || nativeSessionId == null) return 0;
     // A rollback resumes the next T3 turn at its head, which leaves out what the terminal added.
     if (providerThread.nativeConversationHeadRef !== null) return 0;
 
     const anchorNativeId = yield* anchorFor(threadId, records, providerThread);
     if (anchorNativeId === null) {
       yield* Effect.logDebug("Transcript sync has no anchor", { threadId });
+      quietSince.set(providerThread.id, yield* Clock.currentTimeMillis);
       return 0;
     }
 
@@ -149,7 +191,13 @@ const make = Effect.gen(function* () {
       providerSessionId: nativeSessionId,
       anchorNativeId,
       ...(previous?.anchor === anchorNativeId ? { unchangedSince: previous.signature } : {}),
+      ...(pollingRememberedPath ? { useRememberedPath: true } : {}),
     });
+    if (read._tag === "NoTranscript") {
+      quietSince.set(providerThread.id, yield* Clock.currentTimeMillis);
+    } else {
+      quietSince.delete(providerThread.id);
+    }
     if (read._tag === "Unchanged") return 0;
     // Only a read that leaves nothing to retry is remembered; a refused command reads again.
     const remember = (anchor: string) => {
@@ -194,14 +242,16 @@ const make = Effect.gen(function* () {
   });
 
   // A trigger during a sync waits for it and then finds the transcript unchanged.
-  const sync: TranscriptSyncService["Service"]["sync"] = (threadId) =>
+  const syncLocked = (threadId: ThreadId, pollingRememberedPath: boolean) =>
     locks
-      .withLock(threadId, syncOnce(threadId))
+      .withLock(threadId, syncOnce(threadId, pollingRememberedPath))
       .pipe(
         Effect.mapError(
           (cause) => new OrchestrationV2SyncTranscriptTurnsError({ threadId, cause }),
         ),
       );
+
+  const sync: TranscriptSyncService["Service"]["sync"] = (threadId) => syncLocked(threadId, false);
 
   const syncInBackground: TranscriptSyncService["Service"]["syncInBackground"] = (threadId) =>
     sync(threadId).pipe(
@@ -227,7 +277,70 @@ const make = Effect.gen(function* () {
       { concurrency: SYNC_MANY_CONCURRENCY },
     ).pipe(Effect.map((counts) => counts.reduce((total, count) => total + count, 0)));
 
-  return TranscriptSyncService.of({ sync, syncMany, syncInBackground });
+  type PollVerdict = "skip" | "changed" | "cold";
+
+  // Looks at the file only; the projection is not read for a session that has not changed.
+  const pollVerdict = Effect.fn("TranscriptSyncService.pollVerdict")(function* (
+    candidate: TranscriptSyncPollCandidate,
+  ) {
+    const missingSince = quietSince.get(candidate.providerThreadId);
+    if (
+      missingSince !== undefined &&
+      (yield* Clock.currentTimeMillis) - missingSince <
+        Duration.toMillis(TRANSCRIPT_SYNC_NO_TRANSCRIPT_RECHECK)
+    ) {
+      return "skip" as PollVerdict;
+    }
+    const previous = lastRead.get(candidate.providerThreadId);
+    if (previous === undefined) return "cold" as PollVerdict;
+    const current = yield* scanner.peekTranscriptSignature({
+      driver: candidate.driver,
+      providerInstanceId: candidate.providerInstanceId,
+      providerSessionId: candidate.nativeId,
+    });
+    if (Option.isNone(current)) return "cold" as PollVerdict;
+    return (
+      current.value.size === previous.signature.size &&
+      current.value.mtimeMs === previous.signature.mtimeMs
+        ? "skip"
+        : "changed"
+    ) as PollVerdict;
+  });
+
+  const pollMany: TranscriptSyncService["Service"]["pollMany"] = Effect.fn(
+    "TranscriptSyncService.pollMany",
+  )(function* (candidates) {
+    const verdicts = yield* Effect.forEach(
+      candidates,
+      (candidate) =>
+        pollVerdict(candidate).pipe(
+          Effect.orElseSucceed(() => "cold" as PollVerdict),
+          Effect.map((verdict) => ({ candidate, verdict })),
+        ),
+      { concurrency: SYNC_MANY_CONCURRENCY },
+    );
+    let coldReads = 0;
+    const due = verdicts.filter(({ verdict }) => {
+      if (verdict === "changed") return true;
+      return verdict === "cold" && coldReads++ < TRANSCRIPT_SYNC_COLD_READS_PER_TICK;
+    });
+    const counts = yield* Effect.forEach(
+      due,
+      ({ candidate }) =>
+        syncLocked(candidate.threadId, true).pipe(
+          Effect.catch((error) =>
+            Effect.logWarning("Transcript sync failed", {
+              threadId: candidate.threadId,
+              cause: error.cause,
+            }).pipe(Effect.as(0)),
+          ),
+        ),
+      { concurrency: SYNC_MANY_CONCURRENCY },
+    );
+    return counts.reduce((total, count) => total + count, 0);
+  });
+
+  return TranscriptSyncService.of({ sync, syncMany, pollMany, syncInBackground });
 });
 
 export const layer = Layer.effect(TranscriptSyncService, make);
