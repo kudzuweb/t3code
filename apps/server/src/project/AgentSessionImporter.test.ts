@@ -1195,19 +1195,44 @@ describe("importing one session", () => {
     }).pipe(Effect.scoped, Effect.provide(persistence)),
   );
 
-  it.effect("settles on one thread when the same session is imported twice at once", () =>
+  it.effect("settles on one thread when two imports of the same session reach the write", () =>
     Effect.gen(function* () {
       const source = candidate(CLAUDE_MODEL_SELECTION, claudeId, "claudeAgent");
-      const importer = yield* makeImporter([source]);
+      const bothChecked = yield* Deferred.make<void>();
+      let arrived = 0;
+      const importer = yield* makeImporter(
+        [source],
+        Effect.sync(() => (arrived += 1)).pipe(
+          Effect.flatMap((count) =>
+            count === 2 ? Deferred.succeed(bothChecked, undefined) : Effect.void,
+          ),
+          Effect.andThen(Deferred.await(bothChecked)),
+        ),
+      );
       const results = yield* Effect.all(
         [importer.importSession(source), importer.importSession(source)],
         { concurrency: 2 },
       );
+      expect(arrived).toBe(2);
       expect(results.map((result) => result.threadId)).toEqual([
         importId(source),
         importId(source),
       ]);
       expect(results.filter((result) => result.imported)).toHaveLength(1);
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+  );
+
+  it.effect("does not return another project's thread for a session this project lacks", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const source = candidate(CLAUDE_MODEL_SELECTION, claudeId, "claudeAgent");
+      const owner = yield* seedOwner(source);
+      yield* sql`UPDATE orchestration_v2_projection_threads SET project_id = 'other-project' WHERE thread_id = ${owner}`;
+      const importer = yield* makeImporter([]);
+      expect(yield* Effect.flip(importer.importSession(source))).toMatchObject({
+        _tag: "AgentSessionNotFoundError",
+        projectId,
+      });
     }).pipe(Effect.scoped, Effect.provide(persistence)),
   );
 

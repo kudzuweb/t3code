@@ -127,6 +127,7 @@ interface SessionKey {
 
 interface SessionOwner {
   readonly threadId: ThreadId;
+  readonly projectId: string;
   readonly deleted: boolean;
 }
 
@@ -612,6 +613,7 @@ const make = Effect.gen(function* () {
       if (holder !== undefined) {
         owners.set(sessionKeyId(key), {
           threadId: ThreadId.make(holder.thread_id),
+          projectId: holder.project_id,
           deleted: holder.deleted_at !== null,
         });
       }
@@ -656,6 +658,8 @@ const make = Effect.gen(function* () {
     const project = yield* loadProject(input.projectId);
     const held = Effect.fn("AgentSessionImporter.importSession.held")(function* (
       nativeThreadId: string,
+      // Before the scan confirms the session belongs to this project, only a thread in it counts.
+      scope: "project" | "any",
     ) {
       const key: SessionKey = {
         providerInstanceId: input.providerInstanceId,
@@ -664,6 +668,9 @@ const make = Effect.gen(function* () {
       };
       const owner = (yield* findOwners(input.projectId, [key])).get(sessionKeyId(key));
       if (owner === undefined) return null;
+      if (scope === "project" && (owner.deleted || owner.projectId !== input.projectId)) {
+        return null;
+      }
       if (owner.deleted) {
         return yield* new AgentSessionDeletedThreadError({
           projectId: input.projectId,
@@ -673,7 +680,7 @@ const make = Effect.gen(function* () {
       }
       return { threadId: owner.threadId, imported: false } satisfies AgentSessionImportOneResult;
     });
-    const alreadyHeld = yield* held(input.providerSessionId);
+    const alreadyHeld = yield* held(input.providerSessionId, "project");
     if (alreadyHeld !== null) return alreadyHeld;
 
     const found = yield* scanner.findProjectSession({
@@ -694,10 +701,10 @@ const make = Effect.gen(function* () {
           });
     }
     const nativeThreadId = nativeThreadIdOf(found.source);
-    if (nativeThreadId !== input.providerSessionId) {
-      const heldByFile = yield* held(nativeThreadId);
-      if (heldByFile !== null) return heldByFile;
-    }
+    const heldAfterScan =
+      (yield* held(input.providerSessionId, "any")) ??
+      (nativeThreadId === input.providerSessionId ? null : yield* held(nativeThreadId, "any"));
+    if (heldAfterScan !== null) return heldAfterScan;
 
     const settled = yield* importThread({
       outcome: found,
@@ -726,7 +733,7 @@ const make = Effect.gen(function* () {
     );
     if ("imported" in settled) return settled;
     // Another import can claim the session between the first check and the write.
-    return (yield* held(nativeThreadId)) ?? (yield* settled);
+    return (yield* held(nativeThreadId, "any")) ?? (yield* settled);
   });
 
   /**
