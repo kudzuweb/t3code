@@ -90,6 +90,7 @@ const MAX_IMPORT_HISTORY_BYTES = 32 * 1024 * 1024;
 const MAX_IMPORT_BYTES = 4 * 1024 * 1024 * 1024;
 const MAX_IMPORT_TRANSCRIPTS = 100;
 const MAX_LISTED_SESSIONS = 200;
+const LIST_SAMPLE_BYTES = 64 * 1024;
 const MAX_IMPORT_RECORDS = 100_000;
 
 /**
@@ -273,6 +274,11 @@ interface RecentThreadOptions {
   readonly windowMs: number | null;
   readonly transcriptLimit: number;
   readonly session?: AgentSessionKey;
+  /**
+   * Lists read only the head and tail of each transcript so listing stays fast on large
+   * transcripts; an import does the full parse. A transcript the sample cannot parse is read in full.
+   */
+  readonly headTailOnly?: boolean;
 }
 
 const IMPORT_OPTIONS: RecentThreadOptions = {
@@ -1455,6 +1461,79 @@ export const make = Effect.gen(function* () {
     );
   });
 
+  const readTranscriptSample = Effect.fn("AgentSessionScanner.readTranscriptSample")(function* (
+    filePath: string,
+    expected: ReturnType<typeof transcriptIdentity>,
+    source: AgentSessionSource,
+    parseInput: AgentSessionTranscriptMetadata,
+  ) {
+    const size = expected.size;
+    return yield* Effect.scoped(
+      fileSystem.open(filePath, { flag: "r" }).pipe(
+        Effect.flatMap((file) =>
+          Effect.gen(function* () {
+            if (!sameTranscriptIdentity(expected, transcriptIdentity(filePath, yield* file.stat))) {
+              return null;
+            }
+            const readRange = Effect.fn("AgentSessionScanner.readTranscriptSample.range")(
+              function* (offset: number, length: number) {
+                yield* file.seek(BigInt(offset), "start");
+                const decoder = new TextDecoder();
+                let text = "";
+                let remaining = length;
+                while (remaining > 0) {
+                  const next = yield* file.readAlloc(remaining);
+                  if (Option.isNone(next) || next.value.byteLength === 0) break;
+                  text += decoder.decode(next.value, { stream: true });
+                  remaining -= next.value.byteLength;
+                }
+                return text + decoder.decode();
+              },
+            );
+            const headEnd = Math.min(size, LIST_SAMPLE_BYTES);
+            const tailStart = Math.max(headEnd, size - LIST_SAMPLE_BYTES);
+            const lines =
+              tailStart === headEnd
+                ? (yield* readRange(0, size)).split("\n")
+                : [
+                    ...(yield* readRange(0, headEnd)).split("\n").slice(0, -1),
+                    ...(yield* readRange(tailStart, size - tailStart)).split("\n").slice(1),
+                  ];
+            const records: Array<DecodedTranscriptRecord> = [];
+            let cwd = Option.none<string>();
+            let claudeFields = emptyClaudeFields;
+            for (const line of lines) {
+              const decoded = decodeTranscriptRecord(line);
+              if (Option.isNone(decoded)) continue;
+              if (Option.isNone(cwd)) cwd = Option.fromNullOr(extractDecodedCwd(decoded.value));
+              if (source === "claudeAgent") {
+                claudeFields = foldClaudeFields(claudeFields, decoded.value);
+              }
+              if (!shouldRetainDecodedRecord(source, decoded.value)) continue;
+              if (
+                source === "pi" &&
+                decoded.value.type === "message" &&
+                !isPiConversationRecord(decoded.value)
+              ) {
+                const { message: _message, ...links } = decoded.value;
+                records.push(links);
+              } else {
+                records.push(decoded.value);
+              }
+            }
+            if (!sameTranscriptIdentity(expected, transcriptIdentity(filePath, yield* file.stat))) {
+              return null;
+            }
+            const parsed = parseAgentSessionRecords(parseInput, records, claudeFields, 0);
+            return parsed === null || parsed === "empty"
+              ? null
+              : { records, droppedMessageCount: 0, cwd, claudeFields, historyBytes: 0 };
+          }),
+        ),
+      ),
+    ).pipe(Effect.orElseSucceed(() => null));
+  });
+
   const readCodexThreadNames = Effect.fn("AgentSessionScanner.readCodexThreadNames")(function* (
     homePath: string,
   ) {
@@ -2281,8 +2360,28 @@ export const make = Effect.gen(function* () {
             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
           }
           transcriptsRemaining -= 1;
-          bytesRemaining -= identity.size;
-          const snapshot = yield* readTranscript(transcript.filePath, identity, candidate.source);
+          const sampled =
+            options.headTailOnly === true && !isCompressedTranscript(transcript.filePath);
+          const parseInput: AgentSessionTranscriptMetadata = {
+            source: candidate.source,
+            providerInstanceId: candidate.providerInstanceId,
+            fallbackSessionId: path.basename(
+              transcript.filePath,
+              isCompressedTranscript(transcript.filePath) ? COMPRESSED_TRANSCRIPT_SUFFIX : ".jsonl",
+            ),
+            lastActiveAtMs: transcript.mtimeMs,
+          };
+          const sample = sampled
+            ? yield* readTranscriptSample(
+                transcript.filePath,
+                identity,
+                candidate.source,
+                parseInput,
+              )
+            : null;
+          if (sample === null) bytesRemaining -= identity.size;
+          const snapshot =
+            sample ?? (yield* readTranscript(transcript.filePath, identity, candidate.source));
           if (snapshot === null) {
             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
           }
@@ -2308,17 +2407,7 @@ export const make = Effect.gen(function* () {
                 )
               : null;
           const parsedThread = parseAgentSessionRecords(
-            {
-              source: candidate.source,
-              providerInstanceId: candidate.providerInstanceId,
-              fallbackSessionId: path.basename(
-                transcript.filePath,
-                isCompressedTranscript(transcript.filePath)
-                  ? COMPRESSED_TRANSCRIPT_SUFFIX
-                  : ".jsonl",
-              ),
-              lastActiveAtMs: transcript.mtimeMs,
-            },
+            parseInput,
             inheritedRecords === null
               ? snapshot.records
               : [...inheritedRecords, ...snapshot.records],
@@ -2389,6 +2478,7 @@ export const make = Effect.gen(function* () {
       prepareRecentThreads(workspaceRoot, [], {
         windowMs: null,
         transcriptLimit: MAX_TRANSCRIPTS_PER_SOURCE,
+        headTailOnly: true,
       }),
     ).pipe(
       Stream.filter((outcome) => outcome._tag === "Importable"),

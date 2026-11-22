@@ -1827,6 +1827,71 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
       }),
     );
 
+    it.effect("lists titles from the head and tail of a transcript larger than the sample", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+        yield* TestClock.setTime(nowMs);
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const workspace = yield* makeTempDir("t3code-workspace-");
+        const message = (type: "user" | "assistant", sessionId: string, text: string): string =>
+          encodeTranscriptRecord({
+            type,
+            cwd: workspace,
+            sessionId,
+            timestamp: "2026-08-23T12:00:00.000Z",
+            message: { role: type, content: type === "user" ? text : [{ type: "text", text }] },
+          });
+        const filler = Array.from({ length: 400 }, (_, index) =>
+          message(index % 2 === 0 ? "assistant" : "user", "titled", "x".repeat(400)),
+        );
+        const write = (sessionId: string, records: ReadonlyArray<string>, ageMs: number) =>
+          writeTranscript({
+            filePath: path.join(claudeHomePath, "projects", "-selected", `${sessionId}.jsonl`),
+            contents: `${records.join("\n")}\n`,
+            mtimeMs: nowMs - ageMs,
+          });
+        yield* write(
+          "titled",
+          [
+            message("user", "titled", "First prompt"),
+            ...filler,
+            message("assistant", "titled", "Done"),
+            encodeTranscriptRecord({
+              type: "ai-title",
+              sessionId: "titled",
+              aiTitle: "Tail title",
+            }),
+          ],
+          1000,
+        );
+        yield* write(
+          "untitled",
+          [
+            message("user", "untitled", "Only the prompt names this"),
+            ...filler,
+            message("assistant", "untitled", "Done"),
+          ],
+          2000,
+        );
+
+        const scanner = yield* AgentSessionScanner.AgentSessionScanner.pipe(
+          Effect.provide(layerScannerTest({ claudeHomePath, codexHomePath })),
+        );
+        const listing = yield* scanner.listProjectSessions(workspace);
+        expect(
+          listing.sessions.map(({ source, title }) => [source.providerSessionId, title]),
+        ).toEqual([
+          ["titled", "Tail title"],
+          ["untitled", "Only the prompt names this"],
+        ]);
+        expect(
+          NodeFS.statSync(path.join(claudeHomePath, "projects", "-selected", "titled.jsonl")).size,
+        ).toBeGreaterThan(128 * 1024);
+      }),
+    );
+
     it.effect("keeps the provider instance that owns a custom session home", () =>
       Effect.gen(function* () {
         const path = yield* Path.Path;
