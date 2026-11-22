@@ -44,6 +44,7 @@ import * as ClaudeSessionChain from "./ClaudeSessionChain.ts";
 import { resolveCodexHomeLayout } from "../provider/Drivers/CodexHomeLayout.ts";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
+import { type CodexTurnStatus, isEndedCodexTurnStatus } from "./CodexTurns.ts";
 import { piHome, resolvePiSessionsDir } from "@t3tools/provider-pi/server/usage";
 import * as ServerSettings from "../serverSettings.ts";
 import { sourceControlDefinitions } from "../sourceControl/sourceControlDefinitions.ts";
@@ -823,6 +824,19 @@ export function parseAgentSessionTranscript(
   return thread === "empty" ? null : thread;
 }
 
+// A rollout marks each turn's start and end with events; one without them, as older rollouts,
+// gives no sign that its last turn is running.
+function codexLastTurnStatus(records: ReadonlyArray<DecodedTranscriptRecord>): CodexTurnStatus {
+  let status: CodexTurnStatus = "completed";
+  for (const record of records) {
+    if (record.type !== "event_msg") continue;
+    if (record.payload?.type === "task_started") status = "inProgress";
+    else if (record.payload?.type === "task_complete") status = "completed";
+    else if (record.payload?.type === "turn_aborted") status = "interrupted";
+  }
+  return status;
+}
+
 function parseAgentSessionRecords(
   input: AgentSessionTranscriptMetadata,
   records: ReadonlyArray<DecodedTranscriptRecord>,
@@ -1045,7 +1059,10 @@ function parseAgentSessionRecords(
   }
 
   // A turn still running is left for the sync, which records it whole once it has finished.
-  if (input.source === "claudeAgent" && !isFinishedClaudeTurn(claudeFields.turn)) {
+  const lastTurnRunning =
+    (input.source === "claudeAgent" && !isFinishedClaudeTurn(claudeFields.turn)) ||
+    (input.source === "codex" && !isEndedCodexTurnStatus(codexLastTurnStatus(records)));
+  if (lastTurnRunning) {
     const lastPrompt = messages.findLastIndex((message) => message.role === "user");
     // A session of one running turn has nothing earlier to show, so it stays whole.
     if (lastPrompt > 0 || (lastPrompt === 0 && droppedMessageCount > 0)) {

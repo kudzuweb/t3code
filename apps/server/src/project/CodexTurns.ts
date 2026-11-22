@@ -8,6 +8,10 @@ import type * as CodexSchema from "effect-codex-app-server/schema";
 import type { TurnsAfterAnchor } from "./AgentSessionScanner.ts";
 
 type CodexThreadItem = CodexSchema.V2ThreadReadResponse__ThreadItem;
+export type CodexTurnStatus = CodexSchema.V2ThreadReadResponse__TurnStatus;
+
+/** The one rule for a Codex turn being done, which the import and the sync both apply. */
+export const isEndedCodexTurnStatus = (status: CodexTurnStatus) => status !== "inProgress";
 
 /** The Codex turn id T3 stored for a turn that ended; null when the turn never reached Codex. */
 export const codexTurnCursor = (turn: OrchestrationV2ProviderTurn): string | null =>
@@ -44,7 +48,7 @@ export function codexTurnsAfter(
   const turns: Array<OrchestrationV2TranscriptTurn> = [];
   let throughNativeId = anchorNativeId;
   for (const codexTurn of thread.turns.slice(anchorIndex + 1)) {
-    if (codexTurn.status === "inProgress") break;
+    if (!isEndedCodexTurnStatus(codexTurn.status)) break;
     const startedAt = isoOf(codexTurn.startedAt, fallbackTimestamp);
     const endedAt = isoOf(codexTurn.completedAt, startedAt);
     let open: { userNativeId: string; userText: string; replies: Array<string> } | undefined;
