@@ -40,6 +40,8 @@ export function codexTurnsAfter(
       inTurn.push(message);
     }
   }
+  // A rollout from before Codex named its turns has nothing to place a turn by.
+  if (turnIds.length === 0) return { _tag: "Unsupported" };
   const anchorIndex = turnIds.indexOf(anchorNativeId);
   if (anchorIndex === -1) return { _tag: "AnchorNotFound" };
 

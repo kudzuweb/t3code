@@ -2129,16 +2129,17 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
         const read = (
           anchorNativeId: string,
           unchangedSince?: AgentSessionScanner.TranscriptSignature,
+          poll?: true,
         ) =>
           scanner.readTurnsAfter({
             driver: ProviderDriverKind.make("codex"),
             providerInstanceId: ProviderInstanceId.make("codex"),
             providerSessionId: sessionId,
             anchorNativeId,
-            workspaceRoot: workspace,
             ...(unchangedSince === undefined ? {} : { unchangedSince }),
+            ...(poll === undefined ? {} : { poll }),
           });
-        return { codexHomePath, workspace, write, read, path };
+        return { claudeHomePath, codexHomePath, workspace, write, read, path, scanner };
       });
 
       it.effect(
@@ -2302,6 +2303,102 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
           });
           // The third turn was rewound away.
           expect(yield* read(third)).toMatchObject({ _tag: "AnchorNotFound" });
+        }),
+      );
+
+      it.effect("reads a rollout whose cwd is a worktree T3 manages", () =>
+        Effect.gen(function* () {
+          const { claudeHomePath, write, read, path } = yield* setup();
+          const worktree = path.join(claudeHomePath, ".t3", "worktrees", "project", "wt-1");
+          yield* (yield* FileSystem.FileSystem).makeDirectory(worktree, { recursive: true });
+          yield* write(fixtureLines(worktree));
+
+          expect(yield* read(first)).toMatchObject({ _tag: "Turns", throughNativeId: third });
+        }),
+      );
+
+      it.effect("shows the user's own prompt, not the instructions Codex injects before it", () =>
+        Effect.gen(function* () {
+          const { workspace } = yield* setup();
+          const thread = AgentSessionScanner.parseAgentSessionTranscript({
+            contents: fixtureLines(workspace).join("\n"),
+            source: "codex",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            fallbackSessionId: "unused",
+            lastActiveAtMs: Date.parse("2026-11-22T12:00:00.000Z"),
+          });
+
+          expect(thread?.messages.map((message) => [message.role, message.text])).toEqual([
+            ["user", "Reply with exactly one word: alpha. Do not use tools."],
+            ["assistant", "alpha"],
+            ["user", "Reply with exactly one word: beta. Do not use tools."],
+            ["assistant", "beta"],
+            ["user", "Reply with exactly one word: gamma. Do not use tools."],
+            ["assistant", "gamma"],
+          ]);
+        }),
+      );
+
+      describe("a rollout from before Codex named its turns", () => {
+        // The same session with every turn id removed, as older rollouts have it.
+        const withoutTurnIds = (workspace: string, keep: (index: number) => boolean) =>
+          fixtureLines(workspace, keep).map((line) =>
+            JSON.stringify(JSON.parse(line), (key, value) =>
+              key === "turn_id" || key === "turn_attribution" ? undefined : value,
+            ),
+          );
+
+        it.effect("is not read, since its turns cannot be told apart", () =>
+          Effect.gen(function* () {
+            const { workspace, write, read } = yield* setup();
+            yield* write(withoutTurnIds(workspace, () => true));
+
+            expect(yield* read(first)).toEqual({ _tag: "Unsupported" });
+          }),
+        );
+
+        it.effect("keeps every message in the import, though its last turn never ended", () =>
+          Effect.gen(function* () {
+            const { workspace } = yield* setup();
+            const thread = AgentSessionScanner.parseAgentSessionTranscript({
+              contents: withoutTurnIds(workspace, (index) => index !== endOf(third)).join("\n"),
+              source: "codex",
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              fallbackSessionId: "unused",
+              lastActiveAtMs: Date.parse("2026-11-22T12:00:00.000Z"),
+            });
+
+            expect(thread?.messages).toHaveLength(6);
+          }),
+        );
+      });
+
+      it.effect(
+        "looks for a rollout it could not find again only when asked, or after five minutes",
+        () =>
+          Effect.gen(function* () {
+            const { workspace, write, read } = yield* setup();
+            yield* TestClock.setTime(Date.parse("2026-11-22T12:00:00.000Z"));
+            expect(yield* read(first, undefined, true)).toEqual({ _tag: "NoTranscript" });
+
+            yield* write(fixtureLines(workspace));
+            // A poll does not look again, so it costs nothing while the rollout is missing.
+            yield* TestClock.adjust("4 minutes");
+            expect(yield* read(first, undefined, true)).toEqual({ _tag: "NoTranscript" });
+            // Opening or focusing the thread looks at once.
+            expect((yield* read(first))._tag).toBe("Turns");
+          }),
+      );
+
+      it.effect("lets a poll look again once five minutes have passed", () =>
+        Effect.gen(function* () {
+          const { workspace, write, read } = yield* setup();
+          yield* TestClock.setTime(Date.parse("2026-11-22T12:00:00.000Z"));
+          expect(yield* read(first, undefined, true)).toEqual({ _tag: "NoTranscript" });
+
+          yield* write(fixtureLines(workspace));
+          yield* TestClock.adjust("5 minutes");
+          expect((yield* read(first, undefined, true))._tag).toBe("Turns");
         }),
       );
 

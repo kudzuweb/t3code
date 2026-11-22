@@ -31,7 +31,6 @@ import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ProviderReplayHarness from "../orchestration-v2/testkit/ProviderReplayHarness.ts";
 import * as AgentSessionScanner from "./AgentSessionScanner.ts";
-import * as ProjectService from "./ProjectService.ts";
 import * as TranscriptSyncService from "./TranscriptSyncService.ts";
 
 const instanceId = ProviderInstanceId.make("claudeAgent");
@@ -272,11 +271,6 @@ const providerThreadAt = (
 
 const signature = { size: 100, mtimeMs: 5 };
 
-// Where a thread's sessions are looked for: its project's directory.
-const layerProjects = Layer.mock(ProjectService.ProjectService)({
-  getById: () => Effect.succeedSome({ workspaceRoot: "/work/project" } as never),
-});
-
 /** A sync whose reader answers with `reads[anchor]` and remembers what it was asked. */
 const makeService = Effect.fn("TranscriptSyncService.test.makeService")(function* (
   reads: Record<string, AgentSessionScanner.TurnsAfterAnchor>,
@@ -285,13 +279,13 @@ const makeService = Effect.fn("TranscriptSyncService.test.makeService")(function
     readonly anchor: string;
     readonly unchangedSince: AgentSessionScanner.TranscriptSignature | undefined;
   }> = [];
-  const workspaceRoots: Array<string | undefined> = [];
+  const polls: Array<boolean | undefined> = [];
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const scanner = Layer.mock(AgentSessionScanner.AgentSessionScanner)({
-    readTurnsAfter: ({ anchorNativeId, unchangedSince, workspaceRoot }) =>
+    readTurnsAfter: ({ anchorNativeId, unchangedSince, poll }) =>
       Effect.sync(() => {
         asked.push({ anchor: anchorNativeId, unchangedSince });
-        workspaceRoots.push(workspaceRoot);
+        polls.push(poll);
         return unchangedSince !== undefined
           ? ({ _tag: "Unchanged" } as const)
           : { ...(reads[anchorNativeId] ?? { _tag: "AnchorNotFound" as const }), signature };
@@ -301,11 +295,7 @@ const makeService = Effect.fn("TranscriptSyncService.test.makeService")(function
     Effect.provide(
       TranscriptSyncService.layer.pipe(
         Layer.provide(
-          Layer.mergeAll(
-            scanner,
-            layerProjects,
-            Layer.succeed(Orchestrator.OrchestratorV2, orchestrator),
-          ),
+          Layer.mergeAll(scanner, Layer.succeed(Orchestrator.OrchestratorV2, orchestrator)),
         ),
       ),
     ),
@@ -313,7 +303,7 @@ const makeService = Effect.fn("TranscriptSyncService.test.makeService")(function
   return {
     service,
     asked,
-    workspaceRoots,
+    polls,
     get anchors() {
       return asked.map((entry) => entry.anchor);
     },
@@ -543,7 +533,6 @@ it.effect("serializes triggers for a thread, and the later one finds the file un
         TranscriptSyncService.layer.pipe(
           Layer.provide(
             Layer.mergeAll(
-              layerProjects,
               Layer.mock(AgentSessionScanner.AgentSessionScanner)({
                 readTurnsAfter: ({ unchangedSince }) =>
                   Effect.gen(function* () {
@@ -581,7 +570,6 @@ it.effect("starts a sync in the background without waiting for it", () =>
         TranscriptSyncService.layer.pipe(
           Layer.provide(
             Layer.mergeAll(
-              layerProjects,
               Layer.mock(AgentSessionScanner.AgentSessionScanner)({
                 readTurnsAfter: ({ anchorNativeId }) =>
                   Deferred.succeed(read, anchorNativeId).pipe(
@@ -612,7 +600,6 @@ it.effect("reads again after a dispatch the thread refused, though the file is u
         TranscriptSyncService.layer.pipe(
           Layer.provide(
             Layer.mergeAll(
-              layerProjects,
               Layer.mock(AgentSessionScanner.AgentSessionScanner)({
                 readTurnsAfter: ({ unchangedSince }) =>
                   Effect.gen(function* () {
@@ -678,7 +665,7 @@ describe("Codex sessions", () => {
       seeded: { provider: "codex", runs: [], importedItems: ["turn-a", "turn-b"] },
       anchor: "turn-b",
     },
-  ] as const)("reads the rollout from the thread's directory when $name", ({ seeded, anchor }) =>
+  ] as const)("reads the rollout when $name", ({ seeded, anchor }) =>
     Effect.gen(function* () {
       const projections = yield* seed(seeded);
       const sync = yield* makeService({ [anchor]: turnsOf("one") });
@@ -686,7 +673,7 @@ describe("Codex sessions", () => {
       assert.equal(yield* sync.service.sync(threadId), 1);
 
       assert.deepEqual(sync.anchors, [anchor]);
-      assert.deepEqual(sync.workspaceRoots, ["/work/project"]);
+      assert.deepEqual(sync.polls, [undefined]);
       assert.equal(
         (yield* projections.getThreadProjection(threadId)).runs.at(-1)?.recordedFrom,
         "transcript",
@@ -725,6 +712,23 @@ describe("Codex sessions", () => {
 
       assert.deepEqual(sync.anchors, []);
     }).pipe(Effect.provide(layerStores)),
+  );
+
+  it.effect(
+    "tells the reader a poll from an open, so a poll can leave a missing rollout alone",
+    () =>
+      Effect.gen(function* () {
+        yield* seed({
+          provider: "codex",
+          runs: [{ status: "completed", turn: "turn-t3", turnStrength: "strong" }],
+        });
+        const sync = yield* makeService({});
+
+        yield* sync.service.sync(threadId, { poll: true });
+        yield* sync.service.sync(threadId);
+
+        assert.deepEqual(sync.polls, [true, undefined]);
+      }).pipe(Effect.provide(layerStores)),
   );
 
   it.effect("moves its anchor to the turn it recorded, which names the turn and not an item", () =>

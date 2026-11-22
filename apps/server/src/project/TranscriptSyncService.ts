@@ -13,14 +13,12 @@ import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import * as Option from "effect/Option";
 
 import { CLAUDE_PROVIDER, claudeTurnCursor } from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
 import { CODEX_DRIVER_KIND } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import type { ProjectionRecords } from "../orchestration-v2/ProjectionStore.ts";
 import * as AgentSessionScanner from "./AgentSessionScanner.ts";
-import * as ProjectService from "./ProjectService.ts";
 import { codexTurnCursor } from "./CodexTurns.ts";
 
 /**
@@ -34,6 +32,8 @@ export class TranscriptSyncService extends Context.Service<
     /** Records the turns the thread's session gained after what T3 has shown; returns how many. */
     readonly sync: (
       threadId: ThreadId,
+      /** A poll leaves a Codex rollout it could not find alone for a few minutes. */
+      options?: { readonly poll?: boolean },
     ) => Effect.Effect<number, OrchestrationV2SyncTranscriptTurnsError>;
     /** Starts a sync and returns at once; a failure is logged, never raised. */
     readonly syncInBackground: (threadId: ThreadId) => Effect.Effect<void>;
@@ -80,7 +80,6 @@ const isTerminal = (run: OrchestrationV2Run) =>
 const make = Effect.gen(function* () {
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const scanner = yield* AgentSessionScanner.AgentSessionScanner;
-  const projects = yield* ProjectService.ProjectService;
   const locks = yield* KeyedLock.make<ThreadId>();
   // What the last read of each provider thread's transcript saw, so an unchanged file is not read again.
   const lastRead = new Map<
@@ -155,7 +154,10 @@ const make = Effect.gen(function* () {
     return newestItemNativeId(turnItems) ?? null;
   });
 
-  const syncOnce = Effect.fn("TranscriptSyncService.sync")(function* (threadId: ThreadId) {
+  const syncOnce = Effect.fn("TranscriptSyncService.sync")(function* (
+    threadId: ThreadId,
+    poll: boolean,
+  ) {
     yield* Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": threadId });
     const records = yield* orchestrator.getThreadRecords(threadId, [
       "runs",
@@ -192,19 +194,13 @@ const make = Effect.gen(function* () {
     }
 
     const previous = lastRead.get(providerThread.id);
-    // A Codex rollout is found through the directory the thread works in.
-    const workspaceRoot =
-      providerThread.driver === CODEX_DRIVER_KIND
-        ? (thread.worktreePath ??
-          Option.getOrUndefined(yield* projects.getById(thread.projectId))?.workspaceRoot)
-        : undefined;
     const read: TranscriptRead = yield* scanner.readTurnsAfter({
       driver: providerThread.driver,
       providerInstanceId: providerThread.providerInstanceId,
       providerSessionId: nativeThread.nativeId,
       anchorNativeId,
       ...(previous?.anchor === anchorNativeId ? { unchangedSince: previous.signature } : {}),
-      ...(workspaceRoot === undefined ? {} : { workspaceRoot }),
+      ...(poll ? { poll } : {}),
     });
     if (read._tag === "Unchanged") return 0;
     // Only a read that leaves nothing to retry is remembered; a refused command reads again.
@@ -250,9 +246,9 @@ const make = Effect.gen(function* () {
   });
 
   // A trigger during a sync waits for it and then finds the transcript unchanged.
-  const sync: TranscriptSyncService["Service"]["sync"] = (threadId) =>
+  const sync: TranscriptSyncService["Service"]["sync"] = (threadId, options) =>
     locks
-      .withLock(threadId, syncOnce(threadId))
+      .withLock(threadId, syncOnce(threadId, options?.poll === true))
       .pipe(
         Effect.mapError(
           (cause) => new OrchestrationV2SyncTranscriptTurnsError({ threadId, cause }),

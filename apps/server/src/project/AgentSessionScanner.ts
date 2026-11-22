@@ -127,6 +127,8 @@ const TranscriptMessage = Schema.Struct({
 
 const CodexTurnMetadata = Schema.Struct({
   turn_id: Schema.optional(Schema.Union([Schema.String, Schema.Null])),
+  // What each part of a message is, such as `user.text` for a prompt the user typed.
+  content_item_kinds: Schema.optional(Schema.Array(Schema.String)),
 });
 
 const TranscriptRecord = Schema.Struct({
@@ -202,6 +204,8 @@ const decodeCodexHistoryBase = Schema.decodeUnknownOption(
   Schema.Struct({ thread_id: Schema.String, end_byte_offset: Schema.Number }),
 );
 // Original rollouts end in their thread ID, rewound ones in `<thread ID>_<rollout ID>`.
+// How long a poll waits before it looks again for a Codex rollout it could not find.
+const CODEX_NOT_FOUND_RECHECK_MS = 5 * 60 * 1000;
 const CODEX_ROLLOUT_ID_PATTERN =
   /-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}))?\.jsonl(?:\.zst)?$/i;
 // Codex zstd-compresses older rollouts; their byte limits and offsets count decompressed bytes.
@@ -289,8 +293,8 @@ export class AgentSessionScanner extends Context.Service<
     ) => Effect.Effect<AgentSessionRecentThread, AgentSessionScanError>;
     /**
      * What the session gained after `anchorNativeId`, read from its file. For Pi,
-     * `providerSessionId` is the session file's path. A Codex rollout is found through
-     * `workspaceRoot`, the way the importer finds it, and its path is remembered.
+     * `providerSessionId` is the session file's path. A Codex rollout is found by its session id,
+     * the way the importer finds it, wherever it ran, and its path is remembered.
      */
     readonly readTurnsAfter: (
       input: AgentSessionKey & {
@@ -298,8 +302,11 @@ export class AgentSessionScanner extends Context.Service<
         readonly anchorNativeId: string;
         /** A transcript still looking like this was already read, so it is not read again. */
         readonly unchangedSince?: TranscriptSignature;
-        /** The directory the session ran in, which a Codex rollout is looked up through. */
-        readonly workspaceRoot?: string;
+        /**
+         * The read is a poll. A Codex rollout that was not found is then looked for again only
+         * after a few minutes, where an open, a focus or a request looks at once.
+         */
+        readonly poll?: boolean;
       },
     ) => Effect.Effect<
       | (TurnsAfterAnchor & { readonly signature?: TranscriptSignature })
@@ -323,6 +330,11 @@ interface RecentThreadOptions {
   readonly headTailOnly?: boolean;
   /** Collects the candidate transcripts again instead of reusing the last collection. */
   readonly refreshCandidates?: boolean;
+  /**
+   * Finds `session` wherever it ran, instead of only inside the workspace root, so a session in a
+   * folder the project scan leaves out, such as a worktree T3 manages, can still be read.
+   */
+  readonly anyDirectory?: boolean;
 }
 
 const IMPORT_OPTIONS: RecentThreadOptions = {
@@ -412,6 +424,12 @@ function normalizeTimestamp(value: string | undefined, fallback: string): string
   if (value === undefined) return fallback;
   const parsed = DateTime.make(value);
   return Option.isSome(parsed) ? DateTime.formatIso(parsed.value) : fallback;
+}
+
+/** A user message Codex made up, such as the instructions it injects, names no part as the user's own. */
+function isCodexInjectedMessage(metadata: unknown): boolean {
+  const kinds = Option.getOrUndefined(decodeCodexTurnMetadata(metadata))?.content_item_kinds;
+  return kinds !== undefined && kinds.length > 0 && !kinds.some((kind) => kind.startsWith("user."));
 }
 
 function codexTurnId(metadata: unknown): string | null {
@@ -1062,6 +1080,12 @@ function parseAgentSessionRecords(
     if (record.payload.role === "user" && canonicalCodexResponseUserIndices.has(recordIndex)) {
       continue;
     }
+    if (
+      record.payload.role === "user" &&
+      isCodexInjectedMessage(record.payload.internal_chat_message_metadata_passthrough)
+    ) {
+      continue;
+    }
     if (record.payload.role === "user" && hasMatchingCodexEventInTurn(extractedText)) {
       continue;
     }
@@ -1080,7 +1104,8 @@ function parseAgentSessionRecords(
   const codexLast = input.source === "codex" ? codexLastTurn(records) : undefined;
   const lastTurnRunning =
     (input.source === "claudeAgent" && !isFinishedClaudeTurn(claudeFields.turn)) ||
-    (codexLast !== undefined && !isEndedCodexTurnStatus(codexLast.status));
+    // A running turn that names no id, as in older rollouts, cannot be told from the rest.
+    (codexLast?.turnId !== undefined && !isEndedCodexTurnStatus(codexLast.status));
   if (lastTurnRunning) {
     // Claude's turn starts at its last prompt; a Codex turn is every message that names it.
     const lastPrompt =
@@ -2525,7 +2550,12 @@ export const make = Effect.gen(function* () {
   ) {
     const root = path.resolve(expandHomePath(workspaceRoot, homeDir));
     const realRoot = yield* fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root));
-    if (isExcludedProjectPath(root) || isExcludedProjectPath(realRoot)) return Stream.empty;
+    if (
+      options.anyDirectory !== true &&
+      (isExcludedProjectPath(root) || isExcludedProjectPath(realRoot))
+    ) {
+      return Stream.empty;
+    }
     const rootIdentity = yield* directoryIdentity(root);
     const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
     const cutoffMs =
@@ -2594,7 +2624,7 @@ export const make = Effect.gen(function* () {
       const expanded = expandHomePath(candidate.cwd.trim(), homeDir);
       if (!path.isAbsolute(expanded)) continue;
       const resolved = path.resolve(expanded);
-      if (!(yield* belongsToRoot(resolved))) continue;
+      if (options.anyDirectory !== true && !(yield* belongsToRoot(resolved))) continue;
 
       for (const transcript of candidate.transcripts) {
         if (
@@ -2769,7 +2799,10 @@ export const make = Effect.gen(function* () {
             projectCwd(snapshot.cwd.value, transcript.projectRoots).trim(),
             homeDir,
           );
-          if (!path.isAbsolute(expandedCwd) || !(yield* belongsToRoot(path.resolve(expandedCwd)))) {
+          if (
+            !path.isAbsolute(expandedCwd) ||
+            (options.anyDirectory !== true && !(yield* belongsToRoot(path.resolve(expandedCwd))))
+          ) {
             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
           }
           const worktree = yield* rootWorktree(path.resolve(expandedCwd));
@@ -2877,16 +2910,19 @@ export const make = Effect.gen(function* () {
     };
   });
 
-  const findProjectSession: AgentSessionScanner["Service"]["findProjectSession"] = Effect.fn(
-    "AgentSessionScanner.findProjectSession",
-  )(function* ({ workspaceRoot, ...session }) {
+  /** `workspaceRoot` null looks for the session in any folder. */
+  const findSession = Effect.fn("AgentSessionScanner.findSession")(function* (
+    workspaceRoot: string | null,
+    session: AgentSessionKey,
+  ) {
     const find = (refreshCandidates: boolean) =>
       Stream.unwrap(
-        prepareRecentThreads(workspaceRoot, [], {
+        prepareRecentThreads(workspaceRoot ?? path.parse(homeDir).root, [], {
           windowMs: null,
           transcriptLimit: MAX_TRANSCRIPTS_PER_SOURCE,
           session,
           refreshCandidates,
+          ...(workspaceRoot === null ? { anyDirectory: true } : {}),
         }),
       ).pipe(Stream.runHead);
     // The cached collection can predate a session started since, or name a file that has moved,
@@ -2896,6 +2932,11 @@ export const make = Effect.gen(function* () {
       Option.isSome(cached) && cached.value._tag !== "Skipped" ? cached : yield* find(true);
     return Option.getOrElse(found, (): AgentSessionRecentThread => ({ _tag: "Skipped" }));
   });
+
+  const findProjectSession: AgentSessionScanner["Service"]["findProjectSession"] = ({
+    workspaceRoot,
+    ...session
+  }) => findSession(workspaceRoot, session);
 
   const readError = (cause: unknown) =>
     new AgentSessionScanError({ operation: "read-transcript", cause });
@@ -2975,12 +3016,14 @@ export const make = Effect.gen(function* () {
 
   // Where each Codex session's rollout was last found, so a poll costs one stat of that file.
   const codexRollouts = new Map<string, string>();
+  // When a lookup last failed to find a session's rollout, so a poll does not repeat it at once.
+  const codexNotFoundAt = new Map<string, number>();
 
   const readCodexTurnsAfter = Effect.fn("AgentSessionScanner.readCodexTurnsAfter")(function* (
     session: AgentSessionKey,
     anchorNativeId: string,
     unchangedSince: TranscriptSignature | undefined,
-    workspaceRoot: string | undefined,
+    poll: boolean,
   ) {
     const key = `${session.providerInstanceId}\0${session.providerSessionId}`;
     const knownPath = codexRollouts.get(key);
@@ -2995,16 +3038,27 @@ export const make = Effect.gen(function* () {
     ) {
       return { _tag: "Unchanged" } as const;
     }
+    const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
+    const notFoundAt = codexNotFoundAt.get(key);
+    if (poll && notFoundAt !== undefined && nowMs - notFoundAt < CODEX_NOT_FOUND_RECHECK_MS) {
+      return { _tag: "NoTranscript" } as const;
+    }
     // A rollout that moved, as when Codex compressed it, is found again the way the importer finds it.
-    if (workspaceRoot === undefined) return { _tag: "NoTranscript" } as const;
-    const found = yield* findProjectSession({ ...session, workspaceRoot });
-    if (found._tag !== "Importable") return { _tag: "NoTranscript" } as const;
+    const found = yield* findSession(null, session);
+    if (found._tag !== "Importable") {
+      codexNotFoundAt.set(key, nowMs);
+      return { _tag: "NoTranscript" } as const;
+    }
+    codexNotFoundAt.delete(key);
     codexRollouts.set(key, found.source.filePath);
-    return {
-      ...codexTurnsAfter(found.thread.messages, anchorNativeId),
-      // What the file looked like when it was read, so a change during the read shows next time.
-      signature: { size: found.source.size, mtimeMs: found.source.mtimeMs ?? 0 },
-    };
+    const turns = codexTurnsAfter(found.thread.messages, anchorNativeId);
+    return turns._tag === "Turns"
+      ? {
+          ...turns,
+          // What the file looked like when it was read, so a change during the read shows next time.
+          signature: { size: found.source.size, mtimeMs: found.source.mtimeMs ?? 0 },
+        }
+      : turns;
   });
 
   const readTurnsAfter: AgentSessionScanner["Service"]["readTurnsAfter"] = Effect.fn(
@@ -3015,14 +3069,14 @@ export const make = Effect.gen(function* () {
     providerSessionId,
     anchorNativeId,
     unchangedSince,
-    workspaceRoot,
+    poll,
   }) {
     if (driver === "codex") {
       return yield* readCodexTurnsAfter(
         { providerInstanceId, providerSessionId },
         anchorNativeId,
         unchangedSince,
-        workspaceRoot,
+        poll === true,
       );
     }
     if (driver === "pi")

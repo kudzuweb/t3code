@@ -282,13 +282,7 @@ const layerAgentSessionImporterProvided = AgentSessionImporter.layer.pipe(
 );
 
 const layerTranscriptSyncProvided = TranscriptSyncService.layer.pipe(
-  Layer.provide(
-    Layer.mergeAll(
-      layerAgentSessionScannerProvided,
-      layerProjectService,
-      layerOrchestratorProvided,
-    ),
-  ),
+  Layer.provide(Layer.mergeAll(layerAgentSessionScannerProvided, layerOrchestratorProvided)),
 );
 
 const layerThreadManagementProvided = ThreadManagementService.layerWithLegacyImporter.pipe(
