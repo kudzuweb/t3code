@@ -6,7 +6,9 @@ import {
   isRuntimeModeAbove,
   AgentSessionImportProjectChangedError,
   AgentSessionImportProjectNotFoundError,
+  AgentSessionDeletedThreadError,
   AgentSessionNotFoundError,
+  AgentSessionUnreadableError,
   AgentSessionScanError,
   AgentSessionUnresumableSessionError,
   EventId,
@@ -17,6 +19,7 @@ import {
   TurnItemId,
   type AgentSessionImportInput,
   type AgentSessionImportOneInput,
+  type AgentSessionImportSource,
   type AgentSessionImportOneResult,
   type AgentSessionImportResult,
   type AgentSessionSource,
@@ -114,6 +117,31 @@ function nativeThreadIdOf(source: {
 }): string {
   return source.provider === "pi" ? source.filePath : source.providerSessionId;
 }
+
+interface SessionKey {
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly nativeThreadId: string;
+  readonly importThreadId: ThreadId;
+}
+
+interface SessionOwner {
+  readonly threadId: ThreadId;
+  readonly deleted: boolean;
+}
+
+function importThreadIdOf(providerInstanceId: ProviderInstanceId, providerSessionId: string) {
+  return ThreadId.make(`import:${providerInstanceId}:${providerSessionId}`);
+}
+
+function sessionKeyOf(source: AgentSessionImportSource): SessionKey {
+  return {
+    providerInstanceId: source.providerInstanceId,
+    nativeThreadId: nativeThreadIdOf(source),
+    importThreadId: importThreadIdOf(source.providerInstanceId, source.providerSessionId),
+  };
+}
+
+const sessionKeyId = (key: SessionKey) => `${key.providerInstanceId}\0${key.nativeThreadId}`;
 
 function dateTime(value: string): DateTime.Utc {
   return DateTime.makeUnsafe(value);
@@ -536,25 +564,58 @@ const make = Effect.gen(function* () {
     return { importedCount, skippedCount } satisfies AgentSessionImportResult;
   });
 
-  const findOwnerThread = Effect.fn("AgentSessionImporter.findOwnerThread")(function* (input: {
-    readonly projectId: ProjectId;
-    readonly providerInstanceId: ProviderInstanceId;
-    readonly nativeThreadId: string;
-  }) {
-    const rows = yield* sql<{ readonly thread_id: string }>`
-      SELECT provider.thread_id
-      FROM orchestration_v2_projection_provider_threads AS provider
-      JOIN orchestration_v2_projection_threads AS thread ON thread.thread_id = provider.thread_id
-      WHERE provider.provider_instance_id = ${input.providerInstanceId}
-        AND json_extract(provider.payload_json, '$.nativeThreadRef.nativeId') = ${input.nativeThreadId}
-        AND thread.project_id = ${input.projectId}
-        AND thread.deleted_at IS NULL
+  // The thread holding a session is found by the native id its provider thread owns, the way
+  // the event sink's ownership guard sees it, or by the id a bulk import gives it.
+  const findOwners = Effect.fn("AgentSessionImporter.findOwners")(function* (
+    projectId: ProjectId,
+    keys: ReadonlyArray<SessionKey>,
+  ) {
+    const owners = new Map<string, SessionOwner>();
+    if (keys.length === 0) return owners;
+    const rows = yield* sql<{
+      readonly thread_id: string;
+      readonly project_id: string;
+      readonly deleted_at: string | null;
+      readonly provider_instance_id: string | null;
+      readonly native_id: string | null;
+    }>`
+      SELECT thread.thread_id AS thread_id,
+             thread.project_id AS project_id,
+             thread.deleted_at AS deleted_at,
+             provider.provider_instance_id AS provider_instance_id,
+             json_extract(provider.payload_json, '$.nativeThreadRef.nativeId') AS native_id
+      FROM orchestration_v2_projection_threads AS thread
+      LEFT JOIN orchestration_v2_projection_provider_threads AS provider
+        ON provider.thread_id = thread.thread_id
+      WHERE thread.thread_id IN (
+          SELECT value FROM json_each(${JSON.stringify(keys.map((key) => key.importThreadId))})
+        )
+        OR json_extract(provider.payload_json, '$.nativeThreadRef.nativeId') IN (
+          SELECT value FROM json_each(${JSON.stringify(keys.map((key) => key.nativeThreadId))})
+        )
       ORDER BY thread.updated_at DESC
-      LIMIT 1
     `.pipe(
-      Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-projects", cause })),
+      Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-owners", cause })),
     );
-    return rows[0] ? ThreadId.make(rows[0].thread_id) : null;
+    for (const key of keys) {
+      const holders = rows.filter(
+        (row) =>
+          row.thread_id === key.importThreadId ||
+          (row.provider_instance_id === key.providerInstanceId &&
+            row.native_id === key.nativeThreadId),
+      );
+      const holder =
+        holders.find((row) => row.deleted_at === null && row.project_id === projectId) ??
+        holders.find((row) => row.deleted_at === null) ??
+        holders[0];
+      if (holder !== undefined) {
+        owners.set(sessionKeyId(key), {
+          threadId: ThreadId.make(holder.thread_id),
+          deleted: holder.deleted_at !== null,
+        });
+      }
+    }
+    return owners;
   });
 
   const listSessions = Effect.fn("AgentSessionImporter.listSessions")(function* (
@@ -562,9 +623,13 @@ const make = Effect.gen(function* () {
   ) {
     const project = yield* loadProject(input.projectId);
     const listing = yield* scanner.listProjectSessions(project.workspaceRoot);
-    const sessions = yield* Effect.forEach(
-      listing.sessions,
-      Effect.fn(function* ({ source, title, lastActiveAt, worktree }) {
+    const owners = yield* findOwners(
+      input.projectId,
+      listing.sessions.map(({ source }) => sessionKeyOf(source)),
+    );
+    const sessions = listing.sessions.map(
+      ({ source, title, lastActiveAt, worktree }): AgentSessionSummary => {
+        const owner = owners.get(sessionKeyId(sessionKeyOf(source)));
         return {
           provider: source.provider,
           providerInstanceId: source.providerInstanceId,
@@ -572,14 +637,10 @@ const make = Effect.gen(function* () {
           title,
           lastActiveAt,
           worktree,
-          threadId: yield* findOwnerThread({
-            projectId: input.projectId,
-            providerInstanceId: source.providerInstanceId,
-            nativeThreadId: nativeThreadIdOf(source),
-          }),
-        } satisfies AgentSessionSummary;
-      }),
-      { concurrency: 8 },
+          threadId: owner === undefined || owner.deleted ? null : owner.threadId,
+          ...(owner?.deleted === true ? { heldBy: "deleted" as const } : {}),
+        };
+      },
     );
     return { sessions, truncated: listing.truncated } satisfies AgentSessionListResult;
   });
@@ -592,16 +653,25 @@ const make = Effect.gen(function* () {
     input: AgentSessionImportOneInput,
   ) {
     const project = yield* loadProject(input.projectId);
-    const held = (nativeThreadId: string) =>
-      findOwnerThread({
-        projectId: input.projectId,
+    const held = Effect.fn("AgentSessionImporter.importSession.held")(function* (
+      nativeThreadId: string,
+    ) {
+      const key: SessionKey = {
         providerInstanceId: input.providerInstanceId,
         nativeThreadId,
-      }).pipe(
-        Effect.map((threadId): AgentSessionImportOneResult | null =>
-          threadId === null ? null : { threadId, imported: false },
-        ),
-      );
+        importThreadId: importThreadIdOf(input.providerInstanceId, input.providerSessionId),
+      };
+      const owner = (yield* findOwners(input.projectId, [key])).get(sessionKeyId(key));
+      if (owner === undefined) return null;
+      if (owner.deleted) {
+        return yield* new AgentSessionDeletedThreadError({
+          projectId: input.projectId,
+          providerSessionId: input.providerSessionId,
+          threadId: owner.threadId,
+        });
+      }
+      return { threadId: owner.threadId, imported: false } satisfies AgentSessionImportOneResult;
+    });
     const alreadyHeld = yield* held(input.providerSessionId);
     if (alreadyHeld !== null) return alreadyHeld;
 
@@ -611,36 +681,51 @@ const make = Effect.gen(function* () {
       providerSessionId: input.providerSessionId,
     });
     if (found._tag !== "Importable") {
-      return yield* new AgentSessionNotFoundError({
-        projectId: input.projectId,
-        providerSessionId: input.providerSessionId,
-      });
+      return yield* found._tag === "Skipped" && found.filePath !== undefined
+        ? new AgentSessionUnreadableError({
+            projectId: input.projectId,
+            providerSessionId: input.providerSessionId,
+            filePath: found.filePath,
+          })
+        : new AgentSessionNotFoundError({
+            projectId: input.projectId,
+            providerSessionId: input.providerSessionId,
+          });
     }
-    const heldByFile = yield* held(nativeThreadIdOf(found.source));
-    if (heldByFile !== null) return heldByFile;
+    const nativeThreadId = nativeThreadIdOf(found.source);
+    if (nativeThreadId !== input.providerSessionId) {
+      const heldByFile = yield* held(nativeThreadId);
+      if (heldByFile !== null) return heldByFile;
+    }
 
-    const outcome = yield* importThread({
+    const settled = yield* importThread({
       outcome: found,
       projectId: input.projectId,
       workspaceRoot: project.workspaceRoot,
       runtimeMode: yield* importRuntimeMode(input.projectId, project),
     }).pipe(
-      Effect.catchIf(
-        (cause) => !isUnresumableSessionError(cause),
-        (cause) => Effect.die(cause),
+      Effect.map((outcome) =>
+        outcome === "imported"
+          ? ({
+              threadId: importThreadIdOf(input.providerInstanceId, input.providerSessionId),
+              imported: true,
+            } satisfies AgentSessionImportOneResult)
+          : new AgentSessionUnresumableSessionError({
+              source: found.source.provider,
+              providerSessionId: found.source.providerSessionId,
+            }),
+      ),
+      Effect.catch((cause) =>
+        Effect.succeed(
+          isUnresumableSessionError(cause)
+            ? cause
+            : new AgentSessionScanError({ operation: "import-session", cause }),
+        ),
       ),
     );
-    const threadId = ThreadId.make(
-      `import:${found.source.providerInstanceId}:${found.source.providerSessionId}`,
-    );
-    if (outcome === "imported") return { threadId, imported: true };
-    return (
-      (yield* held(nativeThreadIdOf(found.source))) ??
-      (yield* new AgentSessionUnresumableSessionError({
-        source: found.source.provider,
-        providerSessionId: found.source.providerSessionId,
-      }))
-    );
+    if ("imported" in settled) return settled;
+    // Another import can claim the session between the first check and the write.
+    return (yield* held(nativeThreadId)) ?? (yield* settled);
   });
 
   /**

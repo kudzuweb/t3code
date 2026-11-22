@@ -87,7 +87,7 @@ export type AgentSessionImportResult = typeof AgentSessionImportResult.Type;
 export class AgentSessionScanError extends Schema.TaggedError<AgentSessionScanError>()(
   "AgentSessionScanError",
   {
-    operation: Schema.Literals(["read-settings", "read-projects"]),
+    operation: Schema.Literals(["read-settings", "read-projects", "read-owners", "import-session"]),
     cause: Schema.Defect(),
   },
 ) {
@@ -120,6 +120,32 @@ export class AgentSessionNotFoundError extends Schema.TaggedError<AgentSessionNo
   }
 }
 
+export class AgentSessionDeletedThreadError extends Schema.TaggedError<AgentSessionDeletedThreadError>()(
+  "AgentSessionDeletedThreadError",
+  {
+    projectId: ProjectId,
+    providerSessionId: Schema.String,
+    threadId: ThreadId,
+  },
+) {
+  override get message(): string {
+    return `Session '${this.providerSessionId}' belongs to thread '${this.threadId}', which was deleted.`;
+  }
+}
+
+export class AgentSessionUnreadableError extends Schema.TaggedError<AgentSessionUnreadableError>()(
+  "AgentSessionUnreadableError",
+  {
+    projectId: ProjectId,
+    providerSessionId: Schema.String,
+    filePath: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `Session '${this.providerSessionId}' was listed but its transcript could not be read in full.`;
+  }
+}
+
 export const AgentSessionListInput = Schema.Struct({
   projectId: ProjectId,
 });
@@ -140,6 +166,8 @@ export const AgentSessionSummary = Schema.Struct({
   worktree: Schema.NullOr(AgentSessionWorktree),
   /** The T3 thread that already holds this session. */
   threadId: Schema.NullOr(ThreadId),
+  /** Set when the only thread that held this session was deleted, so it cannot be opened again. */
+  heldBy: Schema.optionalKey(Schema.Literal("deleted")),
 });
 export type AgentSessionSummary = typeof AgentSessionSummary.Type;
 

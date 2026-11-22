@@ -231,7 +231,8 @@ export type AgentSessionRecentThread =
     }
   | { readonly _tag: "AlreadyImported"; readonly source: AgentSessionImportSource }
   | { readonly _tag: "Duplicate"; readonly source: AgentSessionImportSource }
-  | { readonly _tag: "Skipped" };
+  /** `filePath` names the target transcript of a single-session lookup that could not be read. */
+  | { readonly _tag: "Skipped"; readonly filePath?: string };
 
 export interface AgentSessionKey {
   readonly providerInstanceId: ProviderInstanceId;
@@ -279,6 +280,8 @@ interface RecentThreadOptions {
    * transcripts; an import does the full parse. A transcript the sample cannot parse is read in full.
    */
   readonly headTailOnly?: boolean;
+  /** Collects the candidate transcripts again instead of reusing the last collection. */
+  readonly refreshCandidates?: boolean;
 }
 
 const IMPORT_OPTIONS: RecentThreadOptions = {
@@ -522,6 +525,22 @@ function activePiBranch(
     branch.push(entry);
   }
   return branch.toReversed();
+}
+
+// Whether the walk from the last entry reaches the root through the records given.
+function isPiBranchComplete(records: ReadonlyArray<DecodedTranscriptRecord>): boolean {
+  const entries = records.filter((record) => record.type !== "session");
+  const leaf = entries.at(-1);
+  if (leaf?.id === undefined) return true;
+  const byId = new Map(
+    entries.flatMap((entry) => (entry.id === undefined ? [] : [[entry.id, entry] as const])),
+  );
+  let entry: DecodedTranscriptRecord | undefined = leaf;
+  for (let steps = 0; entry !== undefined && steps <= entries.length; steps += 1) {
+    if (!entry.parentId) return true;
+    entry = byId.get(entry.parentId);
+  }
+  return false;
 }
 
 function isPiConversationRecord(
@@ -1492,33 +1511,57 @@ export const make = Effect.gen(function* () {
             );
             const headEnd = Math.min(size, LIST_SAMPLE_BYTES);
             const tailStart = Math.max(headEnd, size - LIST_SAMPLE_BYTES);
-            const lines =
-              tailStart === headEnd
-                ? (yield* readRange(0, size)).split("\n")
-                : [
-                    ...(yield* readRange(0, headEnd)).split("\n").slice(0, -1),
-                    ...(yield* readRange(tailStart, size - tailStart)).split("\n").slice(1),
-                  ];
+            const decodeLines = (lines: ReadonlyArray<string>) =>
+              lines.flatMap((line) => {
+                const decoded = decodeTranscriptRecord(line);
+                if (Option.isSome(decoded)) return [decoded.value];
+                if (source !== "pi") return [];
+                // Pi accepts messages this schema rejects; keep their tree links, as the full read does.
+                try {
+                  return Option.toArray(decodePiEntryLinks(JSON.parse(line)));
+                } catch {
+                  return [];
+                }
+              });
+            let headRecords: ReadonlyArray<DecodedTranscriptRecord>;
+            let tailRecords: ReadonlyArray<DecodedTranscriptRecord> = [];
+            if (tailStart === headEnd) {
+              headRecords = decodeLines((yield* readRange(0, size)).split("\n"));
+            } else {
+              headRecords = decodeLines((yield* readRange(0, headEnd)).split("\n").slice(0, -1));
+              // The byte before the tail tells whether the tail starts on a line boundary.
+              const tailText = yield* readRange(tailStart - 1, size - tailStart + 1);
+              tailRecords = decodeLines(
+                tailText.startsWith("\n")
+                  ? tailText.slice(1).split("\n")
+                  : tailText.split("\n").slice(1),
+              );
+            }
+            let sampledRecords = [...headRecords, ...tailRecords];
+            if (source === "pi" && tailRecords.length > 0 && !isPiBranchComplete(sampledRecords)) {
+              // The walk back from the tail cannot cross the unread middle, so title from the head's
+              // branch and keep only the tail's latest session name, relinked onto it.
+              const name = tailRecords.findLast((record) => record.type === "session_info");
+              const headLeaf = headRecords.findLast(
+                (record) => record.type !== "session" && record.id !== undefined,
+              );
+              sampledRecords = [
+                ...headRecords,
+                ...(name === undefined ? [] : [{ ...name, parentId: headLeaf?.id ?? null }]),
+              ];
+            }
             const records: Array<DecodedTranscriptRecord> = [];
             let cwd = Option.none<string>();
             let claudeFields = emptyClaudeFields;
-            for (const line of lines) {
-              const decoded = decodeTranscriptRecord(line);
-              if (Option.isNone(decoded)) continue;
-              if (Option.isNone(cwd)) cwd = Option.fromNullOr(extractDecodedCwd(decoded.value));
-              if (source === "claudeAgent") {
-                claudeFields = foldClaudeFields(claudeFields, decoded.value);
-              }
-              if (!shouldRetainDecodedRecord(source, decoded.value)) continue;
-              if (
-                source === "pi" &&
-                decoded.value.type === "message" &&
-                !isPiConversationRecord(decoded.value)
-              ) {
-                const { message: _message, ...links } = decoded.value;
+            for (const record of sampledRecords) {
+              if (Option.isNone(cwd)) cwd = Option.fromNullOr(extractDecodedCwd(record));
+              if (source === "claudeAgent") claudeFields = foldClaudeFields(claudeFields, record);
+              if (!shouldRetainDecodedRecord(source, record)) continue;
+              if (source === "pi" && record.type === "message" && !isPiConversationRecord(record)) {
+                const { message: _message, ...links } = record;
                 records.push(links);
               } else {
-                records.push(decoded.value);
+                records.push(record);
               }
             }
             if (!sameTranscriptIdentity(expected, transcriptIdentity(filePath, yield* file.stat))) {
@@ -2175,7 +2218,11 @@ export const make = Effect.gen(function* () {
       options.windowMs === null ? Number.NEGATIVE_INFINITY : nowMs - options.windowMs;
 
     // Imports recorded since a budget-truncated collection can free budget for transcripts it cut off.
-    if (cachedCandidates === null || cachedCandidates.metadataTruncated) {
+    if (
+      cachedCandidates === null ||
+      cachedCandidates.metadataTruncated ||
+      options.refreshCandidates === true
+    ) {
       cachedCandidates = yield* collectCandidates();
     }
     const { candidates } = cachedCandidates;
@@ -2265,6 +2312,21 @@ export const make = Effect.gen(function* () {
           Number(left.transcript.filePath.includes(wantedSessionId)),
       );
     }
+
+    // A lookup by id reports only its own transcript: others are not its concern, and the file
+    // named for the session is the one whose failure to read the caller can say something about.
+    const onlyRequestedSession = (
+      outcome: Option.Option<AgentSessionRecentThread>,
+      filePath: string,
+    ): Option.Option<AgentSessionRecentThread> => {
+      const wanted = options.session?.providerSessionId;
+      if (wanted === undefined || Option.isNone(outcome) || outcome.value._tag !== "Skipped") {
+        return outcome;
+      }
+      return filePath.includes(wanted)
+        ? Option.some<AgentSessionRecentThread>({ _tag: "Skipped", filePath })
+        : Option.none();
+    };
 
     const completedByFile = Map.groupBy(
       completedSources,
@@ -2459,7 +2521,10 @@ export const make = Effect.gen(function* () {
             source,
             worktree,
           });
-        }).pipe(importReadLock.withPermits(1)),
+        }).pipe(
+          Effect.map((outcome) => onlyRequestedSession(outcome, transcript.filePath)),
+          importReadLock.withPermits(1),
+        ),
       ),
       Stream.map(Option.toArray),
       Stream.flattenIterable,
@@ -2479,6 +2544,7 @@ export const make = Effect.gen(function* () {
         windowMs: null,
         transcriptLimit: MAX_TRANSCRIPTS_PER_SOURCE,
         headTailOnly: true,
+        refreshCandidates: true,
       }),
     ).pipe(
       Stream.filter((outcome) => outcome._tag === "Importable"),
@@ -2491,20 +2557,28 @@ export const make = Effect.gen(function* () {
       Stream.take(limit + 1),
       Stream.runCollect,
     );
-    return { sessions: listings.slice(0, limit), truncated: listings.length > limit };
+    return {
+      sessions: listings.slice(0, limit),
+      truncated: listings.length > limit || (cachedCandidates?.truncated ?? false),
+    };
   });
 
   const findProjectSession: AgentSessionScanner["Service"]["findProjectSession"] = Effect.fn(
     "AgentSessionScanner.findProjectSession",
   )(function* ({ workspaceRoot, ...session }) {
-    const outcome = yield* Stream.unwrap(
-      prepareRecentThreads(workspaceRoot, [], {
-        windowMs: null,
-        transcriptLimit: MAX_TRANSCRIPTS_PER_SOURCE,
-        session,
-      }),
-    ).pipe(Stream.runHead);
-    return Option.getOrElse(outcome, (): AgentSessionRecentThread => ({ _tag: "Skipped" }));
+    const find = (refreshCandidates: boolean) =>
+      Stream.unwrap(
+        prepareRecentThreads(workspaceRoot, [], {
+          windowMs: null,
+          transcriptLimit: MAX_TRANSCRIPTS_PER_SOURCE,
+          session,
+          refreshCandidates,
+        }),
+      ).pipe(Stream.runHead);
+    // The cached collection can predate a session started since, so look again before giving up.
+    const cached = yield* find(false);
+    const found = Option.isSome(cached) ? cached : yield* find(true);
+    return Option.getOrElse(found, (): AgentSessionRecentThread => ({ _tag: "Skipped" }));
   });
 
   return AgentSessionScanner.of({

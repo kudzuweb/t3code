@@ -1892,6 +1892,115 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
       }),
     );
 
+    it.effect("sees sessions started after an earlier listing and ignores other transcripts", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+        yield* TestClock.setTime(nowMs);
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const workspace = yield* makeTempDir("t3code-workspace-");
+        const transcript = (sessionId: string, cwd?: string) =>
+          [
+            encodeTranscriptRecord({
+              type: "user",
+              ...(cwd === undefined ? {} : { cwd }),
+              sessionId,
+              message: { role: "user", content: `Prompt ${sessionId}` },
+            }),
+            encodeTranscriptRecord({
+              type: "assistant",
+              sessionId,
+              message: { role: "assistant", content: [{ type: "text", text: "Done" }] },
+            }),
+          ].join("\n");
+        const write = (name: string, contents: string, ageMs: number) =>
+          writeTranscript({
+            filePath: path.join(claudeHomePath, "projects", "-selected", `${name}.jsonl`),
+            contents,
+            mtimeMs: nowMs - ageMs,
+          });
+        yield* write("first", transcript("first", workspace), 3000);
+        const scanner = yield* AgentSessionScanner.AgentSessionScanner.pipe(
+          Effect.provide(layerScannerTest({ claudeHomePath, codexHomePath })),
+        );
+        expect((yield* scanner.listProjectSessions(workspace)).sessions).toHaveLength(1);
+
+        // Newer than the target, and no cwd, so it can only be skipped.
+        yield* write("aaa-no-cwd", transcript("no-cwd"), 1000);
+        yield* write("zzz", transcript("late-session", workspace), 2000);
+        expect(
+          (yield* scanner.listProjectSessions(workspace)).sessions.map(
+            ({ source }) => source.providerSessionId,
+          ),
+        ).toEqual(["late-session", "first"]);
+        yield* write("later", transcript("later-session", workspace), 500);
+        expect(
+          yield* scanner.findProjectSession({
+            workspaceRoot: workspace,
+            providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+            providerSessionId: "later-session",
+          }),
+        ).toMatchObject({ _tag: "Importable", thread: { providerSessionId: "later-session" } });
+        expect(
+          yield* scanner.findProjectSession({
+            workspaceRoot: workspace,
+            providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+            providerSessionId: "missing",
+          }),
+        ).toEqual({ _tag: "Skipped" });
+      }),
+    );
+
+    it.effect("keeps the first tail line when the tail starts on a line boundary", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+        yield* TestClock.setTime(nowMs);
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const workspace = yield* makeTempDir("t3code-workspace-");
+        const sampleBytes = 64 * 1024;
+        const pad = (length: number) =>
+          encodeTranscriptRecord({ type: "progress", pad: "p".repeat(length) });
+        const head = [
+          encodeTranscriptRecord({
+            type: "user",
+            cwd: workspace,
+            sessionId: "boundary",
+            message: { role: "user", content: "Prompt names it" },
+          }),
+          encodeTranscriptRecord({
+            type: "assistant",
+            sessionId: "boundary",
+            message: { role: "assistant", content: [{ type: "text", text: "Done" }] },
+          }),
+          pad(70 * 1024),
+        ].join("\n");
+        const titleLine = encodeTranscriptRecord({
+          type: "ai-title",
+          sessionId: "boundary",
+          aiTitle: "Boundary title",
+        });
+        // The tail is exactly the last 64 KiB: the title line, then padding to the end.
+        const fillerLength = sampleBytes - titleLine.length - 1 - 1;
+        const emptyPad = pad(0).length;
+        const tail = `${titleLine}\n${pad(fillerLength - emptyPad)}\n`;
+        expect(Buffer.byteLength(tail)).toBe(sampleBytes);
+        yield* writeTranscript({
+          filePath: path.join(claudeHomePath, "projects", "-selected", "boundary.jsonl"),
+          contents: `${head}\n${tail}`,
+          mtimeMs: nowMs - 1000,
+        });
+        const scanner = yield* AgentSessionScanner.AgentSessionScanner.pipe(
+          Effect.provide(layerScannerTest({ claudeHomePath, codexHomePath })),
+        );
+        expect(
+          (yield* scanner.listProjectSessions(workspace)).sessions.map(({ title }) => title),
+        ).toEqual(["Boundary title"]);
+      }),
+    );
+
     it.effect("keeps the provider instance that owns a custom session home", () =>
       Effect.gen(function* () {
         const path = yield* Path.Path;

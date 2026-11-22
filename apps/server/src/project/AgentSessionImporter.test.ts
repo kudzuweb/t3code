@@ -264,7 +264,11 @@ const makeImporter = Effect.fn(function* (
                         entry._tag === "Importable" &&
                         entry.source.providerInstanceId === providerInstanceId &&
                         entry.source.providerSessionId === providerSessionId,
-                    ) ?? { _tag: "Skipped" as const },
+                    ) ??
+                      candidates.find(
+                        (entry) =>
+                          entry._tag === "Skipped" && entry.filePath?.includes(providerSessionId),
+                      ) ?? { _tag: "Skipped" as const },
                   ),
               })
             : Layer.succeed(AgentSessionScanner.AgentSessionScanner, realScan.scanner),
@@ -1169,6 +1173,81 @@ describe("importing one session", () => {
         _tag: "AgentSessionUnresumableSessionError",
         providerSessionId: "not-a-uuid",
       });
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+  );
+
+  it.effect("returns the owner that claims the session while the import is being written", () =>
+    Effect.gen(function* () {
+      const enteringTransaction = yield* Deferred.make<void>();
+      const continueTransaction = yield* Deferred.make<void>();
+      const source = candidate(CLAUDE_MODEL_SELECTION, claudeId, "claudeAgent");
+      const importer = yield* makeImporter(
+        [source],
+        Deferred.succeed(enteringTransaction, undefined).pipe(
+          Effect.andThen(Deferred.await(continueTransaction)),
+        ),
+      );
+      const pending = yield* Effect.forkScoped(importer.importSession(source));
+      yield* Deferred.await(enteringTransaction);
+      const ownerId = yield* seedOwner(source);
+      yield* Deferred.succeed(continueTransaction, undefined);
+      expect(yield* Fiber.join(pending)).toEqual({ threadId: ownerId, imported: false });
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+  );
+
+  it.effect("settles on one thread when the same session is imported twice at once", () =>
+    Effect.gen(function* () {
+      const source = candidate(CLAUDE_MODEL_SELECTION, claudeId, "claudeAgent");
+      const importer = yield* makeImporter([source]);
+      const results = yield* Effect.all(
+        [importer.importSession(source), importer.importSession(source)],
+        { concurrency: 2 },
+      );
+      expect(results.map((result) => result.threadId)).toEqual([
+        importId(source),
+        importId(source),
+      ]);
+      expect(results.filter((result) => result.imported)).toHaveLength(1);
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+  );
+
+  it.effect("returns and lists a live thread that holds the session in another project", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const source = candidate(CLAUDE_MODEL_SELECTION, claudeId, "claudeAgent");
+      const owner = yield* seedOwner(source);
+      yield* sql`UPDATE orchestration_v2_projection_threads SET project_id = 'other-project' WHERE thread_id = ${owner}`;
+      const importer = yield* makeImporter([source]);
+      expect(yield* importer.importSession(source)).toEqual({ threadId: owner, imported: false });
+      expect((yield* importer.listSessions).sessions[0]?.threadId).toBe(owner);
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+  );
+
+  it.effect("marks a session held only by a deleted thread and refuses to import it", () =>
+    Effect.gen(function* () {
+      const source = candidate(CLAUDE_MODEL_SELECTION, claudeId, "claudeAgent");
+      const owner = yield* seedOwner(source, "deleted");
+      const importer = yield* makeImporter([source]);
+      expect(yield* Effect.flip(importer.importSession(source))).toMatchObject({
+        _tag: "AgentSessionDeletedThreadError",
+        threadId: owner,
+      });
+      expect((yield* importer.listSessions).sessions[0]).toMatchObject({
+        threadId: null,
+        heldBy: "deleted",
+      });
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+  );
+
+  it.effect("reports a listed session whose transcript cannot be read as unreadable", () =>
+    Effect.gen(function* () {
+      const filePath = `/tmp/claude/${claudeId}.jsonl`;
+      const importer = yield* makeImporter([{ _tag: "Skipped", filePath }]);
+      expect(
+        yield* Effect.flip(
+          importer.importSession(candidate(CLAUDE_MODEL_SELECTION, claudeId, "claudeAgent")),
+        ),
+      ).toMatchObject({ _tag: "AgentSessionUnreadableError", filePath });
     }).pipe(Effect.scoped, Effect.provide(persistence)),
   );
 
