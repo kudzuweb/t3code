@@ -2168,6 +2168,12 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
                 },
               ],
             });
+            // A T3 turn between two terminal turns anchors on its own turn id.
+            expect(yield* read(second)).toMatchObject({
+              _tag: "Turns",
+              throughNativeId: third,
+              turns: [{ nativeRefId: third }],
+            });
             expect(yield* read("01a20589-0000-7000-8000-000000000000")).toMatchObject({
               _tag: "AnchorNotFound",
             });
