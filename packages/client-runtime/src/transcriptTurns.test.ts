@@ -1,6 +1,13 @@
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 
-import { findTerminalRun, isTerminalRun, shouldSyncTranscriptTurns } from "./transcriptTurns.ts";
+import { EnvironmentId, SYNC_TRANSCRIPT_TURNS_MAX_THREADS, ThreadId } from "@t3tools/contracts";
+
+import {
+  findTerminalRun,
+  isTerminalRun,
+  planTranscriptSyncBatches,
+  syncTranscriptTurnsOnFocus,
+} from "./transcriptTurns.ts";
 
 describe("isTerminalRun", () => {
   it("is true for a run recorded from a transcript", () => {
@@ -26,30 +33,78 @@ describe("findTerminalRun", () => {
   });
 });
 
-describe("shouldSyncTranscriptTurns", () => {
-  const providerThreads = [
-    { id: "pt-claude", driver: "claudeAgent" },
-    { id: "pt-codex", driver: "codex" },
-  ];
+const local = EnvironmentId.make("env-local");
+const remote = EnvironmentId.make("env-remote");
+const thread = (
+  environmentId: EnvironmentId,
+  id: string,
+  overrides: { archivedAt?: string | null; activeProviderThreadId?: string | null } = {},
+) => ({
+  environmentId,
+  id: ThreadId.make(id),
+  archivedAt: null,
+  activeProviderThreadId: "provider-thread",
+  ...overrides,
+});
 
-  it("syncs a thread whose active provider thread is Claude", () => {
+describe("planTranscriptSyncBatches", () => {
+  it("groups the threads of each environment, keeping the list's order", () => {
     expect(
-      shouldSyncTranscriptTurns({ activeProviderThreadId: "pt-claude", providerThreads }),
-    ).toBe(true);
+      planTranscriptSyncBatches([thread(local, "a"), thread(remote, "b"), thread(local, "c")]),
+    ).toEqual([
+      { environmentId: local, threadIds: ["a", "c"] },
+      { environmentId: remote, threadIds: ["b"] },
+    ]);
   });
 
-  it("skips a thread whose active provider thread is another driver", () => {
-    expect(shouldSyncTranscriptTurns({ activeProviderThreadId: "pt-codex", providerThreads })).toBe(
-      false,
-    );
+  it("leaves out archived threads, threads with no provider session, and repeats", () => {
+    expect(
+      planTranscriptSyncBatches([
+        thread(local, "a"),
+        thread(local, "archived", { archivedAt: "2026-11-01T00:00:00.000Z" }),
+        thread(local, "no-session", { activeProviderThreadId: null }),
+        thread(local, "a"),
+      ]),
+    ).toEqual([{ environmentId: local, threadIds: ["a"] }]);
   });
 
-  it("skips a thread with no active provider thread", () => {
-    expect(shouldSyncTranscriptTurns({ activeProviderThreadId: null, providerThreads })).toBe(
-      false,
+  it("splits an environment's threads into calls the server accepts", () => {
+    const threads = Array.from({ length: SYNC_TRANSCRIPT_TURNS_MAX_THREADS + 1 }, (_, index) =>
+      thread(local, `t-${index}`),
     );
-    expect(shouldSyncTranscriptTurns({ activeProviderThreadId: "pt-gone", providerThreads })).toBe(
-      false,
-    );
+    const batches = planTranscriptSyncBatches(threads);
+    expect(batches.map((batch) => batch.threadIds.length)).toEqual([
+      SYNC_TRANSCRIPT_TURNS_MAX_THREADS,
+      1,
+    ]);
+  });
+
+  it("plans nothing for an empty list", () => {
+    expect(planTranscriptSyncBatches([])).toEqual([]);
+  });
+});
+
+describe("syncTranscriptTurnsOnFocus", () => {
+  it("sends each environment's sidebar threads", () => {
+    const send = vi.fn();
+    syncTranscriptTurnsOnFocus({
+      threads: [thread(local, "a"), thread(remote, "b")],
+      canSync: () => true,
+      send,
+    });
+    expect(send.mock.calls).toEqual([
+      [{ environmentId: local, threadIds: ["a"] }],
+      [{ environmentId: remote, threadIds: ["b"] }],
+    ]);
+  });
+
+  it("sends nothing to an environment the user cannot operate", () => {
+    const send = vi.fn();
+    syncTranscriptTurnsOnFocus({
+      threads: [thread(local, "a"), thread(remote, "b")],
+      canSync: (environmentId) => environmentId === remote,
+      send,
+    });
+    expect(send.mock.calls).toEqual([[{ environmentId: remote, threadIds: ["b"] }]]);
   });
 });

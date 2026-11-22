@@ -4450,7 +4450,7 @@ export class OrchestrationV2ThreadLaunchError extends Schema.TaggedError<Orchest
   },
 ) {}
 
-const SYNC_TRANSCRIPT_TURNS_MAX_THREADS = 200;
+export const SYNC_TRANSCRIPT_TURNS_MAX_THREADS = 200;
 
 export const OrchestrationV2SyncTranscriptTurnsInput = Schema.Struct({
   threadIds: Schema.Array(ThreadId).check(

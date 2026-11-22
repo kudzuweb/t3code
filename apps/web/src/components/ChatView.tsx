@@ -294,7 +294,6 @@ import {
   useQuietThreadShell,
   useThreadCheckpointSummaries,
 } from "../state/entities";
-import { useSyncTranscriptTurnsOnFocus } from "../state/useSyncTranscriptTurnsOnFocus";
 import { useEnvironmentShellHasSnapshot } from "../state/shell";
 import { ChatComposer, type ChatComposerHandle } from "./chat/ChatComposer";
 import { DraftHeroHeadline } from "./chat/DraftHeroHeadline";
@@ -559,7 +558,6 @@ export default function ChatView(props: ChatViewProps) {
     : null;
   const threadStatus = useThreadStatus(routeThreadDetailRef);
   const threadSyncError = useThreadError(routeThreadDetailRef);
-  useSyncTranscriptTurnsOnFocus(embedded ? null : routeThreadDetailRef);
   const threadSyncPhase = resolveThreadSyncPhase({
     detailExists: serverProjection !== null,
     shellExists: serverThread !== null,
