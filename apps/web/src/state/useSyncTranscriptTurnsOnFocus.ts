@@ -19,13 +19,14 @@ const { syncTranscriptTurns } = orchestrationEnvironment;
 export function useSyncTranscriptTurnsOnFocus(threads: ReadonlyArray<TranscriptSyncThread>): void {
   const run = useAtomCommand(syncTranscriptTurns, { reportFailure: false });
 
-  const sync = useStableCallback(() =>
-    syncTranscriptTurnsOnFocus({
-      threads,
-      canSync: (environmentId) =>
-        appAtomRegistry.get(syncTranscriptTurns.permissionAtom(environmentId)),
-      send: ({ environmentId, threadIds }) => void run({ environmentId, input: { threadIds } }),
-    }),
+  const sync = useStableCallback(
+    () =>
+      void syncTranscriptTurnsOnFocus({
+        threads,
+        canSync: (environmentId) =>
+          appAtomRegistry.get(syncTranscriptTurns.permissionAtom(environmentId)),
+        send: ({ environmentId, threadIds }) => run({ environmentId, input: { threadIds } }),
+      }),
   );
 
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- window focus has no React source; the platform's focus wakeup stream only reaches the connection layer

@@ -60,13 +60,27 @@ export function planTranscriptSyncBatches(
   });
 }
 
-/** Sends each environment's threads to be synced, skipping environments the user cannot operate. */
-export function syncTranscriptTurnsOnFocus(input: {
+/**
+ * Sends each environment's threads to be synced, skipping environments the user cannot operate.
+ * An environment's chunks go one after another so a large sidebar does not flood the server;
+ * environments go side by side.
+ */
+export async function syncTranscriptTurnsOnFocus(input: {
   readonly threads: ReadonlyArray<TranscriptSyncThread>;
   readonly canSync: (environmentId: EnvironmentId) => boolean;
-  readonly send: (batch: TranscriptSyncBatch) => void;
-}): void {
+  readonly send: (batch: TranscriptSyncBatch) => Promise<unknown>;
+}): Promise<void> {
+  const chunksByEnvironment = new Map<EnvironmentId, Array<TranscriptSyncBatch>>();
   for (const batch of planTranscriptSyncBatches(input.threads)) {
-    if (input.canSync(batch.environmentId)) input.send(batch);
+    if (!input.canSync(batch.environmentId)) continue;
+    chunksByEnvironment.set(batch.environmentId, [
+      ...(chunksByEnvironment.get(batch.environmentId) ?? []),
+      batch,
+    ]);
   }
+  await Promise.all(
+    [...chunksByEnvironment.values()].map(async (chunks) => {
+      for (const chunk of chunks) await input.send(chunk);
+    }),
+  );
 }

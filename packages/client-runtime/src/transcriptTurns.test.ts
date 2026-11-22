@@ -85,9 +85,9 @@ describe("planTranscriptSyncBatches", () => {
 });
 
 describe("syncTranscriptTurnsOnFocus", () => {
-  it("sends each environment's sidebar threads", () => {
-    const send = vi.fn();
-    syncTranscriptTurnsOnFocus({
+  it("sends each environment's sidebar threads", async () => {
+    const send = vi.fn(async () => {});
+    await syncTranscriptTurnsOnFocus({
       threads: [thread(local, "a"), thread(remote, "b")],
       canSync: () => true,
       send,
@@ -98,13 +98,29 @@ describe("syncTranscriptTurnsOnFocus", () => {
     ]);
   });
 
-  it("sends nothing to an environment the user cannot operate", () => {
-    const send = vi.fn();
-    syncTranscriptTurnsOnFocus({
+  it("sends nothing to an environment the user cannot operate", async () => {
+    const send = vi.fn(async () => {});
+    await syncTranscriptTurnsOnFocus({
       threads: [thread(local, "a"), thread(remote, "b")],
       canSync: (environmentId) => environmentId === remote,
       send,
     });
     expect(send.mock.calls).toEqual([[{ environmentId: remote, threadIds: ["b"] }]]);
+  });
+
+  it("sends an environment's next chunk only after the previous one is answered", async () => {
+    const threads = Array.from({ length: SYNC_TRANSCRIPT_TURNS_MAX_THREADS + 1 }, (_, index) =>
+      thread(local, `t-${index}`),
+    );
+    const answers: Array<() => void> = [];
+    const send = vi.fn(() => new Promise<void>((resolve) => answers.push(resolve)));
+
+    const done = syncTranscriptTurnsOnFocus({ threads, canSync: () => true, send });
+    expect(send).toHaveBeenCalledTimes(1);
+
+    answers[0]!();
+    await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(2));
+    answers[1]!();
+    await done;
   });
 });
