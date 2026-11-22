@@ -2,6 +2,7 @@ import { copySnapshot as copySnapshotToClipboard } from "./copySnapshot";
 import { InlineAudioPreview } from "../files/InlineAudioPreview";
 import { filePreviewKind } from "@t3tools/shared/filePreview";
 import type { MarkdownExtensions } from "~/markdown/wordsHast";
+import { isTerminalRun, findTerminalRun } from "@t3tools/client-runtime/transcript-turns";
 import { T, useGT, useMessages, Var } from "gt-react";
 import { findRevealRef } from "./markdownFindContext";
 import {
@@ -42,6 +43,7 @@ import {
   PencilIcon,
   LinkIcon,
 } from "lucide-react";
+import { Badge } from "../ui/badge";
 import { Button, InlineButton } from "../ui/button";
 import { FreshSessionRow, ModelSwitchRow } from "./V2LifecycleRow";
 import { useAssetUrlRefresh, useAssetUrls, useAssetUrlState } from "../../assets/assetUrls";
@@ -463,6 +465,7 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
   const m = useMessages();
   const { onImageExpand, onFileOpen } = ctx;
   const coarsePointer = useMediaQuery({ pointer: "coarse" });
+  const madeInTerminal = isTerminalRun(findTerminalRun(ctx.runs, row.message.runId));
   // A linked environment's agent sent it from a thread there.
   const senderRef =
     row.message.linkedSender ??
@@ -857,6 +860,11 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
         >
           <T>Open thread</T>
         </InlineButton>
+      ) : null}
+      {madeInTerminal ? (
+        <Badge variant="outline" size="sm">
+          <T>Terminal</T>
+        </Badge>
       ) : null}
       <Tooltip>
         <TooltipTrigger render={<p className="text-muted-foreground text-xs tabular-nums" />}>

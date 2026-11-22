@@ -4356,6 +4356,7 @@
   "36e4b8d2db087296": "Bifurcar desde esta respuesta",
   "c92a0bab54261695": "Responder a esta respuesta",
   "405a3e88ee6e62b3": "No se pueden listar los cambios de este turno en este repositorio.",
+  "b6a53d1a5a4631b9": "Los turnos hechos fuera de T3 Code no se pueden bifurcar",
   "f6958f38dc87c712": "Bifurcar desde esta respuesta",
   "72f8e14b1246d224": "Responder a esta respuesta",
   "01d7728e893c281d": "Ir al mensaje: {text}",
@@ -4401,6 +4402,7 @@
       "v": "v"
     }
   ],
+  "b0e84e35de44a0c3": "Terminal",
   "31c5a7eb89641aba": "Editar desde aquí",
   "918cd5477d0c0e9b": "Mostrar el mensaje completo",
   "513b0929ca7dde1b": "Entrada de la herramienta\n{input}",

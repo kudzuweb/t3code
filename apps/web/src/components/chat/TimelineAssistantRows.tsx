@@ -1,6 +1,7 @@
 import { shouldPreserveAssistantLineBreaks } from "@t3tools/shared/assistantInsights";
 import { MessageId, type RunId, type TurnItemId } from "@t3tools/contracts";
 import { canForkProjectedAssistantItem } from "@t3tools/client-runtime/state/thread-workflows";
+import { findTerminalRun, isTerminalRun } from "@t3tools/client-runtime/transcript-turns";
 import { agentWorkingDirectories } from "@t3tools/client-runtime/workspace-basename-lookup";
 import { T, useGT, useMessages } from "gt-react";
 import { memo, use, useState } from "react";
@@ -171,30 +172,36 @@ function AssistantForkButton({
   const onForkFromRun = ctx.onForkFromRun;
   if (!canFork || onForkFromRun === undefined || projectedItem.item.runId === null) return null;
   const runId = projectedItem.item.runId;
+  const madeInTerminal = isTerminalRun(findTerminalRun(ctx.runs, runId));
+
+  const forkButton = (
+    <Button
+      type="button"
+      size="xs"
+      variant="ghost"
+      disabled={busy || madeInTerminal}
+      onClick={() => {
+        setBusy(true);
+        void onForkFromRun({ sourceThreadId: projectedItem.sourceThreadId, runId }).finally(() =>
+          setBusy(false),
+        );
+      }}
+      aria-label={gt("Fork from this response")}
+    >
+      <GitForkIcon className={cn("size-3", busy && "animate-pulse")} />
+    </Button>
+  );
 
   return (
     <Tooltip>
-      <TooltipTrigger
-        render={
-          <Button
-            type="button"
-            size="xs"
-            variant="ghost"
-            disabled={busy}
-            onClick={() => {
-              setBusy(true);
-              void onForkFromRun({ sourceThreadId: projectedItem.sourceThreadId, runId }).finally(
-                () => setBusy(false),
-              );
-            }}
-            aria-label={gt("Fork from this response")}
-          />
-        }
-      >
-        <GitForkIcon className={cn("size-3", busy && "animate-pulse")} />
-      </TooltipTrigger>
+      {/* A disabled button gets no hover, so the span carries the tooltip. */}
+      <TooltipTrigger render={<span className="inline-flex">{forkButton}</span>} />
       <TooltipPopup side="top">
-        <T>Fork from this response</T>
+        {madeInTerminal ? (
+          <T>Turns made outside T3 Code can't be forked from</T>
+        ) : (
+          <T>Fork from this response</T>
+        )}
       </TooltipPopup>
     </Tooltip>
   );

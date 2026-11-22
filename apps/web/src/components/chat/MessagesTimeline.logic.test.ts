@@ -32,6 +32,7 @@ import {
   timelineTurnFoldRunIdsByEntryId,
   liveAnswerPreview,
   deriveMessagesTimelineRowsWithState,
+  handoffRunsSignature,
   isTimelineMinimapTurnVisible,
   resolveAssistantMessageCopyState,
   type MessagesTimelineRow,
@@ -5182,6 +5183,21 @@ describe("subagent continued by a later turn", () => {
       `turn-fold:${run2}`,
       "closing-2",
     ]);
+  });
+});
+
+describe("handoffRunsSignature", () => {
+  const run = {
+    id: RunId.make("run-1"),
+    ordinal: 1,
+    providerInstanceId: "claude",
+    modelSelection: { instanceId: "claude", model: "haiku" },
+  } as never;
+
+  it("tells a run recorded from a terminal transcript from the same run made in T3", () => {
+    expect(handoffRunsSignature([{ ...run, recordedFrom: "transcript" }])).not.toBe(
+      handoffRunsSignature([run]),
+    );
   });
 });
 
