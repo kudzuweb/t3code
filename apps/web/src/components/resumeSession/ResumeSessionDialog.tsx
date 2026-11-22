@@ -14,7 +14,7 @@ import type { ScopedProjectRef } from "@t3tools/contracts";
 import { useNavigate } from "@tanstack/react-router";
 import { T, useGT, useMessages } from "gt-react";
 import { GitBranchIcon } from "lucide-react";
-import { useState, type KeyboardEvent, type ReactNode } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 
 import { useHandleNewThread } from "~/hooks/useHandleNewThread";
 import { cn } from "~/lib/utils";
@@ -93,6 +93,7 @@ function ProjectSessions(props: { readonly projectRef: ScopedProjectRef }) {
   const [search, setSearch] = useState("");
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [resumingKey, setResumingKey] = useState<string | null>(null);
+  const importingRef = useRef(false);
   const [failure, setFailure] = useState<string | null>(null);
 
   const rows = buildResumeSessionRows(sessions.data?.sessions ?? []);
@@ -101,7 +102,20 @@ function ProjectSessions(props: { readonly projectRef: ScopedProjectRef }) {
   if (searchSeen !== search) {
     setSearchSeen(search);
     setSelectedIndex(0);
+    setFailure(null);
   }
+  const activeIndex = Math.min(selectedIndex, Math.max(visibleRows.length - 1, 0));
+  const select = (index: number) => {
+    if (index === activeIndex) return;
+    setSelectedIndex(index);
+    setFailure(null);
+  };
+
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- sessions change in a terminal while this window is away, so returning to it refetches the list
+  useEffect(() => {
+    window.addEventListener("focus", sessions.refresh);
+    return () => window.removeEventListener("focus", sessions.refresh);
+  }, [sessions.refresh]);
 
   const openThread = (threadId: NonNullable<ResumeSessionRow["threadId"]>) => {
     closeDialog();
@@ -112,13 +126,15 @@ function ProjectSessions(props: { readonly projectRef: ScopedProjectRef }) {
   };
 
   const choose = async (row: ResumeSessionRow) => {
-    if (resumingKey !== null) return;
+    if (importingRef.current) return;
     setFailure(null);
     if (row.state === "open" && row.threadId !== null) {
       openThread(row.threadId);
       return;
     }
+    importingRef.current = true;
     setResumingKey(row.key);
+    const openedFor = appAtomRegistry.get(resumeSessionRequestAtom);
     const result = await importOne({
       environmentId,
       input: {
@@ -127,7 +143,10 @@ function ProjectSessions(props: { readonly projectRef: ScopedProjectRef }) {
         providerSessionId: row.session.providerSessionId,
       },
     });
+    importingRef.current = false;
     setResumingKey(null);
+    // The server import finishes either way; a dialog closed or reopened meanwhile stays put.
+    if (appAtomRegistry.get(resumeSessionRequestAtom) !== openedFor) return;
     if (result._tag === "Success") {
       openThread(result.value.threadId);
       return;
@@ -167,13 +186,13 @@ function ProjectSessions(props: { readonly projectRef: ScopedProjectRef }) {
         if (visibleRows.length === 0) return;
         if (event.key === "ArrowDown") {
           event.preventDefault();
-          setSelectedIndex((current) => (current + 1) % visibleRows.length);
+          select((activeIndex + 1) % visibleRows.length);
         } else if (event.key === "ArrowUp") {
           event.preventDefault();
-          setSelectedIndex((current) => (current - 1 + visibleRows.length) % visibleRows.length);
+          select((activeIndex - 1 + visibleRows.length) % visibleRows.length);
         } else if (event.key === "Enter" && canChoose) {
           event.preventDefault();
-          const row = visibleRows[selectedIndex];
+          const row = visibleRows[activeIndex];
           if (row) void choose(row);
         }
       }}
@@ -190,10 +209,10 @@ function ProjectSessions(props: { readonly projectRef: ScopedProjectRef }) {
               <SessionRow
                 key={row.key}
                 row={row}
-                selected={index === selectedIndex}
+                selected={index === activeIndex}
                 resuming={resumingKey === row.key}
                 disabled={!canChoose || resumingKey !== null}
-                onHover={() => setSelectedIndex(index)}
+                onHover={() => select(index)}
                 onChoose={() => void choose(row)}
               />
             ))}
