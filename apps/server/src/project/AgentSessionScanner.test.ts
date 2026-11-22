@@ -4459,6 +4459,43 @@ describe("claudeTurnsAfter", () => {
     );
   });
 
+  describe("after Claude compacts the session", () => {
+    // A session made with `claude -p`, resumed twice, then `/compact`ed; ids are the real ones.
+    const compacted = NodeFS.readFileSync(
+      new URL("./fixtures/claude-compacted-session.jsonl", import.meta.url),
+      "utf8",
+    )
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    // What `getSessionMessages` returned for it: the summary, the preserved last reply, the command.
+    const afterCompaction = [
+      "863816e7-bc91-4381-84bf-a0ba35284b90",
+      "0ac5a9ef-3802-456e-a632-bdeaf6c662eb",
+      "386f36df-69ff-4cae-9fc5-6334c5add64a",
+      "2aaee520-27ae-4bb7-94df-daa7b8a0e604",
+    ];
+    const replyTwo = "cc9390";
+    const read = (anchorPrefix: string) =>
+      AgentSessionScanner.claudeTurnsAfter(
+        compacted,
+        afterCompaction,
+        compacted.find((entry) => entry.uuid.startsWith(anchorPrefix))!.uuid,
+        fallback,
+      );
+
+    it("finds an anchor from before the compaction and records what came after it", () => {
+      expect(read(replyTwo)).toMatchObject({
+        _tag: "Turns",
+        turns: [{ userText: "Reply with exactly: three", assistantText: "three" }],
+      });
+    });
+
+    it("still finds an anchor the compaction preserved", () => {
+      expect(read("0ac5a9")).toMatchObject({ _tag: "Turns", turns: [] });
+    });
+  });
+
   it("keeps the text that follows non-visible user records in the same turn", () => {
     const continued = [
       record("u1", null, "user", "prompt"),

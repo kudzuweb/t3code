@@ -135,6 +135,16 @@ const TranscriptRecord = Schema.Struct({
   // Claude records form a tree through uuid/parentUuid.
   uuid: Schema.optional(Schema.String),
   parentUuid: Schema.optional(Schema.NullOr(Schema.String)),
+  // A compact boundary has no parent; Claude records where the compacted conversation ended.
+  subtype: Schema.optional(Schema.String),
+  logicalParentUuid: Schema.optional(Schema.NullOr(Schema.String)),
+  compactMetadata: Schema.optional(
+    Schema.Struct({
+      preservedSegment: Schema.optional(
+        Schema.Struct({ tailUuid: Schema.optional(Schema.String) }),
+      ),
+    }),
+  ),
   timestamp: Schema.optional(Schema.String),
   cwd: Schema.optional(Schema.String),
   sessionId: Schema.optional(Schema.String),
@@ -556,6 +566,29 @@ export type TurnsAfterAnchor =
   | { readonly _tag: "NoTranscript" }
   | { readonly _tag: "Unsupported" };
 
+/** The conversation each compaction replaced, oldest first, found from where its boundary says it ended. */
+function claudeUuidsBeforeCompaction(
+  records: ReadonlyArray<DecodedTranscriptRecord>,
+  byUuid: ReadonlyMap<string, DecodedTranscriptRecord>,
+): Array<string> {
+  return records
+    .filter((record) => record.subtype === "compact_boundary")
+    .flatMap((boundary) => {
+      const end =
+        byUuid.get(boundary.logicalParentUuid ?? "") ??
+        byUuid.get(boundary.compactMetadata?.preservedSegment?.tailUuid ?? "");
+      const uuids: Array<string> = [];
+      for (
+        let record = end;
+        record?.uuid !== undefined && uuids.length <= byUuid.size;
+        record = byUuid.get(record.parentUuid ?? "")
+      ) {
+        uuids.push(record.uuid);
+      }
+      return uuids.toReversed();
+    });
+}
+
 /**
  * The turns after the anchor on Claude's live `chain` of uuids. A uuid the transcript has no
  * record for yet ends the walk, and a last turn not yet finished is left for the next read.
@@ -571,7 +604,14 @@ export function claudeTurnsAfter(
       record.uuid === undefined ? [] : [[record.uuid, record] as const],
     ),
   );
-  const anchorIndex = chain.indexOf(anchorNativeId);
+  // Compaction cuts the live chain at its boundary, so an anchor from before it is only in the
+  // conversation the boundary replaced.
+  let sequence = chain;
+  let anchorIndex = chain.indexOf(anchorNativeId);
+  if (anchorIndex === -1) {
+    sequence = [...new Set([...claudeUuidsBeforeCompaction(records, byUuid), ...chain])];
+    anchorIndex = sequence.indexOf(anchorNativeId);
+  }
   if (anchorIndex === -1) return { _tag: "AnchorNotFound" };
 
   const turns: Array<OrchestrationV2TranscriptTurn> = [];
@@ -594,7 +634,7 @@ export function claudeTurnsAfter(
     replies.length = 0;
     lastReply = undefined;
   };
-  for (const uuid of chain.slice(anchorIndex + 1)) {
+  for (const uuid of sequence.slice(anchorIndex + 1)) {
     const record = byUuid.get(uuid);
     if (record === undefined) break;
     if (
