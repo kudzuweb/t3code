@@ -322,7 +322,7 @@ const makeImporter = Effect.fn(function* (
 });
 
 it.effect(
-  "ignores sessions owned by live or archived threads, but imports other instances, unowned sessions and sessions whose thread was deleted",
+  "ignores owned sessions, including archived and deleted threads, but imports other instances and unowned sessions",
   () =>
     Effect.gen(function* () {
       const projections = yield* ProjectionStore.ProjectionStoreV2;
@@ -364,8 +364,8 @@ it.effect(
         unownedPi,
       ]);
 
-      expect(yield* importer.run).toEqual({ importedCount: 4, skippedCount: 0 });
-      for (const source of [active, archived, ownedPi]) {
+      expect(yield* importer.run).toEqual({ importedCount: 3, skippedCount: 0 });
+      for (const source of [active, archived, deleted, ownedPi]) {
         const threadId = importId(source);
         expect(yield* Effect.option(projections.getThread(threadId))).toEqual(Option.none());
         expect(yield* events.read({ threadId }).pipe(Stream.runCollect)).toEqual([]);
@@ -382,15 +382,8 @@ it.effect(
             "event" in stored ? [stored.event.threadId] : [],
           ),
         ),
-      ).toEqual(
-        new Set([
-          importId(otherInstance),
-          importId(unowned),
-          importId(unownedPi),
-          importId(deleted),
-        ]),
-      );
-      for (const source of [otherInstance, unowned, unownedPi, deleted]) {
+      ).toEqual(new Set([importId(otherInstance), importId(unowned), importId(unownedPi)]));
+      for (const source of [otherInstance, unowned, unownedPi]) {
         const threadId = importId(source);
         const records = yield* projections.getThreadRecords(threadId, [
           "messages",
@@ -1286,6 +1279,18 @@ describe("importing one session", () => {
         imported: false,
       });
     }).pipe(Effect.scoped, Effect.provide(persistence)),
+  );
+
+  it.effect(
+    "is skipped by the bulk import but reimported by importSession when its thread was deleted",
+    () =>
+      Effect.gen(function* () {
+        const source = candidate(CLAUDE_MODEL_SELECTION, claudeId, "claudeAgent");
+        yield* deleteThread(yield* seedOwner(source));
+        const importer = yield* makeImporter([source]);
+        expect(yield* importer.run).toEqual({ importedCount: 0, skippedCount: 0 });
+        expect((yield* importer.importSession(source)).imported).toBe(true);
+      }).pipe(Effect.scoped, Effect.provide(persistence)),
   );
 
   it.effect("keeps one live thread when two reimports of a deleted session reach the write", () =>

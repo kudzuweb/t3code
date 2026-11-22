@@ -480,6 +480,25 @@ const make = Effect.gen(function* () {
     return "imported" as const;
   });
 
+  // The bulk import leaves a session alone when any thread, deleted or not, holds it.
+  const ownedByAnotherThread = Effect.fn("AgentSessionImporter.ownedByAnotherThread")(function* (
+    source: AgentSessionImportSource,
+    threadId: ThreadId,
+  ) {
+    const owners = yield* sql`
+      SELECT provider_thread_id
+      FROM orchestration_v2_projection_provider_threads
+      WHERE driver = ${source.provider}
+        AND provider_instance_id = ${source.providerInstanceId}
+        AND thread_id IS NOT ${threadId}
+        AND json_extract(payload_json, '$.nativeThreadRef.nativeId') = ${nativeThreadIdOf(source)}
+      LIMIT 1
+    `.pipe(
+      Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-owners", cause })),
+    );
+    return owners.length > 0;
+  });
+
   const importRecentAgentThreads = Effect.fn("importRecentAgentThreadsV2")(function* (
     input: AgentSessionImportInput,
   ) {
@@ -540,11 +559,14 @@ const make = Effect.gen(function* () {
           return;
         }
 
-        const imported = yield* importThread({
-          outcome,
-          projectId: input.projectId,
-          workspaceRoot: project.workspaceRoot,
-          runtimeMode,
+        const imported = yield* Effect.gen(function* () {
+          if (yield* ownedByAnotherThread(outcome.source, threadId)) return "owned" as const;
+          return yield* importThread({
+            outcome,
+            projectId: input.projectId,
+            workspaceRoot: project.workspaceRoot,
+            runtimeMode,
+          });
         }).pipe(
           Effect.catch((cause) =>
             Effect.logWarning("Could not import an agent session", {
