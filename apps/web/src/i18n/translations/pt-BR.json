@@ -4356,6 +4356,7 @@
   "36e4b8d2db087296": "Criar fork a partir desta resposta",
   "c92a0bab54261695": "Responder a esta resposta",
   "405a3e88ee6e62b3": "Não é possível listar as alterações deste turno neste repositório.",
+  "b6a53d1a5a4631b9": "Turnos feitos fora do T3 Code não podem ser bifurcados",
   "f6958f38dc87c712": "Criar fork a partir desta resposta",
   "72f8e14b1246d224": "Responder a esta resposta",
   "01d7728e893c281d": "Ir para a mensagem: {text}",
@@ -4401,6 +4402,7 @@
       "v": "v"
     }
   ],
+  "b0e84e35de44a0c3": "Terminal",
   "31c5a7eb89641aba": "Editar a partir daqui",
   "918cd5477d0c0e9b": "Mostrar mensagem completa",
   "513b0929ca7dde1b": "Entrada da ferramenta\n{input}",

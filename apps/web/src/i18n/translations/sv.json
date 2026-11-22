@@ -4357,6 +4357,7 @@
   "36e4b8d2db087296": "Forka från det här svaret",
   "c92a0bab54261695": "Svara på det här svaret",
   "405a3e88ee6e62b3": "Den här omgångens ändringar i det här repot kan inte listas.",
+  "b6a53d1a5a4631b9": "Tur som gjorts utanför T3 Code kan inte förgrenas",
   "f6958f38dc87c712": "Forka från det här svaret",
   "72f8e14b1246d224": "Svara på det här svaret",
   "01d7728e893c281d": "Hoppa till meddelande: {text}",
@@ -4402,6 +4403,7 @@
       "v": "v"
     }
   ],
+  "b0e84e35de44a0c3": "Terminal",
   "31c5a7eb89641aba": "Redigera härifrån",
   "918cd5477d0c0e9b": "Visa hela meddelandet",
   "513b0929ca7dde1b": "Verktygsindata\n{input}",

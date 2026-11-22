@@ -2122,6 +2122,127 @@ const restartCancelledWorkSurvivesStaleRunUpdate = Effect.gen(function* () {
   assert.deepEqual(updated?.restartCancelledBackgroundWork, work);
 });
 
+const transcriptSyncCandidatesAreLiveStrongRecentThreads = Effect.gen(function* () {
+  const store = yield* ProjectionStore.ProjectionStoreV2;
+  const now = yield* DateTime.now;
+  const longAgo = DateTime.subtract(now, { days: 40 });
+  const create = Effect.fnUntraced(function* (
+    id: string,
+    input: {
+      readonly strength?: "strong" | "weak" | undefined;
+      readonly noProviderThread?: true;
+      readonly archived?: true;
+      readonly deleted?: true;
+      readonly updatedAt?: DateTime.Utc;
+      readonly threadDriver?: ProviderDriverKind;
+    } = {},
+  ) {
+    const at = input.updatedAt ?? now;
+    const threadId = ThreadId.make(id);
+    const providerThreadId = ProviderThreadId.make(`provider-thread:${id}`);
+    const threadDriver = input.threadDriver ?? ProviderDriverKind.make("claudeAgent");
+    const thread = {
+      createdBy: "user" as const,
+      creationSource: "web" as const,
+      id: threadId,
+      projectId: ProjectId.make("project:transcript-sync"),
+      title: id,
+      providerInstanceId,
+      modelSelection,
+      runtimeMode: "full-access" as const,
+      interactionMode: "default" as const,
+      branch: null,
+      worktreePath: null,
+      activeProviderThreadId: input.noProviderThread === true ? null : providerThreadId,
+      lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+      forkedFrom: null,
+      createdAt: input.updatedAt ?? now,
+      updatedAt: input.updatedAt ?? now,
+      archivedAt: input.archived === true ? now : null,
+      settledOverride: null,
+      settledAt: null,
+      lastVisitedAt: null,
+      deletedAt: null,
+    };
+    yield* store.apply({
+      id: EventId.make(`event:${id}:created`),
+      type: "thread.created",
+      threadId,
+      occurredAt: at,
+      payload: thread,
+    });
+    if (input.noProviderThread !== true) {
+      yield* store.apply({
+        id: EventId.make(`event:${id}:provider-thread`),
+        type: "provider-thread.updated",
+        threadId,
+        occurredAt: at,
+        payload: {
+          id: providerThreadId,
+          driver: threadDriver,
+          providerInstanceId,
+          providerSessionId: null,
+          appThreadId: threadId,
+          ownerNodeId: null,
+          nativeThreadRef: {
+            driver: threadDriver,
+            nativeId: `native:${id}`,
+            strength: input.strength ?? "strong",
+          },
+          nativeConversationHeadRef: null,
+          status: "idle" as const,
+          firstRunOrdinal: null,
+          lastRunOrdinal: null,
+          handoffIds: [],
+          forkedFrom: null,
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+    }
+    if (input.deleted === true) {
+      yield* store.apply({
+        id: EventId.make(`event:${id}:deleted`),
+        type: "thread.deleted",
+        threadId,
+        occurredAt: at,
+        payload: { ...thread, deletedAt: now },
+      });
+    }
+  });
+  yield* create("thread:transcript-live");
+  yield* create("thread:transcript-other-driver", {
+    threadDriver: ProviderDriverKind.make("codex"),
+  });
+  yield* create("thread:transcript-archived", { archived: true });
+  yield* create("thread:transcript-deleted", { deleted: true });
+  yield* create("thread:transcript-old", { updatedAt: longAgo });
+  yield* create("thread:transcript-weak", { strength: "weak" });
+  yield* create("thread:transcript-no-session", { noProviderThread: true });
+
+  const candidates = yield* store.listTranscriptSyncCandidates({
+    updatedSince: DateTime.subtract(now, { days: 30 }),
+  });
+
+  assert.deepEqual(
+    candidates.find((candidate) => candidate.threadId === "thread:transcript-live"),
+    {
+      threadId: ThreadId.make("thread:transcript-live"),
+      driver: ProviderDriverKind.make("claudeAgent"),
+      providerThreadId: ProviderThreadId.make("provider-thread:thread:transcript-live"),
+      providerInstanceId,
+      nativeId: "native:thread:transcript-live",
+    },
+  );
+  assert.deepEqual(
+    candidates.map((candidate) => [candidate.threadId, candidate.driver]).toSorted(),
+    [
+      [ThreadId.make("thread:transcript-live"), "claudeAgent"],
+      [ThreadId.make("thread:transcript-other-driver"), "codex"],
+    ],
+  );
+});
+
 const threadWorktreePathsIncludeArchivedOnRequest = Effect.gen(function* () {
   const store = yield* ProjectionStore.ProjectionStoreV2;
   const now = yield* DateTime.now;
@@ -3923,6 +4044,10 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
   it.effect(
     "SQL recovery selects unfinished runless native subagents",
     () => runlessNativeSubagentNeedsRecovery,
+  );
+  it.effect(
+    "transcript sync candidates are live threads with a strong session, active recently",
+    () => transcriptSyncCandidatesAreLiveStrongRecentThreads,
   );
   it.effect(
     "worktree path and title lookups skip deleted threads, and can include archived ones",

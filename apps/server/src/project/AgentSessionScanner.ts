@@ -204,8 +204,6 @@ const decodeCodexHistoryBase = Schema.decodeUnknownOption(
   Schema.Struct({ thread_id: Schema.String, end_byte_offset: Schema.Number }),
 );
 // Original rollouts end in their thread ID, rewound ones in `<thread ID>_<rollout ID>`.
-// How long a poll waits before it looks again for a Codex rollout it could not find.
-const CODEX_NOT_FOUND_RECHECK_MS = 5 * 60 * 1000;
 const CODEX_ROLLOUT_ID_PATTERN =
   /-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}))?\.jsonl(?:\.zst)?$/i;
 // Codex zstd-compresses older rollouts; their byte limits and offsets count decompressed bytes.
@@ -291,10 +289,29 @@ export class AgentSessionScanner extends Context.Service<
     readonly findProjectSession: (
       input: AgentSessionKey & { readonly workspaceRoot: string },
     ) => Effect.Effect<AgentSessionRecentThread, AgentSessionScanError>;
+    /** Whether `readTurnsAfter` can read sessions of this driver. */
+    readonly supportsTranscriptSync: (driver: ProviderDriverKind) => boolean;
+    /**
+     * The signature of the session file found by an earlier read, without looking for it: none when
+     * no read has found it or it is gone.
+     */
+    readonly peekTranscriptSignature: (
+      input: AgentSessionKey & { readonly driver: ProviderDriverKind },
+    ) => Effect.Effect<Option.Option<TranscriptSignature>, AgentSessionScanError>;
+    /**
+     * The signature of the session's newest file, found by looking (or, with `useRememberedPath`,
+     * by the file found last time), and remembered for later checks.
+     */
+    readonly locateTranscript: (
+      input: AgentSessionKey & {
+        readonly driver: ProviderDriverKind;
+        readonly useRememberedPath?: boolean;
+      },
+    ) => Effect.Effect<Option.Option<TranscriptSignature>, AgentSessionScanError>;
     /**
      * What the session gained after `anchorNativeId`, read from its file. For Pi,
      * `providerSessionId` is the session file's path. A Codex rollout is found by its session id,
-     * the way the importer finds it, wherever it ran, and its path is remembered.
+     * the way the importer finds it, wherever it ran.
      */
     readonly readTurnsAfter: (
       input: AgentSessionKey & {
@@ -302,11 +319,8 @@ export class AgentSessionScanner extends Context.Service<
         readonly anchorNativeId: string;
         /** A transcript still looking like this was already read, so it is not read again. */
         readonly unchangedSince?: TranscriptSignature;
-        /**
-         * The read is a poll. A Codex rollout that was not found is then looked for again only
-         * after a few minutes, where an open, a focus or a request looks at once.
-         */
-        readonly poll?: boolean;
+        /** Check the file found last time instead of looking for the newest copy; the poll sets it. */
+        readonly useRememberedPath?: boolean;
       },
     ) => Effect.Effect<
       | (TurnsAfterAnchor & { readonly signature?: TranscriptSignature })
@@ -2938,6 +2952,11 @@ export const make = Effect.gen(function* () {
     ...session
   }) => findSession(workspaceRoot, session);
 
+  const transcriptPaths = new Map<string, string>();
+
+  const supportsTranscriptSync = (driver: ProviderDriverKind) =>
+    driver === "claudeAgent" || driver === "codex" || driver === "pi";
+
   const readError = (cause: unknown) =>
     new AgentSessionScanError({ operation: "read-transcript", cause });
 
@@ -3016,50 +3035,182 @@ export const make = Effect.gen(function* () {
 
   // Where each Codex session's rollout was last found, so a poll costs one stat of that file.
   const codexRollouts = new Map<string, string>();
-  // When a lookup last failed to find a session's rollout, so a poll does not repeat it at once.
-  const codexNotFoundAt = new Map<string, number>();
+
+  /** The rollout of a Codex session, found by its id wherever it ran, and remembered. */
+  const locateCodexRollout = Effect.fn("AgentSessionScanner.locateCodexRollout")(function* (
+    session: AgentSessionKey,
+    useRememberedPath: boolean,
+  ) {
+    const key = `${session.providerInstanceId}\0${session.providerSessionId}`;
+    const knownPath = codexRollouts.get(key);
+    if (useRememberedPath && knownPath !== undefined) {
+      const known = (yield* statTranscript(knownPath))[0];
+      if (known !== undefined) return { ...known, thread: undefined };
+    }
+    // A rollout that moved, as when Codex compressed it, is found again the way the importer finds it.
+    const found = yield* findSession(null, session);
+    if (found._tag !== "Importable") {
+      codexRollouts.delete(key);
+      return undefined;
+    }
+    codexRollouts.set(key, found.source.filePath);
+    return {
+      filePath: found.source.filePath,
+      size: found.source.size,
+      mtimeMs: found.source.mtimeMs ?? 0,
+      thread: found.thread,
+    };
+  });
 
   const readCodexTurnsAfter = Effect.fn("AgentSessionScanner.readCodexTurnsAfter")(function* (
     session: AgentSessionKey,
     anchorNativeId: string,
     unchangedSince: TranscriptSignature | undefined,
-    poll: boolean,
+    useRememberedPath: boolean,
   ) {
-    const key = `${session.providerInstanceId}\0${session.providerSessionId}`;
-    const knownPath = codexRollouts.get(key);
-    const known = knownPath === undefined ? Option.none() : yield* statOption(knownPath);
-    if (
-      unchangedSince !== undefined &&
-      Option.isSome(known) &&
-      known.value.type === "File" &&
-      unchangedSince.size === Number(known.value.size) &&
-      unchangedSince.mtimeMs ===
-        Option.match(known.value.mtime, { onNone: () => 0, onSome: (mtime) => mtime.getTime() })
-    ) {
-      return { _tag: "Unchanged" } as const;
+    if (useRememberedPath && unchangedSince !== undefined) {
+      const knownPath = codexRollouts.get(
+        `${session.providerInstanceId}\0${session.providerSessionId}`,
+      );
+      const known = knownPath === undefined ? undefined : (yield* statTranscript(knownPath))[0];
+      if (known?.size === unchangedSince.size && known.mtimeMs === unchangedSince.mtimeMs) {
+        return { _tag: "Unchanged" } as const;
+      }
     }
-    const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
-    const notFoundAt = codexNotFoundAt.get(key);
-    if (poll && notFoundAt !== undefined && nowMs - notFoundAt < CODEX_NOT_FOUND_RECHECK_MS) {
-      return { _tag: "NoTranscript" } as const;
-    }
-    // A rollout that moved, as when Codex compressed it, is found again the way the importer finds it.
-    const found = yield* findSession(null, session);
-    if (found._tag !== "Importable") {
-      codexNotFoundAt.set(key, nowMs);
-      return { _tag: "NoTranscript" } as const;
-    }
-    codexNotFoundAt.delete(key);
-    codexRollouts.set(key, found.source.filePath);
-    const turns = codexTurnsAfter(found.thread.messages, anchorNativeId);
+    const rollout = yield* locateCodexRollout(session, false);
+    if (rollout?.thread === undefined) return { _tag: "NoTranscript" } as const;
+    const turns = codexTurnsAfter(rollout.thread.messages, anchorNativeId);
+    // The signature is of the file as it was read, so a change during the read shows next time.
     return turns._tag === "Turns"
-      ? {
-          ...turns,
-          // What the file looked like when it was read, so a change during the read shows next time.
-          signature: { size: found.source.size, mtimeMs: found.source.mtimeMs ?? 0 },
-        }
+      ? { ...turns, signature: { size: rollout.size, mtimeMs: rollout.mtimeMs } }
       : turns;
   });
+
+  /** Where an instance keeps its Claude sessions; none when the instance is not a Claude one. */
+  const claudeProjectsDir = Effect.fn("AgentSessionScanner.claudeProjectsDir")(function* (
+    driver: ProviderDriverKind,
+    providerInstanceId: ProviderInstanceId,
+  ) {
+    const settings = yield* serverSettings.getSettings.pipe(
+      Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-settings", cause })),
+    );
+    const instance =
+      settings.providerInstances[providerInstanceId] ??
+      (providerInstanceId === "claudeAgent" ? { driver } : undefined);
+    const claudeSettings =
+      instance === undefined ? Option.none() : decodeClaudeSettings(instance.config ?? {});
+    if (instance === undefined || Option.isNone(claudeSettings)) return Option.none<string>();
+    const configuredHome = instance.environment?.findLast(
+      (variable) => variable.name === "CLAUDE_CONFIG_DIR",
+    )?.value;
+    const claudeHome = resolveClaudeConfigDir(
+      claudeSettings.value.homePath,
+      typeof configuredHome === "string" ? configuredHome : hostEnvironment.CLAUDE_CONFIG_DIR,
+    );
+    return Option.some(path.join(claudeHome, "projects"));
+  });
+
+  const statTranscript = (filePath: string) =>
+    statOption(filePath).pipe(
+      Effect.map((info) =>
+        Option.isSome(info) && info.value.type === "File"
+          ? [
+              {
+                filePath,
+                size: Number(info.value.size),
+                mtimeMs: Option.match(info.value.mtime, {
+                  onNone: () => 0,
+                  onSome: (mtime) => mtime.getTime(),
+                }),
+              },
+            ]
+          : [],
+      ),
+    );
+
+  const rememberedTranscript = Effect.fn("AgentSessionScanner.rememberedTranscript")(function* (
+    projectsDir: string,
+    cacheKey: string,
+  ) {
+    const rememberedPath = transcriptPaths.get(cacheKey);
+    if (!rememberedPath?.startsWith(projectsDir + path.sep)) return undefined;
+    return (yield* statTranscript(rememberedPath))[0];
+  });
+
+  // The same session id can sit in several project folders; the newest copy is the live one.
+  const discoverTranscript = Effect.fn("AgentSessionScanner.discoverTranscript")(function* (
+    projectsDir: string,
+    cacheKey: string,
+    providerSessionId: string,
+  ) {
+    const projectFolders = yield* listDirectory(projectsDir);
+    const copies = yield* Effect.forEach(projectFolders, (folder) =>
+      statTranscript(path.join(projectsDir, folder, `${providerSessionId}.jsonl`)),
+    );
+    const transcript = copies.flat().toSorted((left, right) => right.mtimeMs - left.mtimeMs)[0];
+    if (transcript === undefined) transcriptPaths.delete(cacheKey);
+    else transcriptPaths.set(cacheKey, transcript.filePath);
+    return transcript;
+  });
+
+  const locateTranscript: AgentSessionScanner["Service"]["locateTranscript"] = Effect.fn(
+    "AgentSessionScanner.locateTranscript",
+  )(function* ({ driver, providerInstanceId, providerSessionId, useRememberedPath }) {
+    if (!supportsTranscriptSync(driver)) return Option.none();
+    if (driver === "pi") {
+      const file = (yield* statTranscript(providerSessionId))[0];
+      return file === undefined
+        ? Option.none()
+        : Option.some({ size: file.size, mtimeMs: file.mtimeMs });
+    }
+    if (driver === "codex") {
+      const rollout = yield* locateCodexRollout(
+        { providerInstanceId, providerSessionId },
+        useRememberedPath === true,
+      );
+      return rollout === undefined
+        ? Option.none()
+        : Option.some({ size: rollout.size, mtimeMs: rollout.mtimeMs });
+    }
+    const projectsDir = yield* claudeProjectsDir(driver, providerInstanceId);
+    if (Option.isNone(projectsDir)) return Option.none();
+    const cacheKey = `${providerInstanceId}\0${providerSessionId}`;
+    const found =
+      (useRememberedPath === true
+        ? yield* rememberedTranscript(projectsDir.value, cacheKey)
+        : undefined) ?? (yield* discoverTranscript(projectsDir.value, cacheKey, providerSessionId));
+    return found === undefined
+      ? Option.none()
+      : Option.some({ size: found.size, mtimeMs: found.mtimeMs });
+  });
+
+  const peekTranscriptSignature: AgentSessionScanner["Service"]["peekTranscriptSignature"] =
+    Effect.fn("AgentSessionScanner.peekTranscriptSignature")(function* ({
+      driver,
+      providerInstanceId,
+      providerSessionId,
+    }) {
+      if (!supportsTranscriptSync(driver)) return Option.none();
+      if (driver === "pi" || driver === "codex") {
+        const knownPath =
+          driver === "pi"
+            ? providerSessionId
+            : codexRollouts.get(`${providerInstanceId}\0${providerSessionId}`);
+        const file = knownPath === undefined ? undefined : (yield* statTranscript(knownPath))[0];
+        return file === undefined
+          ? Option.none()
+          : Option.some({ size: file.size, mtimeMs: file.mtimeMs });
+      }
+      const projectsDir = yield* claudeProjectsDir(driver, providerInstanceId);
+      if (Option.isNone(projectsDir)) return Option.none();
+      const remembered = yield* rememberedTranscript(
+        projectsDir.value,
+        `${providerInstanceId}\0${providerSessionId}`,
+      );
+      return remembered === undefined
+        ? Option.none()
+        : Option.some({ size: remembered.size, mtimeMs: remembered.mtimeMs });
+    });
 
   const readTurnsAfter: AgentSessionScanner["Service"]["readTurnsAfter"] = Effect.fn(
     "AgentSessionScanner.readTurnsAfter",
@@ -3069,60 +3220,35 @@ export const make = Effect.gen(function* () {
     providerSessionId,
     anchorNativeId,
     unchangedSince,
-    poll,
+    useRememberedPath,
   }) {
     if (driver === "codex") {
       return yield* readCodexTurnsAfter(
         { providerInstanceId, providerSessionId },
         anchorNativeId,
         unchangedSince,
-        poll === true,
+        useRememberedPath === true,
       );
     }
-    if (driver === "pi")
+    if (driver === "pi") {
       return yield* readPiTurnsAfter(providerSessionId, anchorNativeId, unchangedSince);
-    if (driver !== "claudeAgent") return { _tag: "Unsupported" } as const;
-    const settings = yield* serverSettings.getSettings.pipe(
-      Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-settings", cause })),
-    );
-    const instance =
-      settings.providerInstances[providerInstanceId] ??
-      (providerInstanceId === "claudeAgent" ? { driver } : undefined);
-    const claudeSettings =
-      instance === undefined ? Option.none() : decodeClaudeSettings(instance.config ?? {});
-    if (instance === undefined || Option.isNone(claudeSettings)) {
-      return { _tag: "NoTranscript" } as const;
     }
-    const configuredHome = instance.environment?.findLast(
-      (variable) => variable.name === "CLAUDE_CONFIG_DIR",
-    )?.value;
-    const claudeHome = resolveClaudeConfigDir(
-      claudeSettings.value.homePath,
-      typeof configuredHome === "string" ? configuredHome : hostEnvironment.CLAUDE_CONFIG_DIR,
-    );
-    const projectsDir = path.join(claudeHome, "projects");
-    // The same session id can sit in several project folders; the newest copy is the live one.
-    const projectFolders = yield* listDirectory(projectsDir);
-    const copies = yield* Effect.forEach(projectFolders, (folder) => {
-      const filePath = path.join(projectsDir, folder, `${providerSessionId}.jsonl`);
-      return statOption(filePath).pipe(
-        Effect.map((info) =>
-          Option.isSome(info) && info.value.type === "File"
-            ? [
-                {
-                  filePath,
-                  size: Number(info.value.size),
-                  mtimeMs: Option.match(info.value.mtime, {
-                    onNone: () => 0,
-                    onSome: (mtime) => mtime.getTime(),
-                  }),
-                },
-              ]
-            : [],
-        ),
-      );
-    });
-    const transcript = copies.flat().toSorted((left, right) => right.mtimeMs - left.mtimeMs)[0];
+    if (!supportsTranscriptSync(driver)) return { _tag: "Unsupported" } as const;
+    const projectsDir = yield* claudeProjectsDir(driver, providerInstanceId);
+    if (Option.isNone(projectsDir)) return { _tag: "NoTranscript" } as const;
+    const cacheKey = `${providerInstanceId}\0${providerSessionId}`;
+    // The poll asks about every thread often, so for it an unchanged session costs one stat of
+    // the file found last time. Every other trigger looks for the newest copy of the session.
+    if (useRememberedPath === true && unchangedSince !== undefined) {
+      const remembered = yield* rememberedTranscript(projectsDir.value, cacheKey);
+      if (
+        remembered?.size === unchangedSince.size &&
+        remembered.mtimeMs === unchangedSince.mtimeMs
+      ) {
+        return { _tag: "Unchanged" } as const;
+      }
+    }
+    const transcript = yield* discoverTranscript(projectsDir.value, cacheKey, providerSessionId);
     if (transcript === undefined) return { _tag: "NoTranscript" } as const;
 
     const signature = { size: transcript.size, mtimeMs: transcript.mtimeMs };
@@ -3134,12 +3260,22 @@ export const make = Effect.gen(function* () {
       const decoded = decodeTranscriptValue(value);
       return Option.isSome(decoded) && decoded.value.uuid !== undefined ? [decoded.value] : [];
     });
+    // Nothing after the anchor in the file means nothing new, so the session reader is not started.
+    const anchorIndex = records.findIndex((record) => record.uuid === anchorNativeId);
+    if (anchorIndex >= 0 && anchorIndex === records.length - 1) {
+      return {
+        _tag: "Turns",
+        turns: [],
+        throughNativeId: anchorNativeId,
+        signature,
+      } as const;
+    }
     // The SDK documents `dir` as the session's project directory, which its records name.
     const projectDirectory = records.find((record) => record.cwd !== undefined)?.cwd;
     const chain = yield* claudeChain
       .read({
         sessionId: providerSessionId,
-        environment: { ...hostEnvironment, CLAUDE_CONFIG_DIR: claudeHome },
+        environment: { ...hostEnvironment, CLAUDE_CONFIG_DIR: path.dirname(projectsDir.value) },
         ...(projectDirectory === undefined ? {} : { directory: projectDirectory }),
       })
       .pipe(Effect.mapError(readError));
@@ -3158,6 +3294,9 @@ export const make = Effect.gen(function* () {
     recentThreads,
     listProjectSessions,
     findProjectSession,
+    supportsTranscriptSync,
+    peekTranscriptSignature,
+    locateTranscript,
     readTurnsAfter,
   });
 });

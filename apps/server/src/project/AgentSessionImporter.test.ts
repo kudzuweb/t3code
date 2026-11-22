@@ -250,6 +250,7 @@ const makeImporter = Effect.fn(function* (
           ),
           realScan === undefined
             ? Layer.mock(AgentSessionScanner.AgentSessionScanner)({
+                supportsTranscriptSync: () => false,
                 recentThreads: () => Stream.fromIterable(candidates),
                 listProjectSessions: () =>
                   Effect.succeed({
@@ -606,8 +607,18 @@ it.effect("does not certify new native history after a partial import retry", ()
     continued.source.size = 200;
     continued.source.mtimeMs = 3;
     continued.thread.messages.push(
-      { role: "user", text: "Continue outside T3", createdAt: timestamp },
-      { role: "assistant", text: "Native continuation", createdAt: timestamp },
+      {
+        role: "user",
+        text: "Continue outside T3",
+        createdAt: timestamp,
+        nativeId: "continued-user",
+      },
+      {
+        role: "assistant",
+        text: "Native continuation",
+        createdAt: timestamp,
+        nativeId: "continued-assistant",
+      },
     );
     // The thread holds only the original messages, so the continued transcript stays unrecorded.
     expect(yield* (yield* makeImporter([continued])).run).toEqual({
@@ -646,8 +657,13 @@ it.effect("does not record a changed transcript as imported without its new mess
     continued.source.size = 200;
     continued.source.mtimeMs = 3;
     continued.thread.messages.push(
-      { role: "user", text: "Continue", createdAt: timestamp },
-      { role: "assistant", text: "Continued", createdAt: timestamp },
+      { role: "user", text: "Continue", createdAt: timestamp, nativeId: "continue-user" },
+      {
+        role: "assistant",
+        text: "Continued",
+        createdAt: timestamp,
+        nativeId: "continue-assistant",
+      },
     );
     yield* (yield* makeImporter([continued])).run;
 
@@ -1162,7 +1178,12 @@ describe("importing one session", () => {
       const importer = yield* makeImporter([source]);
       expect(yield* importer.run).toEqual({ importedCount: 1, skippedCount: 0 });
 
-      source.thread.messages.push({ role: "user", text: "One more", createdAt: timestamp });
+      source.thread.messages.push({
+        role: "user",
+        text: "One more",
+        createdAt: timestamp,
+        nativeId: "one-more-user",
+      });
       expect(yield* importer.importSession(source)).toEqual({
         threadId: importId(source),
         imported: false,

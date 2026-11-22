@@ -4357,6 +4357,7 @@
   "36e4b8d2db087296": "Créer un fork depuis cette réponse",
   "c92a0bab54261695": "Répondre à cette réponse",
   "405a3e88ee6e62b3": "Impossible de lister les modifications de ce tour dans ce dépôt.",
+  "b6a53d1a5a4631b9": "Les tours effectués en dehors de T3 Code ne peuvent pas être forkés",
   "f6958f38dc87c712": "Créer un fork depuis cette réponse",
   "72f8e14b1246d224": "Répondre à cette réponse",
   "01d7728e893c281d": "Aller au message : {text}",
@@ -4402,6 +4403,7 @@
       "v": "v"
     }
   ],
+  "b0e84e35de44a0c3": "Terminal",
   "31c5a7eb89641aba": "Modifier à partir d’ici",
   "918cd5477d0c0e9b": "Afficher le message complet",
   "513b0929ca7dde1b": "Entrée de l’outil\n{input}",

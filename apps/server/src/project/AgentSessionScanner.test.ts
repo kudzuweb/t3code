@@ -95,58 +95,55 @@ const layerRuntimeRepository = (imported: ScannerTestInput["importedTranscripts"
   });
 
 const layerScannerTest = (input: ScannerTestInput) =>
-  Layer.effect(AgentSessionScanner.AgentSessionScanner, AgentSessionScanner.make)
-    .pipe(
-      Layer.provide(input.processRunner ?? ProcessRunner.layer),
-      Layer.provide(
-        Layer.succeed(ClaudeSessionChain.ClaudeSessionChain, {
-          read: ({ sessionId, directory }) =>
-            Effect.sync(() => {
-              input.claudeChainDirectories?.push(directory);
-              return input.claudeChains?.[sessionId] ?? [];
-            }),
-        }),
-      ),
-    )
-    .pipe(
-      Layer.provide(
-        Layer.mergeAll(
-          ServerSettings.layerTest({
-            providerInstances: {
-              [ProviderInstanceId.make("claudeAgent")]: {
-                driver: ProviderDriverKind.make("claudeAgent"),
-                config: { homePath: input.claudeHomePath },
-              },
-              [ProviderInstanceId.make("codex")]: {
-                driver: ProviderDriverKind.make("codex"),
-                config: { homePath: input.codexHomePath },
-              },
-              // Keeps the default Pi instance off the developer's real ~/.pi.
-              [ProviderInstanceId.make("pi")]: {
-                driver: ProviderDriverKind.make("pi"),
-                enabled: true,
-                environment: [
-                  {
-                    name: "PI_CODING_AGENT_DIR",
-                    value: input.piAgentDir ?? `${input.claudeHomePath}/pi-agent`,
-                    sensitive: false,
-                  },
-                  { name: "PI_CODING_AGENT_SESSION_DIR", value: "", sensitive: false },
-                ],
-                config: {},
-              },
-              ...input.providerInstances,
-            },
+  Layer.effect(AgentSessionScanner.AgentSessionScanner, AgentSessionScanner.make).pipe(
+    Layer.provide(input.processRunner ?? ProcessRunner.layer),
+    Layer.provide(
+      Layer.succeed(ClaudeSessionChain.ClaudeSessionChain, {
+        read: ({ sessionId, directory }) =>
+          Effect.sync(() => {
+            input.claudeChainDirectories?.push(directory);
+            return input.claudeChains?.[sessionId] ?? [];
           }),
-          ServerConfig.layerTest(
-            input.claudeHomePath,
-            input.configBaseDir ?? { prefix: "t3code-scanner-config-" },
-          ),
-          layerProjectStore(input.importedWorkspaceRoots ?? []),
-          layerRuntimeRepository(input.importedTranscripts),
+      }),
+    ),
+    Layer.provide(
+      Layer.mergeAll(
+        ServerSettings.layerTest({
+          providerInstances: {
+            [ProviderInstanceId.make("claudeAgent")]: {
+              driver: ProviderDriverKind.make("claudeAgent"),
+              config: { homePath: input.claudeHomePath },
+            },
+            [ProviderInstanceId.make("codex")]: {
+              driver: ProviderDriverKind.make("codex"),
+              config: { homePath: input.codexHomePath },
+            },
+            // Keeps the default Pi instance off the developer's real ~/.pi.
+            [ProviderInstanceId.make("pi")]: {
+              driver: ProviderDriverKind.make("pi"),
+              enabled: true,
+              environment: [
+                {
+                  name: "PI_CODING_AGENT_DIR",
+                  value: input.piAgentDir ?? `${input.claudeHomePath}/pi-agent`,
+                  sensitive: false,
+                },
+                { name: "PI_CODING_AGENT_SESSION_DIR", value: "", sensitive: false },
+              ],
+              config: {},
+            },
+            ...input.providerInstances,
+          },
+        }),
+        ServerConfig.layerTest(
+          input.claudeHomePath,
+          input.configBaseDir ?? { prefix: "t3code-scanner-config-" },
         ),
+        layerProjectStore(input.importedWorkspaceRoots ?? []),
+        layerRuntimeRepository(input.importedTranscripts),
       ),
-    );
+    ),
+  );
 
 const runScan = (input: ScannerTestInput) =>
   Effect.gen(function* () {
@@ -1911,7 +1908,10 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
         });
         yield* writeTranscript({
           filePath: path.join(claudeHomePath, "projects", "-live", "claude-mismatch.jsonl"),
-          contents: transcript(line("u1", null, "user", "prompt")),
+          contents: transcript(
+            line("u1", null, "user", "prompt"),
+            line("a2", "u1", "assistant", "reply"),
+          ),
           mtimeMs: 2_000_000,
         });
         expect(yield* read("claude-mismatch", "claudeAgent", "u1")).toEqual({
@@ -2129,7 +2129,7 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
         const read = (
           anchorNativeId: string,
           unchangedSince?: AgentSessionScanner.TranscriptSignature,
-          poll?: true,
+          useRememberedPath?: true,
         ) =>
           scanner.readTurnsAfter({
             driver: ProviderDriverKind.make("codex"),
@@ -2137,7 +2137,7 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
             providerSessionId: sessionId,
             anchorNativeId,
             ...(unchangedSince === undefined ? {} : { unchangedSince }),
-            ...(poll === undefined ? {} : { poll }),
+            ...(useRememberedPath === undefined ? {} : { useRememberedPath }),
           });
         return { claudeHomePath, codexHomePath, workspace, write, read, path, scanner };
       });
@@ -2190,10 +2190,12 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
           expect(caughtUp).toMatchObject({ _tag: "Turns", turns: [], throughNativeId: third });
           const signature = "signature" in caughtUp ? caughtUp.signature : undefined;
           expect(signature?.mtimeMs).toBe(2_000_000);
-          expect(yield* read(third, signature)).toEqual({ _tag: "Unchanged" });
+          // Only a poll trusts the remembered file; opening or focusing the thread looks again.
+          expect(yield* read(third, signature, true)).toEqual({ _tag: "Unchanged" });
+          expect((yield* read(third, signature))._tag).toBe("Turns");
           // A turn appended to the rollout changes its size.
           yield* write([...fixtureLines(workspace), ...fixtureLines(workspace).slice(-3)]);
-          expect((yield* read(third, signature))._tag).toBe("Turns");
+          expect((yield* read(third, signature, true))._tag).toBe("Turns");
         }),
       );
 
@@ -2373,42 +2375,13 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
         );
       });
 
-      it.effect(
-        "looks for a rollout it could not find again only when asked, or after five minutes",
-        () =>
-          Effect.gen(function* () {
-            const { workspace, write, read } = yield* setup();
-            yield* TestClock.setTime(Date.parse("2026-11-22T12:00:00.000Z"));
-            expect(yield* read(first, undefined, true)).toEqual({ _tag: "NoTranscript" });
-
-            yield* write(fixtureLines(workspace));
-            // A poll does not look again, so it costs nothing while the rollout is missing.
-            yield* TestClock.adjust("4 minutes");
-            expect(yield* read(first, undefined, true)).toEqual({ _tag: "NoTranscript" });
-            // Opening or focusing the thread looks at once.
-            expect((yield* read(first))._tag).toBe("Turns");
-          }),
-      );
-
-      it.effect("lets a poll look again once five minutes have passed", () =>
-        Effect.gen(function* () {
-          const { workspace, write, read } = yield* setup();
-          yield* TestClock.setTime(Date.parse("2026-11-22T12:00:00.000Z"));
-          expect(yield* read(first, undefined, true)).toEqual({ _tag: "NoTranscript" });
-
-          yield* write(fixtureLines(workspace));
-          yield* TestClock.adjust("5 minutes");
-          expect((yield* read(first, undefined, true))._tag).toBe("Turns");
-        }),
-      );
-
       it.effect("finds the rollout again where it moved when the file it knew is gone", () =>
         Effect.gen(function* () {
           const { codexHomePath, workspace, write, read, path } = yield* setup();
           yield* write(fixtureLines(workspace));
           const known = yield* read(third);
           const signature = "signature" in known ? known.signature : undefined;
-          expect(yield* read(third, signature)).toEqual({ _tag: "Unchanged" });
+          expect(yield* read(third, signature, true)).toEqual({ _tag: "Unchanged" });
 
           const fileSystem = yield* FileSystem.FileSystem;
           yield* fileSystem.remove(path.join(codexHomePath, "sessions", "2026", "11", "22"), {
@@ -2416,10 +2389,185 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
           });
           yield* write(fixtureLines(workspace), { day: "24", mtimeMs: 2_000_000 });
 
-          expect((yield* read(third, signature))._tag).toBe("Turns");
+          expect((yield* read(third, signature, true))._tag).toBe("Turns");
+        }),
+      );
+
+      it.effect("locates the rollout by session id and peeks at it afterwards", () =>
+        Effect.gen(function* () {
+          const { workspace, write, scanner } = yield* setup();
+          yield* write(fixtureLines(workspace));
+          const session = {
+            driver: ProviderDriverKind.make("codex"),
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            providerSessionId: sessionId,
+          };
+
+          expect(yield* scanner.peekTranscriptSignature(session)).toEqual(Option.none());
+          const located = yield* scanner.locateTranscript(session);
+          expect(Option.isSome(located) && located.value.mtimeMs).toBe(2_000_000);
+          expect(yield* scanner.peekTranscriptSignature(session)).toEqual(located);
         }),
       );
     });
+
+    it.effect.each(["claudeAgent", "codex", "pi", "opencode"])(
+      "says whether a %s session can be read for terminal turns",
+      (driver) =>
+        Effect.gen(function* () {
+          const scanner = yield* AgentSessionScanner.AgentSessionScanner.pipe(
+            Effect.provide(
+              layerScannerTest({
+                claudeHomePath: yield* makeTempDir("t3code-claude-home-"),
+                codexHomePath: yield* makeTempDir("t3code-codex-home-"),
+              }),
+            ),
+          );
+          expect(scanner.supportsTranscriptSync(ProviderDriverKind.make(driver))).toBe(
+            driver !== "opencode",
+          );
+        }),
+    );
+
+    it.effect(
+      "finds a session file once, then checks only that file until it changes or goes",
+      () =>
+        Effect.gen(function* () {
+          const path = yield* Path.Path;
+          const fileSystem = yield* FileSystem.FileSystem;
+          const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+          const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+          const line = (uuid: string, parentUuid: string | null, type: string) =>
+            encodeTranscriptRecord({
+              type,
+              uuid,
+              parentUuid,
+              sessionId: "claude-cached",
+              cwd: "/work/project",
+              timestamp: "2026-11-20T10:00:00.000Z",
+              message: { role: type, content: "text", stop_reason: "end_turn" },
+            });
+          const contents = `${line("u1", null, "user")}\n${line("a2", "u1", "assistant")}\n`;
+          const projects = path.join(claudeHomePath, "projects");
+          const original = path.join(projects, "-first", "claude-cached.jsonl");
+          yield* writeTranscript({ filePath: original, contents, mtimeMs: 1_000_000 });
+          const scanner = yield* AgentSessionScanner.AgentSessionScanner.pipe(
+            Effect.provide(
+              layerScannerTest({
+                claudeHomePath,
+                codexHomePath,
+                claudeChains: { "claude-cached": ["u1", "a2"] },
+              }),
+            ),
+          );
+          const session = {
+            driver: ProviderDriverKind.make("claudeAgent"),
+            providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+            providerSessionId: "claude-cached",
+          };
+          const read = (
+            unchangedSince?: { readonly size: number; readonly mtimeMs: number },
+            useRememberedPath = false,
+          ) =>
+            scanner.readTurnsAfter({
+              ...session,
+              anchorNativeId: "u1",
+              ...(unchangedSince === undefined ? {} : { unchangedSince }),
+              ...(useRememberedPath ? { useRememberedPath } : {}),
+            });
+          expect(yield* scanner.peekTranscriptSignature(session)).toEqual(Option.none());
+
+          const first = yield* read();
+          const signature = "signature" in first ? first.signature : undefined;
+          expect(signature).toBeDefined();
+
+          expect(yield* scanner.peekTranscriptSignature(session)).toEqual(Option.some(signature));
+
+          // A newer copy elsewhere is not looked for while a poll finds the remembered file unchanged.
+          yield* writeTranscript({
+            filePath: path.join(projects, "-second", "claude-cached.jsonl"),
+            contents: `${contents}${contents}`,
+            mtimeMs: 3_000_000,
+          });
+          expect(yield* read(signature, true)).toEqual({ _tag: "Unchanged" });
+
+          // Any other trigger finds the newest copy, wherever Claude continued the session.
+          const newest = yield* read(signature);
+          expect(newest).toMatchObject({ _tag: "Turns" });
+          expect(yield* scanner.peekTranscriptSignature(session)).toEqual(
+            Option.some({ size: Buffer.byteLength(`${contents}${contents}`), mtimeMs: 3_000_000 }),
+          );
+
+          // Once the remembered file is gone, the poll finds the session again.
+          yield* fileSystem.remove(path.join(projects, "-second", "claude-cached.jsonl"));
+          expect(yield* scanner.peekTranscriptSignature(session)).toEqual(Option.none());
+          expect(yield* read(undefined, true)).toMatchObject({ _tag: "Turns" });
+
+          // Locating a file finds it without reading and remembers it for the poll's checks.
+          yield* writeTranscript({
+            filePath: path.join(projects, "-third", "claude-cached.jsonl"),
+            contents,
+            mtimeMs: 5_000_000,
+          });
+          const located = yield* scanner.locateTranscript(session);
+          expect(located).toEqual(
+            Option.some({ size: Buffer.byteLength(contents), mtimeMs: 5_000_000 }),
+          );
+          expect(yield* scanner.peekTranscriptSignature(session)).toEqual(located);
+        }),
+    );
+
+    it.effect("does not start the session reader when nothing follows the anchor", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const line = (uuid: string, parentUuid: string | null, type: string) =>
+          encodeTranscriptRecord({
+            type,
+            uuid,
+            parentUuid,
+            sessionId: "claude-quiet",
+            cwd: "/work/project",
+            timestamp: "2026-11-20T10:00:00.000Z",
+            message: { role: type, content: "text", stop_reason: "end_turn" },
+          });
+        yield* writeTranscript({
+          filePath: path.join(claudeHomePath, "projects", "-quiet", "claude-quiet.jsonl"),
+          contents: `${line("u1", null, "user")}\n${line("a2", "u1", "assistant")}\n`,
+          mtimeMs: 1_000_000,
+        });
+        const chainDirectories: Array<string | undefined> = [];
+        const scanner = yield* AgentSessionScanner.AgentSessionScanner.pipe(
+          Effect.provide(
+            layerScannerTest({
+              claudeHomePath,
+              codexHomePath,
+              claudeChains: { "claude-quiet": ["u1", "a2"] },
+              claudeChainDirectories: chainDirectories,
+            }),
+          ),
+        );
+        const read = (anchorNativeId: string) =>
+          scanner.readTurnsAfter({
+            driver: ProviderDriverKind.make("claudeAgent"),
+            providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+            providerSessionId: "claude-quiet",
+            anchorNativeId,
+          });
+
+        expect(yield* read("a2")).toMatchObject({
+          _tag: "Turns",
+          turns: [],
+          throughNativeId: "a2",
+          signature: { mtimeMs: 1_000_000 },
+        });
+        expect(chainDirectories).toEqual([]);
+
+        yield* read("u1");
+        expect(chainDirectories).toHaveLength(1);
+      }),
+    );
 
     it.effect("lists titles from the head and tail of a transcript larger than the sample", () =>
       Effect.gen(function* () {
@@ -5066,10 +5214,12 @@ describe("claudeTurnsAfter", () => {
       record("u0", null, "user", "earlier"),
       record("a0", "u0", "assistant", "done"),
     ];
-    const read = (entries: ReadonlyArray<ReturnType<typeof record>>) =>
+    const read = (
+      entries: ReadonlyArray<Parameters<typeof AgentSessionScanner.claudeTurnsAfter>[0][number]>,
+    ) =>
       AgentSessionScanner.claudeTurnsAfter(
         [...earlier, ...entries],
-        ["u0", "a0", ...entries.map((entry) => entry.uuid)],
+        ["u0", "a0", ...entries.flatMap((entry) => (entry.uuid === undefined ? [] : [entry.uuid]))],
         "a0",
         fallback,
       );

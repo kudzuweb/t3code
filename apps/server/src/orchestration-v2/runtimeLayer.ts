@@ -17,6 +17,7 @@ import * as ProviderInstallationGate from "../provider/ProviderInstallationGate.
 import * as AgentSessionImporter from "../project/AgentSessionImporter.ts";
 import * as AgentSessionScanner from "../project/AgentSessionScanner.ts";
 import * as TranscriptSyncService from "../project/TranscriptSyncService.ts";
+import * as TranscriptSyncWorker from "../project/TranscriptSyncWorker.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
@@ -441,6 +442,15 @@ export const layerProduction = Layer.mergeAll(
   layerAgentSessionScannerProvided,
   layerAgentSessionImporterProvided,
   layerTranscriptSyncProvided,
+  TranscriptSyncWorker.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        ProjectionStore.layer,
+        layerAgentSessionScannerProvided,
+        layerTranscriptSyncProvided,
+      ),
+    ),
+  ),
   EffectOutbox.layerPruneWorker.pipe(Layer.provide(EffectOutbox.layer)),
 ).pipe(
   Layer.provide(ResourceCleanupService.layer.pipe(Layer.provide(layerScheduledTaskProvided))),
