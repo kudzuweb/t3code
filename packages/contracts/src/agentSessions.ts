@@ -1,5 +1,11 @@
 import * as Schema from "effect/Schema";
-import { IsoDateTime, NonNegativeInt, ProjectId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import {
+  IsoDateTime,
+  NonNegativeInt,
+  ProjectId,
+  ThreadId,
+  TrimmedNonEmptyString,
+} from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 
 export const AgentSessionSource = Schema.Literals(["claudeAgent", "codex", "pi"]);
@@ -89,3 +95,69 @@ export class AgentSessionScanError extends Schema.TaggedError<AgentSessionScanEr
     return `Failed to scan agent sessions during ${this.operation}.`;
   }
 }
+
+export class AgentSessionUnresumableSessionError extends Schema.TaggedError<AgentSessionUnresumableSessionError>()(
+  "AgentSessionUnresumableSessionError",
+  {
+    source: AgentSessionSource,
+    providerSessionId: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `Session '${this.providerSessionId}' from '${this.source}' cannot be resumed.`;
+  }
+}
+
+export class AgentSessionNotFoundError extends Schema.TaggedError<AgentSessionNotFoundError>()(
+  "AgentSessionNotFoundError",
+  {
+    projectId: ProjectId,
+    providerSessionId: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `Session '${this.providerSessionId}' was not found in project '${this.projectId}'.`;
+  }
+}
+
+export const AgentSessionListInput = Schema.Struct({
+  projectId: ProjectId,
+});
+export type AgentSessionListInput = typeof AgentSessionListInput.Type;
+
+export const AgentSessionWorktree = Schema.Struct({
+  path: TrimmedNonEmptyString,
+  branch: Schema.NullOr(TrimmedNonEmptyString),
+});
+export type AgentSessionWorktree = typeof AgentSessionWorktree.Type;
+
+export const AgentSessionSummary = Schema.Struct({
+  provider: AgentSessionSource,
+  providerInstanceId: ProviderInstanceId,
+  providerSessionId: TrimmedNonEmptyString,
+  title: TrimmedNonEmptyString,
+  lastActiveAt: Schema.NullOr(IsoDateTime),
+  worktree: Schema.NullOr(AgentSessionWorktree),
+  /** The T3 thread that already holds this session. */
+  threadId: Schema.NullOr(ThreadId),
+});
+export type AgentSessionSummary = typeof AgentSessionSummary.Type;
+
+export const AgentSessionListResult = Schema.Struct({
+  sessions: Schema.Array(AgentSessionSummary),
+  truncated: Schema.Boolean,
+});
+export type AgentSessionListResult = typeof AgentSessionListResult.Type;
+
+export const AgentSessionImportOneInput = Schema.Struct({
+  projectId: ProjectId,
+  providerInstanceId: ProviderInstanceId,
+  providerSessionId: TrimmedNonEmptyString,
+});
+export type AgentSessionImportOneInput = typeof AgentSessionImportOneInput.Type;
+
+export const AgentSessionImportOneResult = Schema.Struct({
+  threadId: ThreadId,
+  imported: Schema.Boolean,
+});
+export type AgentSessionImportOneResult = typeof AgentSessionImportOneResult.Type;
