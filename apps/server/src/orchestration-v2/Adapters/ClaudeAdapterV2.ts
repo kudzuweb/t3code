@@ -2906,7 +2906,7 @@ const getNativeThreadId = Effect.fnUntraced(function* (
 
 const isSyntheticClaudeTurnId = (nativeTurnId: string): boolean => nativeTurnId.startsWith("turn:");
 
-const claudeTurnCursor = (turn: OrchestrationV2ProviderTurn): string | null => {
+export const claudeTurnCursor = (turn: OrchestrationV2ProviderTurn): string | null => {
   const ref = turn.nativeTurnRef;
   return ref !== null &&
     ref.driver === CLAUDE_PROVIDER &&

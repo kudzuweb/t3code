@@ -12,6 +12,7 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
+import { claudeTurnCursor } from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import type { ProjectionRecords } from "../orchestration-v2/ProjectionStore.ts";
 import * as AgentSessionScanner from "./AgentSessionScanner.ts";
@@ -64,9 +65,19 @@ const make = Effect.gen(function* () {
     records: ProjectionRecords<"runs" | "attempts" | "providerThreads" | "providerTurns">,
     providerThread: OrchestrationV2ProviderThread,
   ) {
+    // A switch of provider instance continues the same native session on a new provider thread.
+    const sessionThreadIds = new Set(
+      records.providerThreads
+        .filter(
+          (candidate) =>
+            candidate.driver === providerThread.driver &&
+            candidate.nativeThreadRef?.nativeId === providerThread.nativeThreadRef?.nativeId,
+        )
+        .map((candidate) => candidate.id),
+    );
     const newestFirst = records.runs.toSorted((left, right) => right.ordinal - left.ordinal);
     for (const run of newestFirst) {
-      if (run.providerThreadId !== providerThread.id) continue;
+      if (run.providerThreadId === null || !sessionThreadIds.has(run.providerThreadId)) continue;
       if (run.recordedFrom === "transcript") {
         const { turnItems } = yield* orchestrator.getThreadRecords(threadId, ["turnItems"], {
           turnItemRunIds: [run.id],
@@ -75,12 +86,9 @@ const make = Effect.gen(function* () {
       }
       const providerTurn = Orchestrator.providerTurnForRun(records, run);
       if (providerTurn === undefined) continue;
-      // A turn that ended without a native id, such as a failed or interrupted one, may sit beside
-      // output of its own in the transcript, so nothing after it can be told apart.
-      // Claude gives a finished turn a weak ref holding its last record's uuid; a strong one is
-      // the placeholder of a turn that never finished.
-      const turnRef = providerTurn.nativeTurnRef;
-      return turnRef?.strength === "weak" ? turnRef.nativeId : null;
+      // A turn with no record uuid, such as one that failed before Claude wrote anything, may sit
+      // beside output of its own in the transcript, so nothing after it can be told apart.
+      return claudeTurnCursor(providerTurn);
     }
     const { turnItems } = yield* orchestrator.getThreadRecords(threadId, ["turnItems"], {
       turnItemRunIds: [null],
@@ -127,17 +135,25 @@ const make = Effect.gen(function* () {
       ...(previous?.anchor === anchorNativeId ? { unchangedSince: previous.signature } : {}),
     });
     if (read._tag === "Unchanged") return 0;
-    if (read.signature !== undefined) {
-      lastRead.set(providerThread.id, { anchor: anchorNativeId, signature: read.signature });
-    }
+    // Only a read that leaves nothing to retry is remembered; a refused command reads again.
+    const remember = (anchor: string) => {
+      if (read.signature !== undefined) {
+        lastRead.set(providerThread.id, { anchor, signature: read.signature });
+      }
+    };
     if (read._tag === "AnchorNotFound") {
+      remember(anchorNativeId);
       yield* Effect.logWarning("Transcript sync could not find its anchor in the session", {
         threadId,
         anchorNativeId,
       });
       return 0;
     }
-    if (read._tag !== "Turns" || read.turns.length === 0) return 0;
+    if (read._tag !== "Turns") return 0;
+    if (read.turns.length === 0) {
+      remember(anchorNativeId);
+      return 0;
+    }
 
     const latestRunOrdinal = runs.reduce((max, run) => Math.max(max, run.ordinal), 0);
     const recorded = yield* orchestrator
@@ -157,9 +173,7 @@ const make = Effect.gen(function* () {
         // The thread changed since it was read; the next trigger reads it again.
         Effect.catchTags({ OrchestratorCommandRejectedError: () => Effect.succeed(0) }),
       );
-    if (recorded > 0 && read.signature !== undefined) {
-      lastRead.set(providerThread.id, { anchor: read.throughNativeId, signature: read.signature });
-    }
+    if (recorded > 0) remember(read.throughNativeId);
     return recorded;
   });
 

@@ -56,6 +56,7 @@ const layerStores = Layer.mergeAll(
 
 const threadId = ThreadId.make("thread:sync");
 const providerThreadId = ProviderThreadId.make("provider-thread:sync");
+const earlierProviderThreadId = ProviderThreadId.make("provider-thread:earlier");
 
 const terminalTurn: OrchestrationV2TranscriptTurn = {
   userNativeId: "u-terminal",
@@ -73,8 +74,8 @@ type SeedRun = {
    * one, or `"never-started"` for a run that never reached the provider.
    */
   readonly turn: string;
-  /** Claude names a turn that did not finish with a strong id of its own, not a record's uuid. */
-  readonly turnStrength?: "strong" | "weak";
+  /** A provider thread other than the active one, which holds the same native session. */
+  readonly onEarlierProviderThread?: true;
 };
 
 const seed = Effect.fn("TranscriptSyncService.test.seed")(function* (input: {
@@ -100,6 +101,16 @@ const seed = Effect.fn("TranscriptSyncService.test.seed")(function* (input: {
     createdBy: "user",
     creationSource: "web",
   });
+  // The thread's active provider thread is the one written last.
+  if (input.runs.some((run) => run.onEarlierProviderThread === true)) {
+    yield* projections.apply({
+      id: EventId.make("sync:earlier-provider-thread"),
+      type: "provider-thread.updated",
+      threadId,
+      occurredAt: now,
+      payload: { ...providerThreadAt(now, false), id: earlierProviderThreadId },
+    });
+  }
   yield* projections.apply({
     id: EventId.make("sync:provider-thread"),
     type: "provider-thread.updated",
@@ -150,7 +161,8 @@ const seed = Effect.fn("TranscriptSyncService.test.seed")(function* (input: {
         ordinal,
         providerInstanceId: instanceId,
         modelSelection,
-        providerThreadId,
+        providerThreadId:
+          run.onEarlierProviderThread === true ? earlierProviderThreadId : providerThreadId,
         userMessageId: MessageId.make(`message:${ordinal}`),
         rootNodeId: null,
         activeAttemptId: reachedProvider ? attemptId : null,
@@ -170,13 +182,12 @@ const seed = Effect.fn("TranscriptSyncService.test.seed")(function* (input: {
         occurredAt: now,
         payload: {
           id: ProviderTurnId.make(`provider-turn:${ordinal}`),
-          providerThreadId,
+          providerThreadId:
+            run.onEarlierProviderThread === true ? earlierProviderThreadId : providerThreadId,
           nodeId: NodeId.make(`node:${ordinal}`),
           runAttemptId: attemptId,
           nativeTurnRef:
-            run.turn === "no-native-id"
-              ? null
-              : { driver, nativeId: run.turn, strength: run.turnStrength ?? "weak" },
+            run.turn === "no-native-id" ? null : { driver, nativeId: run.turn, strength: "weak" },
           ordinal,
           status: "completed",
           startedAt: now,
@@ -269,6 +280,17 @@ it.effect.each([
         { status: "completed", turn: "a-t3" },
         { status: "cancelled", turn: "never-started" },
       ],
+    },
+    anchor: "a-t3",
+  },
+  {
+    name: "a run on an earlier provider thread of the same native session still anchors",
+    seeded: {
+      runs: [
+        { status: "completed", turn: "a-t3", onEarlierProviderThread: true },
+        { status: "failed", turn: "never-started" },
+      ],
+      importedItems: ["a-imported"],
     },
     anchor: "a-t3",
   },
@@ -373,8 +395,9 @@ it.effect.each([
     seeded: { runs: [{ status: "failed", turn: "no-native-id" }] },
   },
   {
+    // Claude writes a weak ref holding `turn:<attempt>` for a turn that never produced a record.
     name: "the latest run ended with a turn id that names no transcript record",
-    seeded: { runs: [{ status: "failed", turn: "attempt-turn", turnStrength: "strong" }] },
+    seeded: { runs: [{ status: "failed", turn: "turn:attempt-1" }] },
   },
   { name: "nothing has anchored the thread yet", seeded: { runs: [] } },
   {
@@ -493,5 +516,66 @@ it.effect("starts a sync in the background without waiting for it", () =>
     yield* service.syncInBackground(threadId);
 
     assert.equal(yield* Deferred.await(read), "a-t3");
+  }).pipe(Effect.provide(layerStores)),
+);
+
+it.effect("reads again after a dispatch the thread refused, though the file is unchanged", () =>
+  Effect.gen(function* () {
+    const projections = yield* seed({ runs: [{ status: "completed", turn: "a-t3" }] });
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const asked: Array<AgentSessionScanner.TranscriptSignature | undefined> = [];
+    let reads = 0;
+    const service = yield* TranscriptSyncService.TranscriptSyncService.pipe(
+      Effect.provide(
+        TranscriptSyncService.layer.pipe(
+          Layer.provide(
+            Layer.mergeAll(
+              Layer.mock(AgentSessionScanner.AgentSessionScanner)({
+                readTurnsAfter: ({ unchangedSince }) =>
+                  Effect.gen(function* () {
+                    asked.push(unchangedSince);
+                    if (unchangedSince !== undefined) return { _tag: "Unchanged" as const };
+                    reads += 1;
+                    if (reads === 1) {
+                      // A run appears between the read and the command, so the command is refused.
+                      const now = yield* DateTime.now;
+                      yield* projections.apply({
+                        id: EventId.make("sync:late-run"),
+                        type: "run.created",
+                        threadId,
+                        occurredAt: now,
+                        payload: {
+                          id: RunId.make("run:late"),
+                          threadId,
+                          ordinal: 2,
+                          providerInstanceId: instanceId,
+                          modelSelection,
+                          providerThreadId,
+                          userMessageId: MessageId.make("message:late"),
+                          rootNodeId: null,
+                          activeAttemptId: null,
+                          status: "cancelled",
+                          requestedAt: now,
+                          startedAt: null,
+                          completedAt: now,
+                          checkpointId: null,
+                          contextHandoffId: null,
+                        },
+                      });
+                    }
+                    return { ...turnsOf("one"), signature };
+                  }),
+              }),
+              Layer.succeed(Orchestrator.OrchestratorV2, orchestrator),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    assert.equal(yield* service.sync(threadId), 0);
+    assert.equal(yield* service.sync(threadId), 1);
+
+    assert.deepEqual(asked, [undefined, undefined]);
   }).pipe(Effect.provide(layerStores)),
 );
