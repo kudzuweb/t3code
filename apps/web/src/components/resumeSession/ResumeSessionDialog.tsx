@@ -96,7 +96,14 @@ function ProjectSessions(props: { readonly projectRef: ScopedProjectRef }) {
   const importingRef = useRef(false);
   const [failure, setFailure] = useState<string | null>(null);
 
-  const rows = buildResumeSessionRows(sessions.data?.sessions ?? []);
+  // A cached list can name threads that were deleted or created since, so "In T3" waits for an
+  // answer from this open. Until then a pick goes through the server, which resolves it correctly.
+  const [openedAt] = useState(() => Date.now());
+  const isFresh = sessions.dataUpdatedAt >= openedAt;
+  const cachedSessions = sessions.data?.sessions ?? [];
+  const rows = buildResumeSessionRows(
+    isFresh ? cachedSessions : cachedSessions.map((session) => ({ ...session, threadId: null })),
+  );
   const visibleRows = filterResumeSessionRows(rows, search);
   const [searchSeen, setSearchSeen] = useState(search);
   if (searchSeen !== search) {
@@ -148,6 +155,7 @@ function ProjectSessions(props: { readonly projectRef: ScopedProjectRef }) {
     // The server import finishes either way; a dialog closed or reopened meanwhile stays put.
     if (appAtomRegistry.get(resumeSessionRequestAtom) !== openedFor) return;
     if (result._tag === "Success") {
+      sessions.refresh();
       openThread(result.value.threadId);
       return;
     }
@@ -200,6 +208,11 @@ function ProjectSessions(props: { readonly projectRef: ScopedProjectRef }) {
       {failure !== null ? (
         <p className="shrink-0 border-b px-3 py-2 text-destructive text-xs" role="alert">
           {failure}
+        </p>
+      ) : null}
+      {!isFresh && sessions.data !== null ? (
+        <p className="flex shrink-0 items-center gap-2 border-b px-3 py-1.5 text-muted-foreground text-xs">
+          <Spinner size="sm" /> <T>Refreshing…</T>
         </p>
       ) : null}
       {status ?? (

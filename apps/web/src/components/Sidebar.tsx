@@ -73,6 +73,7 @@ import {
   ChevronDownIcon,
   FolderIcon,
   FolderPlusIcon,
+  HistoryIcon,
   PlusIcon,
   SettingsIcon,
 } from "lucide-react";
@@ -1264,6 +1265,15 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
       suppressNextScopeChangeRef.current = true;
       dispatchProjectScopeMenu({ type: "project-settings-opened" });
       openProjectSettings(projectGroup);
+    },
+  );
+  const handleResumeSession = useStableCallback(
+    (event: ReactMouseEvent<HTMLElement>, projectGroup: SidebarProjectSnapshot) => {
+      event.preventDefault();
+      event.stopPropagation();
+      suppressNextScopeChangeRef.current = true;
+      dispatchProjectScopeMenu({ type: "project-settings-opened" });
+      openResumeSessionDialog(scopeProjectRef(projectGroup.environmentId, projectGroup.id));
     },
   );
   const startThreadInProjectFolder = useStableCallback((group: SidebarProjectSnapshot) => {
@@ -3257,6 +3267,19 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                                       onToggle={() => toggleProjectGroupPin(project)}
                                     />
                                   ) : null
+                                }
+                                resume={
+                                  <Button
+                                    size="icon-xs"
+                                    variant="ghost-muted"
+                                    tabIndex={-1}
+                                    aria-hidden="true"
+                                    title={gt("Resume session…")}
+                                    onPointerDown={(event) => event.stopPropagation()}
+                                    onClick={(event) => handleResumeSession(event, project)}
+                                  >
+                                    <HistoryIcon className="size-3.5" />
+                                  </Button>
                                 }
                                 settings={
                                   <Button
