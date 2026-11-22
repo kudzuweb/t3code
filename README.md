@@ -8,6 +8,8 @@
 
 <p align="center">The open-source control plane for coding agents.</p>
 
+<p align="center"><em>This is a fork of <a href="https://github.com/pingdotgg/t3code">pingdotgg/t3code</a>. <a href="FORK.md">FORK.md</a> lists what differs.</em></p>
+
 <p align="center">
   <a href="https://t3.codes/download"><strong>Download</strong></a> ·
   <a href="https://apps.apple.com/us/app/t3-code-remote-claude-more/id6787819824">iOS</a> ·
