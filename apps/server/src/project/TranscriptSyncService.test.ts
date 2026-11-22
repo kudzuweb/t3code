@@ -74,6 +74,10 @@ type SeedRun = {
    * one, or `"never-started"` for a run that never reached the provider.
    */
   readonly turn: string;
+  /** How the adapter left the provider turn; it ends as completed, but a late write can undo that. */
+  readonly turnStatus?: "running" | "completed" | "failed";
+  /** The adapter writes its `turn:<attempt>` placeholder strong while a turn runs, weak otherwise. */
+  readonly turnStrength?: "strong" | "weak";
   /** A provider thread other than the active one, which holds the same native session. */
   readonly onEarlierProviderThread?: true;
 };
@@ -187,11 +191,13 @@ const seed = Effect.fn("TranscriptSyncService.test.seed")(function* (input: {
           nodeId: NodeId.make(`node:${ordinal}`),
           runAttemptId: attemptId,
           nativeTurnRef:
-            run.turn === "no-native-id" ? null : { driver, nativeId: run.turn, strength: "weak" },
+            run.turn === "no-native-id"
+              ? null
+              : { driver, nativeId: run.turn, strength: run.turnStrength ?? "weak" },
           ordinal,
-          status: "completed",
+          status: run.turnStatus ?? "completed",
           startedAt: now,
-          completedAt: now,
+          completedAt: run.turnStatus === "running" ? null : now,
         },
       });
     }
@@ -398,6 +404,23 @@ it.effect.each([
     // Claude writes a weak ref holding `turn:<attempt>` for a turn that never produced a record.
     name: "the latest run ended with a turn id that names no transcript record",
     seeded: { runs: [{ status: "failed", turn: "turn:attempt-1" }] },
+  },
+  {
+    name: "the provider turn never ended, though it holds a real cursor",
+    seeded: { runs: [{ status: "completed", turn: "a-t3", turnStatus: "running" }] },
+  },
+  {
+    name: "a late usage write left the provider turn running with its placeholder",
+    seeded: {
+      runs: [
+        {
+          status: "completed",
+          turn: "turn:attempt-1",
+          turnStatus: "running",
+          turnStrength: "strong",
+        },
+      ],
+    },
   },
   { name: "nothing has anchored the thread yet", seeded: { runs: [] } },
   {

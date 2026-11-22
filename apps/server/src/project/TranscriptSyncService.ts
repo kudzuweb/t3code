@@ -2,6 +2,7 @@ import {
   CommandId,
   OrchestrationV2SyncTranscriptTurnsError,
   type OrchestrationV2ProviderThread,
+  type OrchestrationV2ProviderTurn,
   type OrchestrationV2Run,
   type OrchestrationV2TurnItem,
   type ProviderThreadId,
@@ -33,6 +34,12 @@ export class TranscriptSyncService extends Context.Service<
     readonly syncInBackground: (threadId: ThreadId) => Effect.Effect<void>;
   }
 >()("t3/project/TranscriptSyncService") {}
+
+const providerTurnEnded = (turn: OrchestrationV2ProviderTurn) =>
+  turn.status === "completed" ||
+  turn.status === "interrupted" ||
+  turn.status === "failed" ||
+  turn.status === "cancelled";
 
 const isTerminal = (run: OrchestrationV2Run) =>
   run.status !== "preparing" &&
@@ -86,9 +93,9 @@ const make = Effect.gen(function* () {
       }
       const providerTurn = Orchestrator.providerTurnForRun(records, run);
       if (providerTurn === undefined) continue;
-      // A turn with no record uuid, such as one that failed before Claude wrote anything, may sit
-      // beside output of its own in the transcript, so nothing after it can be told apart.
-      return claudeTurnCursor(providerTurn);
+      // A turn that never ended, or ended with no record uuid (it failed before Claude wrote
+      // anything), may sit beside output of its own, so nothing after it can be told apart.
+      return providerTurnEnded(providerTurn) ? claudeTurnCursor(providerTurn) : null;
     }
     const { turnItems } = yield* orchestrator.getThreadRecords(threadId, ["turnItems"], {
       turnItemRunIds: [null],
