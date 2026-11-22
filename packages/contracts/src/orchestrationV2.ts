@@ -790,6 +790,17 @@ export const OrchestrationV2RunOutput = Schema.Struct({
 });
 export type OrchestrationV2RunOutput = typeof OrchestrationV2RunOutput.Type;
 
+/** One prompt and the assistant text that answered it, as read from a provider's transcript. */
+export const OrchestrationV2TranscriptTurn = Schema.Struct({
+  userNativeId: TrimmedNonEmptyString,
+  userText: Schema.String,
+  userAt: IsoDateTime,
+  assistantNativeId: Schema.NullOr(TrimmedNonEmptyString),
+  assistantText: Schema.String,
+  assistantAt: Schema.NullOr(IsoDateTime),
+});
+export type OrchestrationV2TranscriptTurn = typeof OrchestrationV2TranscriptTurn.Type;
+
 export const OrchestrationV2Run = Schema.Struct({
   id: RunId,
   threadId: ThreadId,
@@ -827,6 +838,8 @@ export const OrchestrationV2Run = Schema.Struct({
   workspacePreparation: Schema.optional(OrchestrationV2ThreadLaunchWorkspaceStrategy),
   /** Starts a new provider conversation; earlier runs stay visible but never reach the provider. */
   freshContext: Schema.optional(Schema.Boolean),
+  /** Set on a run T3 wrote from a transcript of turns made outside T3; it has no provider turn. */
+  recordedFrom: Schema.optional(Schema.Literal("transcript")),
   /** The JSON Schema of the result this run was asked to return as data. */
   outputSchema: Schema.optional(Schema.Record(Schema.String, Schema.Json)),
   /**
@@ -4006,6 +4019,19 @@ const OrchestrationV2InternalCommand = Schema.Union([
       }),
     ),
   }),
+  /**
+   * Records turns made outside T3 in a provider's transcript as completed runs. Internal so only
+   * the transcript sync, which has read the transcript, can write history that never ran in T3.
+   */
+  Schema.Struct({
+    type: Schema.Literal("transcript_turns.record"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    providerThreadId: ProviderThreadId,
+    /** The latest run ordinal the reader saw, 0 when the thread had no runs. */
+    expectedLatestRunOrdinal: NonNegativeInt,
+    turns: Schema.Array(OrchestrationV2TranscriptTurn),
+  }),
 ]);
 export type OrchestrationV2InternalCommand = typeof OrchestrationV2InternalCommand.Type;
 
@@ -4028,6 +4054,7 @@ export const ORCHESTRATION_V2_WS_METHODS = {
   getWorkflowScript: "orchestration.getWorkflowScript",
   getNativeChildWork: "orchestration.getNativeChildWork",
   stopWorkflow: "orchestration.stopWorkflow",
+  syncTranscriptTurns: "orchestration.syncTranscriptTurns",
   forceStopThread: "orchestration.forceStopThread",
   getTurnItem: "orchestration.getTurnItem",
   launchThread: "orchestration.launchThread",
@@ -4423,6 +4450,23 @@ export class OrchestrationV2ThreadLaunchError extends Schema.TaggedError<Orchest
   },
 ) {}
 
+export const OrchestrationV2SyncTranscriptTurnsInput = Schema.Struct({ threadId: ThreadId });
+export type OrchestrationV2SyncTranscriptTurnsInput =
+  typeof OrchestrationV2SyncTranscriptTurnsInput.Type;
+
+export const OrchestrationV2SyncTranscriptTurnsResult = Schema.Struct({ recorded: NonNegativeInt });
+export type OrchestrationV2SyncTranscriptTurnsResult =
+  typeof OrchestrationV2SyncTranscriptTurnsResult.Type;
+
+export class OrchestrationV2SyncTranscriptTurnsError extends Schema.TaggedError<OrchestrationV2SyncTranscriptTurnsError>()(
+  "OrchestrationV2SyncTranscriptTurnsError",
+  { threadId: ThreadId, cause: Schema.optional(Schema.Defect()) },
+) {
+  override get message(): string {
+    return "Failed to bring this thread up to date with its session.";
+  }
+}
+
 export const OrchestrationV2StopWorkflowInput = Schema.Struct({
   threadId: ThreadId,
   subagentId: NodeId,
@@ -4728,6 +4772,10 @@ export const OrchestrationV2RpcSchemas = {
   stopWorkflow: {
     input: OrchestrationV2StopWorkflowInput,
     output: Schema.Void,
+  },
+  syncTranscriptTurns: {
+    input: OrchestrationV2SyncTranscriptTurnsInput,
+    output: OrchestrationV2SyncTranscriptTurnsResult,
   },
   forceStopThread: {
     input: OrchestrationV2ForceStopThreadInput,

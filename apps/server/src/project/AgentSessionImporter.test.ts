@@ -92,8 +92,18 @@ function candidate(
       updatedAt: timestamp,
       omittedMessageCount: 0,
       messages: [
-        { role: "user" as const, text: "Fix it", createdAt: timestamp },
-        { role: "assistant" as const, text: "Fixed", createdAt: timestamp },
+        {
+          role: "user" as const,
+          text: "Fix it",
+          createdAt: timestamp,
+          nativeId: `${providerSessionId}:first`,
+        },
+        {
+          role: "assistant" as const,
+          text: "Fixed",
+          createdAt: timestamp,
+          nativeId: `${providerSessionId}:last`,
+        },
       ],
     },
     worktree: null as { path: string; branch: string | null } | null,
@@ -1104,9 +1114,18 @@ describe("importing one session", () => {
       const records = yield* projections.getThreadRecords(first.threadId, [
         "messages",
         "providerThreads",
+        "turnItems",
       ]);
       expect(records.messages.map((message) => message.text)).toEqual(["Fix it", "Fixed"]);
       expect(records.providerThreads[0]?.nativeThreadRef?.nativeId).toBe(claudeId);
+      // The next sync reads from the native record of the last imported item.
+      expect(
+        records.turnItems.map((item) => [item.nativeItemRef?.driver, item.nativeItemRef?.nativeId]),
+      ).toEqual([
+        ["claudeAgent", `${claudeId}:first`],
+        ["claudeAgent", `${claudeId}:last`],
+      ]);
+      expect(records.providerThreads[0]?.nativeMetadata ?? null).toBeNull();
 
       const writtenBefore = (yield* events
         .read({ threadId: first.threadId })
@@ -1118,6 +1137,19 @@ describe("importing one session", () => {
       expect(
         (yield* events.read({ threadId: first.threadId }).pipe(Stream.runCollect)).length,
       ).toBe(writtenBefore);
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+  );
+
+  it.effect("leaves the native item refs of a Codex import empty", () =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const source = candidate(CODEX_MODEL_SELECTION, "codex-session");
+      const importer = yield* makeImporter([source]);
+
+      const imported = yield* importer.importSession(source);
+
+      const records = yield* projections.getThreadRecords(imported.threadId, ["turnItems"]);
+      expect(records.turnItems.map((item) => item.nativeItemRef)).toEqual([null, null]);
     }).pipe(Effect.scoped, Effect.provide(persistence)),
   );
 

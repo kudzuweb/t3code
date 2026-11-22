@@ -36,6 +36,7 @@ import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as AgentSessionScanner from "./AgentSessionScanner.ts";
+import * as ClaudeSessionChain from "./ClaudeSessionChain.ts";
 
 const makeProjectShell = (workspaceRoot: string): OrchestrationProjectShell => ({
   id: ProjectId.make("project-1"),
@@ -67,6 +68,10 @@ interface ScannerTestInput {
     readonly sources: ReadonlyArray<AgentSessionImportSource>;
   };
   readonly processRunner?: Layer.Layer<ProcessRunner.ProcessRunner>;
+  /** What the Claude session reader reports as the live chain of uuids, by session id. */
+  readonly claudeChains?: Readonly<Record<string, ReadonlyArray<string>>>;
+  /** Collects the directory each chain read was given. */
+  readonly claudeChainDirectories?: Array<string | undefined>;
 }
 
 const layerRuntimeRepository = (imported: ScannerTestInput["importedTranscripts"]) =>
@@ -90,50 +95,58 @@ const layerRuntimeRepository = (imported: ScannerTestInput["importedTranscripts"
   });
 
 const layerScannerTest = (input: ScannerTestInput) =>
-  (input.processRunner === undefined
-    ? AgentSessionScanner.layer
-    : Layer.effect(AgentSessionScanner.AgentSessionScanner, AgentSessionScanner.make).pipe(
-        Layer.provide(input.processRunner),
-      )
-  ).pipe(
-    Layer.provide(
-      Layer.mergeAll(
-        ServerSettings.layerTest({
-          providerInstances: {
-            [ProviderInstanceId.make("claudeAgent")]: {
-              driver: ProviderDriverKind.make("claudeAgent"),
-              config: { homePath: input.claudeHomePath },
-            },
-            [ProviderInstanceId.make("codex")]: {
-              driver: ProviderDriverKind.make("codex"),
-              config: { homePath: input.codexHomePath },
-            },
-            // Keeps the default Pi instance off the developer's real ~/.pi.
-            [ProviderInstanceId.make("pi")]: {
-              driver: ProviderDriverKind.make("pi"),
-              enabled: true,
-              environment: [
-                {
-                  name: "PI_CODING_AGENT_DIR",
-                  value: input.piAgentDir ?? `${input.claudeHomePath}/pi-agent`,
-                  sensitive: false,
-                },
-                { name: "PI_CODING_AGENT_SESSION_DIR", value: "", sensitive: false },
-              ],
-              config: {},
-            },
-            ...input.providerInstances,
-          },
+  Layer.effect(AgentSessionScanner.AgentSessionScanner, AgentSessionScanner.make)
+    .pipe(
+      Layer.provide(input.processRunner ?? ProcessRunner.layer),
+      Layer.provide(
+        Layer.succeed(ClaudeSessionChain.ClaudeSessionChain, {
+          read: ({ sessionId, directory }) =>
+            Effect.sync(() => {
+              input.claudeChainDirectories?.push(directory);
+              return input.claudeChains?.[sessionId] ?? [];
+            }),
         }),
-        ServerConfig.layerTest(
-          input.claudeHomePath,
-          input.configBaseDir ?? { prefix: "t3code-scanner-config-" },
-        ),
-        layerProjectStore(input.importedWorkspaceRoots ?? []),
-        layerRuntimeRepository(input.importedTranscripts),
       ),
-    ),
-  );
+    )
+    .pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          ServerSettings.layerTest({
+            providerInstances: {
+              [ProviderInstanceId.make("claudeAgent")]: {
+                driver: ProviderDriverKind.make("claudeAgent"),
+                config: { homePath: input.claudeHomePath },
+              },
+              [ProviderInstanceId.make("codex")]: {
+                driver: ProviderDriverKind.make("codex"),
+                config: { homePath: input.codexHomePath },
+              },
+              // Keeps the default Pi instance off the developer's real ~/.pi.
+              [ProviderInstanceId.make("pi")]: {
+                driver: ProviderDriverKind.make("pi"),
+                enabled: true,
+                environment: [
+                  {
+                    name: "PI_CODING_AGENT_DIR",
+                    value: input.piAgentDir ?? `${input.claudeHomePath}/pi-agent`,
+                    sensitive: false,
+                  },
+                  { name: "PI_CODING_AGENT_SESSION_DIR", value: "", sensitive: false },
+                ],
+                config: {},
+              },
+              ...input.providerInstances,
+            },
+          }),
+          ServerConfig.layerTest(
+            input.claudeHomePath,
+            input.configBaseDir ?? { prefix: "t3code-scanner-config-" },
+          ),
+          layerProjectStore(input.importedWorkspaceRoots ?? []),
+          layerRuntimeRepository(input.importedTranscripts),
+        ),
+      ),
+    );
 
 const runScan = (input: ScannerTestInput) =>
   Effect.gen(function* () {
@@ -1827,6 +1840,103 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
       }),
     );
 
+    it.effect("reads the turns a Claude session gained after an anchor, from the newest copy", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const line = (uuid: string, parentUuid: string | null, type: string, content: string) =>
+          encodeTranscriptRecord({
+            type,
+            uuid,
+            parentUuid,
+            sessionId: "claude-live",
+            cwd: "/work/project",
+            timestamp: "2026-11-20T10:00:00.000Z",
+            message: { role: type, content, stop_reason: "end_turn" },
+          });
+        const transcript = (...lines: ReadonlyArray<string>) => `${lines.join("\n")}\n`;
+        const live = transcript(
+          line("u1", null, "user", "imported prompt"),
+          line("a2", "u1", "assistant", "imported reply"),
+          encodeTranscriptRecord({ type: "last-prompt", lastPrompt: "imported prompt" }),
+          line("u3", "a2", "user", "terminal prompt"),
+          line("a4", "u3", "assistant", "terminal reply"),
+        );
+        yield* writeTranscript({
+          filePath: path.join(claudeHomePath, "projects", "-live", "claude-live.jsonl"),
+          contents: live,
+          mtimeMs: 2_000_000,
+        });
+        // A stale copy under another project folder must not win.
+        yield* writeTranscript({
+          filePath: path.join(claudeHomePath, "projects", "-stale", "claude-live.jsonl"),
+          contents: transcript(line("u1", null, "user", "imported prompt")),
+          mtimeMs: 1_000_000,
+        });
+        const chainDirectories: Array<string | undefined> = [];
+        const scanner = yield* AgentSessionScanner.AgentSessionScanner.pipe(
+          Effect.provide(
+            layerScannerTest({
+              claudeHomePath,
+              codexHomePath,
+              claudeChains: {
+                "claude-live": ["u1", "a2", "u3", "a4"],
+                // The session reader found a different copy of this session than the scanner did.
+                "claude-mismatch": ["other-1", "other-2"],
+              },
+              claudeChainDirectories: chainDirectories,
+            }),
+          ),
+        );
+        const read = (providerSessionId: string, driver: string, anchorNativeId: string) =>
+          scanner.readTurnsAfter({
+            driver: ProviderDriverKind.make(driver),
+            providerInstanceId: ProviderInstanceId.make(driver),
+            providerSessionId,
+            anchorNativeId,
+          });
+
+        expect(yield* read("claude-live", "claudeAgent", "a2")).toMatchObject({
+          _tag: "Turns",
+          throughNativeId: "a4",
+          turns: [
+            { userNativeId: "u3", userText: "terminal prompt", assistantText: "terminal reply" },
+          ],
+        });
+        // The SDK documents `dir` as the project directory, which the file's own records name.
+        expect(chainDirectories).toEqual(["/work/project"]);
+        expect(yield* read("claude-live", "claudeAgent", "nope")).toMatchObject({
+          _tag: "AnchorNotFound",
+        });
+        yield* writeTranscript({
+          filePath: path.join(claudeHomePath, "projects", "-live", "claude-mismatch.jsonl"),
+          contents: transcript(line("u1", null, "user", "prompt")),
+          mtimeMs: 2_000_000,
+        });
+        expect(yield* read("claude-mismatch", "claudeAgent", "u1")).toEqual({
+          _tag: "NoTranscript",
+        });
+        // A transcript that has not changed since a read is not read again.
+        const first = yield* read("claude-live", "claudeAgent", "a2");
+        const signature = "signature" in first ? first.signature : undefined;
+        expect(signature).toEqual({ size: Buffer.byteLength(live), mtimeMs: 2_000_000 });
+        const readCount = chainDirectories.length;
+        expect(
+          yield* scanner.readTurnsAfter({
+            driver: ProviderDriverKind.make("claudeAgent"),
+            providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+            providerSessionId: "claude-live",
+            anchorNativeId: "a2",
+            ...(signature === undefined ? {} : { unchangedSince: signature }),
+          }),
+        ).toEqual({ _tag: "Unchanged" });
+        expect(chainDirectories).toHaveLength(readCount);
+        expect(yield* read("claude-gone", "claudeAgent", "a2")).toEqual({ _tag: "NoTranscript" });
+        expect(yield* read("claude-live", "codex", "a2")).toEqual({ _tag: "Unsupported" });
+      }),
+    );
+
     it.effect("lists titles from the head and tail of a transcript larger than the sample", () =>
       Effect.gen(function* () {
         const path = yield* Path.Path;
@@ -2995,6 +3105,15 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
                 content: [{ type: "tool_use", id: "toolu_1", name: "Bash", input: {} }],
               },
             }),
+            record({
+              type: "assistant",
+              message: {
+                role: "assistant",
+                model: "claude-sonnet-5-5",
+                stop_reason: "end_turn",
+                content: "Latest reply",
+              },
+            }),
             record({ type: "custom-title", customTitle: "Renamed conversation" }),
             record({ type: "ai-title", aiTitle: "Newest title" }),
             record({ type: "attachment", sessionId: "latest-session" }),
@@ -3017,6 +3136,7 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
               { role: "user", text: "First prompt" },
               { role: "assistant", text: "First reply" },
               { role: "user", text: "Latest prompt" },
+              { role: "assistant", text: "Latest reply" },
             ],
           },
         ]);
@@ -3051,6 +3171,7 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
             // Tool and progress records push the file past the 100,000-record limit.
             ...Array.from({ length: 100_000 }, () => "{}"),
             record({ type: "user", message: { role: "user", content: "Latest prompt" } }),
+            record({ type: "assistant", message: { role: "assistant", content: "Latest reply" } }),
           ].join("\n"),
           mtimeMs: nowMs - 60_000,
         });
@@ -3064,9 +3185,9 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
         expect(outcomes.map((outcome) => outcome._tag)).toEqual(["Importable"]);
         const thread = outcomes[0]?._tag === "Importable" ? outcomes[0].thread : undefined;
         expect(thread?.messages[0]).toMatchObject({ role: "user", text: "First prompt" });
-        expect(thread?.messages.at(-1)).toMatchObject({ role: "user", text: "Latest prompt" });
+        expect(thread?.messages.at(-1)).toMatchObject({ role: "assistant", text: "Latest reply" });
         expect(thread?.messages).toHaveLength(200);
-        expect(thread?.omittedMessageCount).toBe(middleCount + 2 - 200);
+        expect(thread?.omittedMessageCount).toBe(middleCount + 3 - 200);
       }),
     );
 
@@ -4231,5 +4352,398 @@ describe("parseAgentSessionTranscript", () => {
         ? null
         : { title: thread.title, texts: thread.messages.map((message) => message.text) },
     ).toEqual(expected);
+  });
+});
+
+describe("claudeTurnsAfter", () => {
+  const fallback = "2026-11-20T00:00:00.000Z";
+  const record = (
+    uuid: string,
+    parentUuid: string | null,
+    type: "user" | "assistant",
+    text: string,
+    extra: {
+      readonly isSidechain?: boolean;
+      readonly isMeta?: boolean;
+      readonly stopReason?: string | null;
+    } = {},
+  ) => {
+    const { stopReason = "end_turn", ...flags } = extra;
+    return {
+      type,
+      uuid,
+      parentUuid,
+      timestamp: `2026-11-20T10:00:${uuid.slice(1).padStart(2, "0")}.000Z`,
+      message: {
+        role: type,
+        content: text,
+        ...(type === "assistant" ? { stop_reason: stopReason } : {}),
+      },
+      ...flags,
+    };
+  };
+  const records = [
+    record("u1", null, "user", "first prompt"),
+    record("a2", "u1", "assistant", "first reply"),
+    // A subagent line and a meta line share the file but are not conversation.
+    record("a3", "a2", "assistant", "subagent chatter", { isSidechain: true }),
+    record("u4", "a2", "user", "caveat", { isMeta: true }),
+    record("u5", "a2", "user", "second prompt"),
+    {
+      type: "assistant",
+      uuid: "a6",
+      parentUuid: "u5",
+      message: { role: "assistant", content: [] },
+    },
+    record("a7", "a6", "assistant", "second reply"),
+    record("u8", "a7", "user", "third prompt"),
+    record("a9", "u8", "assistant", "third reply, part one"),
+    record("a10", "a9", "assistant", "third reply, part two"),
+    record("u11", "a10", "user", "fourth prompt, not answered yet"),
+  ];
+  // What Claude's session reader lists as the live conversation.
+  const live = ["u1", "a2", "u4", "u5", "a6", "a7", "u8", "a9", "a10", "u11"];
+  const userIds = (read: AgentSessionScanner.TurnsAfterAnchor) =>
+    read._tag === "Turns" ? read.turns.map((entry) => entry.userNativeId) : read;
+  const importOf = (count: number) =>
+    AgentSessionScanner.parseAgentSessionTranscript({
+      contents: records
+        .slice(0, count)
+        .map((entry) => JSON.stringify(entry))
+        .join("\n"),
+      source: "claudeAgent",
+      providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+      fallbackSessionId: "claude-session",
+      lastActiveAtMs: Date.parse("2026-11-20T12:00:00.000Z"),
+    });
+
+  it("returns the turns after the anchor, without hidden records or a prompt still waiting for its reply", () => {
+    expect(AgentSessionScanner.claudeTurnsAfter(records, live, "a2", fallback)).toEqual({
+      _tag: "Turns",
+      throughNativeId: "a10",
+      turns: [
+        {
+          userNativeId: "u5",
+          userText: "second prompt",
+          userAt: "2026-11-20T10:00:05.000Z",
+          assistantNativeId: "a7",
+          assistantText: "second reply",
+          assistantAt: "2026-11-20T10:00:07.000Z",
+        },
+        {
+          userNativeId: "u8",
+          userText: "third prompt",
+          userAt: "2026-11-20T10:00:08.000Z",
+          assistantNativeId: "a10",
+          assistantText: "third reply, part one\n\nthird reply, part two",
+          assistantAt: "2026-11-20T10:00:10.000Z",
+        },
+      ],
+    });
+  });
+
+  it("reports no turns, and keeps the anchor, when nothing new has a reply", () => {
+    expect(AgentSessionScanner.claudeTurnsAfter(records, live, "a10", fallback)).toEqual({
+      _tag: "Turns",
+      throughNativeId: "a10",
+      turns: [],
+    });
+  });
+
+  it("follows the session reader's chain, not a branch a rewind left in the file", () => {
+    const withAbandonedBranch = [
+      ...records,
+      record("u12", "a2", "user", "abandoned prompt"),
+      record("a13", "u12", "assistant", "abandoned reply"),
+    ];
+    expect(
+      userIds(AgentSessionScanner.claudeTurnsAfter(withAbandonedBranch, live, "a2", fallback)),
+    ).toEqual(["u5", "u8"]);
+    expect(
+      AgentSessionScanner.claudeTurnsAfter(withAbandonedBranch, live, "a13", fallback),
+    ).toEqual({ _tag: "AnchorNotFound" });
+  });
+
+  it("stops at a uuid the file has not caught up to and leaves the rest for the next read", () => {
+    const lagging = ["u1", "a2", "u5", "a6", "a7", "not-written-yet", "u8", "a9"];
+    expect(userIds(AgentSessionScanner.claudeTurnsAfter(records, lagging, "a2", fallback))).toEqual(
+      ["u5"],
+    );
+  });
+
+  describe("after Claude compacts the session", () => {
+    // A session made with `claude -p`, resumed twice, then `/compact`ed; ids are the real ones.
+    const compacted = NodeFS.readFileSync(
+      new URL("./fixtures/claude-compacted-session.jsonl", import.meta.url),
+      "utf8",
+    )
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    // What `getSessionMessages` returned for it: the summary, the preserved last reply, the command.
+    const afterCompaction = [
+      "863816e7-bc91-4381-84bf-a0ba35284b90",
+      "0ac5a9ef-3802-456e-a632-bdeaf6c662eb",
+      "386f36df-69ff-4cae-9fc5-6334c5add64a",
+      "2aaee520-27ae-4bb7-94df-daa7b8a0e604",
+    ];
+    const replyTwo = "cc9390";
+    const read = (anchorPrefix: string) =>
+      AgentSessionScanner.claudeTurnsAfter(
+        compacted,
+        afterCompaction,
+        compacted.find((entry) => entry.uuid.startsWith(anchorPrefix))!.uuid,
+        fallback,
+      );
+
+    it("finds an anchor from before the compaction and records what came after it", () => {
+      expect(read(replyTwo)).toMatchObject({
+        _tag: "Turns",
+        // The `/compact` command that followed is a finished turn of its own.
+        turns: [
+          { userText: "Reply with exactly: three", assistantText: "three" },
+          { userText: "/compact", assistantText: "" },
+        ],
+      });
+    });
+
+    it("still finds an anchor the compaction preserved", () => {
+      expect(read("0ac5a9")).toMatchObject({
+        _tag: "Turns",
+        turns: [{ userText: "/compact" }],
+      });
+    });
+  });
+
+  describe("a turn that ends without a reply", () => {
+    const earlier = [
+      record("u0", null, "user", "earlier"),
+      record("a0", "u0", "assistant", "done"),
+    ];
+    const read = (entries: ReadonlyArray<ReturnType<typeof record>>) =>
+      AgentSessionScanner.claudeTurnsAfter(
+        [...earlier, ...entries],
+        ["u0", "a0", ...entries.map((entry) => entry.uuid)],
+        "a0",
+        fallback,
+      );
+    const plain = (uuid: string, parentUuid: string, text: string) => ({
+      ...record(uuid, parentUuid, "user", text),
+      message: { role: "user", content: [{ type: "text", text }] },
+    });
+
+    it("counts an interrupted turn as finished", () => {
+      const interrupted = [
+        record("u1", "a0", "user", "run the build"),
+        record("a2", "u1", "assistant", "Running it.", { stopReason: "tool_use" }),
+        plain("u3", "a2", "[Request interrupted by user for tool use]"),
+      ];
+      expect(read(interrupted)).toMatchObject({
+        _tag: "Turns",
+        throughNativeId: "a2",
+        turns: [{ userNativeId: "u1", assistantText: "Running it." }],
+      });
+    });
+
+    it("counts a shell command or a slash command as finished once its output follows", () => {
+      const commands = [
+        record("u1", "a0", "user", "<bash-input>ls</bash-input>"),
+        record("u2", "u1", "user", "<bash-stdout>README.md</bash-stdout>"),
+        record(
+          "u3",
+          "u2",
+          "user",
+          "<command-name>/context</command-name><command-args></command-args>",
+        ),
+        record("u4", "u3", "user", "<local-command-stdout>Context usage</local-command-stdout>"),
+      ];
+      expect(read(commands)).toMatchObject({
+        _tag: "Turns",
+        throughNativeId: "u3",
+        turns: [
+          { userText: "!ls", assistantNativeId: null, assistantText: "" },
+          { userText: "/context", assistantNativeId: null, assistantText: "" },
+        ],
+      });
+      expect(read(commands.slice(0, 1))).toMatchObject({ turns: [] });
+    });
+
+    it("keeps such a turn in an import", () => {
+      const texts = (entries: ReadonlyArray<unknown>) =>
+        AgentSessionScanner.parseAgentSessionTranscript({
+          contents: [...earlier, ...entries].map((entry) => JSON.stringify(entry)).join("\n"),
+          source: "claudeAgent",
+          providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+          fallbackSessionId: "claude-session",
+          lastActiveAtMs: Date.parse("2026-11-20T12:00:00.000Z"),
+        })?.messages.map((message) => message.text);
+      expect(
+        texts([
+          record("u1", "a0", "user", "run the build"),
+          record("a2", "u1", "assistant", "Running it.", { stopReason: "tool_use" }),
+          plain("u3", "a2", "[Request interrupted by user for tool use]"),
+        ]),
+      ).toEqual(["earlier", "done", "run the build", "Running it."]);
+      expect(
+        texts([
+          record("u1", "a0", "user", "<bash-input>ls</bash-input>"),
+          record("u2", "u1", "user", "<bash-stdout>README.md</bash-stdout>"),
+        ]),
+      ).toEqual(["earlier", "done", "!ls"]);
+    });
+  });
+
+  describe("a session compacted twice", () => {
+    const turn = (
+      user: string,
+      parent: string | null,
+      reply: string,
+      text: string,
+    ): Array<ReturnType<typeof record>> => [
+      record(user, parent, "user", `prompt ${text}`),
+      record(reply, user, "assistant", `reply ${text}`),
+    ];
+    const boundary = (uuid: string, tailUuid: string) => ({
+      type: "system",
+      subtype: "compact_boundary",
+      uuid,
+      parentUuid: null,
+      logicalParentUuid: "never-written",
+      compactMetadata: { preservedSegment: { tailUuid } },
+    });
+    const summary = (uuid: string, parent: string) => ({
+      ...record(uuid, parent, "user", "summary"),
+      isCompactSummary: true,
+    });
+    const history = [
+      ...turn("u1", null, "a2", "one"),
+      ...turn("u3", "a2", "a4", "two"),
+      boundary("b1", "a4"),
+      summary("s1", "b1"),
+      ...turn("u5", "s1", "a6", "three"),
+      boundary("b2", "a6"),
+      summary("s2", "b2"),
+      ...turn("u7", "s2", "a8", "four"),
+    ];
+    // The session reader's live chain after the second compaction.
+    const live = ["s2", "u7", "a8"];
+
+    it("finds an anchor from before either compaction", () => {
+      const userIds = (anchor: string) => {
+        const read = AgentSessionScanner.claudeTurnsAfter(history, live, anchor, fallback);
+        return read._tag === "Turns" ? read.turns.map((entry) => entry.userNativeId) : read;
+      };
+      expect(userIds("a2")).toEqual(["u3", "u5", "u7"]);
+      expect(userIds("a4")).toEqual(["u5", "u7"]);
+      expect(userIds("a6")).toEqual(["u7"]);
+    });
+  });
+
+  it("keeps the text that follows non-visible user records in the same turn", () => {
+    const continued = [
+      record("u1", null, "user", "prompt"),
+      record("a2", "u1", "assistant", "reply before the hook"),
+      record("u3", "a2", "user", "Stop hook feedback: keep going", { isMeta: true }),
+      record("a4", "u3", "assistant", "reply after the hook"),
+      record("u5", "a4", "user", "<task-notification>background task done</task-notification>"),
+      record("a6", "u5", "assistant", "reply to the notification"),
+      record("u7", "a6", "user", "next prompt"),
+      record("a8", "u7", "assistant", "next reply"),
+    ];
+    const turns = AgentSessionScanner.claudeTurnsAfter(
+      [record("u0", null, "user", "earlier"), ...continued],
+      ["u0", ...continued.map((entry) => entry.uuid)],
+      "u0",
+      fallback,
+    );
+    expect(turns).toMatchObject({
+      _tag: "Turns",
+      turns: [
+        {
+          userNativeId: "u1",
+          assistantNativeId: "a6",
+          assistantText:
+            "reply before the hook\n\nreply after the hook\n\nreply to the notification",
+        },
+        { userNativeId: "u7", assistantText: "next reply" },
+      ],
+    });
+  });
+
+  it("records a last turn only once it has finished", () => {
+    const base = ["u1", "a2", "u3", "a4"];
+    const turn = (stopReason: string | null) => [
+      record("u1", null, "user", "prompt"),
+      record("a2", "u1", "assistant", "done"),
+      record("u3", "a2", "user", "next prompt"),
+      record("a4", "u3", "assistant", "reply so far", { stopReason }),
+    ];
+    const midReply = AgentSessionScanner.claudeTurnsAfter(turn("tool_use"), base, "a2", fallback);
+    expect(midReply).toEqual({ _tag: "Turns", throughNativeId: "a2", turns: [] });
+    const streaming = AgentSessionScanner.claudeTurnsAfter(turn(null), base, "a2", fallback);
+    expect(streaming).toEqual(midReply);
+
+    const finished = AgentSessionScanner.claudeTurnsAfter(turn("end_turn"), base, "a2", fallback);
+    expect(finished).toMatchObject({
+      _tag: "Turns",
+      throughNativeId: "a4",
+      turns: [{ userNativeId: "u3", assistantText: "reply so far" }],
+    });
+  });
+
+  it("picks up exactly the turns written after what the import consumed", () => {
+    const anchor = importOf(2)?.messages.at(-1)?.nativeId ?? "";
+    expect(userIds(AgentSessionScanner.claudeTurnsAfter(records, live, anchor, fallback))).toEqual([
+      "u5",
+      "u8",
+    ]);
+  });
+
+  it("imports without a last turn that has not finished, and a later sync records it whole", () => {
+    const importOfRecords = (entries: ReadonlyArray<unknown>) =>
+      AgentSessionScanner.parseAgentSessionTranscript({
+        contents: entries.map((entry) => JSON.stringify(entry)).join("\n"),
+        source: "claudeAgent",
+        providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+        fallbackSessionId: "claude-session",
+        lastActiveAtMs: Date.parse("2026-11-20T12:00:00.000Z"),
+      });
+    const history = [
+      record("u1", null, "user", "first prompt"),
+      record("a2", "u1", "assistant", "first reply"),
+    ];
+    const prompt = record("u3", "a2", "user", "second prompt");
+    const midReply = record("a4", "u3", "assistant", "second reply", { stopReason: "tool_use" });
+    const texts = (entries: ReadonlyArray<unknown>) =>
+      importOfRecords(entries)?.messages.map((message) => message.text);
+
+    expect(texts([...history, prompt])).toEqual(["first prompt", "first reply"]);
+    expect(texts([...history, prompt, midReply])).toEqual(["first prompt", "first reply"]);
+    expect(texts([...history, prompt, record("a4", "u3", "assistant", "second reply")])).toEqual([
+      "first prompt",
+      "first reply",
+      "second prompt",
+      "second reply",
+    ]);
+
+    const anchor = importOfRecords([...history, prompt, midReply])?.messages.at(-1)?.nativeId ?? "";
+    const finished = [...history, prompt, record("a4", "u3", "assistant", "second reply")];
+    expect(
+      userIds(
+        AgentSessionScanner.claudeTurnsAfter(finished, ["u1", "a2", "u3", "a4"], anchor, fallback),
+      ),
+    ).toEqual(["u3"]);
+  });
+
+  it("carries each record's uuid through the import as its native id", () => {
+    expect(importOf(records.length)?.messages.map((message) => message.nativeId)).toEqual([
+      "u1",
+      "a2",
+      "u5",
+      "a7",
+      "u8",
+      "a9",
+      "a10",
+    ]);
   });
 });

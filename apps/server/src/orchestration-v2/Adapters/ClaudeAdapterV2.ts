@@ -1475,8 +1475,8 @@ const claudeConfigDirOf = (
 
 // The SDK reads CLAUDE_CONFIG_DIR from process.env. Isolate custom homes in a
 // worker so concurrent providers keep the server's environment.
-const runClaudeWorker = Effect.fn("runClaudeWorker")(function* (input: {
-  readonly method: "forkSession" | "getSessionMessages";
+export const runClaudeWorker = Effect.fn("runClaudeWorker")(function* (input: {
+  readonly method: "forkSession" | "getSessionMessages" | "getSessionUuids";
   readonly sessionId: string;
   readonly options?: ForkSessionOptions;
   readonly environment: NodeJS.ProcessEnv;
@@ -1509,9 +1509,7 @@ const runClaudeWorker = Effect.fn("runClaudeWorker")(function* (input: {
       },
     ),
     // Complete session histories have no status-probe size limit; stderr stays bounded.
-    input.method === "getSessionMessages"
-      ? { maxStdoutBytes: Number.POSITIVE_INFINITY }
-      : undefined,
+    input.method !== "forkSession" ? { maxStdoutBytes: Number.POSITIVE_INFINITY } : undefined,
   ).pipe(Effect.timeout("30 seconds"));
   if (result.code !== 0) {
     return yield* new ClaudeAgentSdkQueryRunnerError({
@@ -2908,7 +2906,7 @@ const getNativeThreadId = Effect.fnUntraced(function* (
 
 const isSyntheticClaudeTurnId = (nativeTurnId: string): boolean => nativeTurnId.startsWith("turn:");
 
-const claudeTurnCursor = (turn: OrchestrationV2ProviderTurn): string | null => {
+export const claudeTurnCursor = (turn: OrchestrationV2ProviderTurn): string | null => {
   const ref = turn.nativeTurnRef;
   return ref !== null &&
     ref.driver === CLAUDE_PROVIDER &&

@@ -13,6 +13,7 @@ import {
   type AgentSessionProjectCandidate,
   type AgentSessionProjectGit,
   type AgentSessionScanResult,
+  type OrchestrationV2TranscriptTurn,
   type ProviderInstanceConfig,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
@@ -39,6 +40,7 @@ import * as ServerConfig from "../config.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.ts";
+import * as ClaudeSessionChain from "./ClaudeSessionChain.ts";
 import { resolveCodexHomeLayout } from "../provider/Drivers/CodexHomeLayout.ts";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
@@ -117,6 +119,7 @@ const TranscriptMessage = Schema.Struct({
   role: Schema.optional(Schema.String),
   content: Schema.optional(Schema.Union([Schema.String, Schema.Array(TranscriptContentBlock)])),
   model: Schema.optional(Schema.String),
+  stop_reason: Schema.optional(Schema.NullOr(Schema.String)),
 });
 
 const CodexTurnMetadata = Schema.Struct({
@@ -129,6 +132,19 @@ const TranscriptRecord = Schema.Struct({
   id: Schema.optional(Schema.String),
   parentId: Schema.optional(Schema.NullOr(Schema.String)),
   name: Schema.optional(Schema.String),
+  // Claude records form a tree through uuid/parentUuid.
+  uuid: Schema.optional(Schema.String),
+  parentUuid: Schema.optional(Schema.NullOr(Schema.String)),
+  // A compact boundary has no parent; Claude records where the compacted conversation ended.
+  subtype: Schema.optional(Schema.String),
+  logicalParentUuid: Schema.optional(Schema.NullOr(Schema.String)),
+  compactMetadata: Schema.optional(
+    Schema.Struct({
+      preservedSegment: Schema.optional(
+        Schema.Struct({ tailUuid: Schema.optional(Schema.String) }),
+      ),
+    }),
+  ),
   timestamp: Schema.optional(Schema.String),
   cwd: Schema.optional(Schema.String),
   sessionId: Schema.optional(Schema.String),
@@ -207,6 +223,8 @@ export interface AgentSessionThreadMessage {
   readonly role: "user" | "assistant";
   readonly text: string;
   readonly createdAt: string;
+  /** The provider's id for the record this message came from, when the record has one. */
+  readonly nativeId?: string;
 }
 
 export interface AgentSessionThread {
@@ -265,6 +283,19 @@ export class AgentSessionScanner extends Context.Service<
     readonly findProjectSession: (
       input: AgentSessionKey & { readonly workspaceRoot: string },
     ) => Effect.Effect<AgentSessionRecentThread, AgentSessionScanError>;
+    /** What the session gained after `anchorNativeId`. Only Claude sessions can be read so far. */
+    readonly readTurnsAfter: (
+      input: AgentSessionKey & {
+        readonly driver: ProviderDriverKind;
+        readonly anchorNativeId: string;
+        /** A transcript still looking like this was already read, so it is not read again. */
+        readonly unchangedSince?: TranscriptSignature;
+      },
+    ) => Effect.Effect<
+      | (TurnsAfterAnchor & { readonly signature?: TranscriptSignature })
+      | { readonly _tag: "Unchanged" },
+      AgentSessionScanError
+    >;
   }
 >()("t3/project/AgentSessionScanner") {}
 
@@ -395,6 +426,12 @@ interface ClaudeFields {
   readonly title: string | undefined;
   readonly customTitle: string | null;
   readonly model: string | undefined;
+  /** The newest prompt's turn: its reply, how Claude's last record stopped, and any ending record. */
+  readonly turn: {
+    readonly replied: boolean;
+    readonly stopReason: string | null;
+    readonly ended: boolean;
+  };
 }
 
 const emptyClaudeFields: ClaudeFields = {
@@ -402,7 +439,40 @@ const emptyClaudeFields: ClaudeFields = {
   title: undefined,
   customTitle: null,
   model: undefined,
+  turn: { replied: true, stopReason: "end_turn", ended: false },
 };
+
+// What Claude Code writes when a turn stops without a reply: the user interrupts it, or a local
+// command (`!cmd`, a slash command) prints its output.
+const CLAUDE_TURN_ENDING =
+  /^(?:<(?:local-command-stdout|local-command-stderr|bash-stdout|bash-stderr)>|\[Request interrupted by user(?: for tool use)?\]$)/;
+
+// A record without the field, as older transcripts write them, gives no sign the turn is running.
+const claudeStopReason = (record: DecodedTranscriptRecord): string | null =>
+  record.message?.stop_reason === undefined ? "end_turn" : record.message.stop_reason;
+
+/** The one rule for a turn being done, which the import and the sync both apply. */
+const isFinishedClaudeTurn = (turn: ClaudeFields["turn"]) =>
+  turn.ended || (turn.replied && isTerminalStopReason(turn.stopReason));
+
+function foldClaudeTurn(
+  turn: ClaudeFields["turn"],
+  record: DecodedTranscriptRecord,
+): ClaudeFields["turn"] {
+  if (record.type === "user") {
+    if (CLAUDE_TURN_ENDING.test(extractText(record.message?.content)))
+      return { ...turn, ended: true };
+    return claudeVisibleText(record).text.length > 0
+      ? { replied: false, stopReason: null, ended: false }
+      : turn;
+  }
+  if (record.type !== "assistant") return turn;
+  return {
+    ended: turn.ended,
+    replied: turn.replied || claudeVisibleText(record).text.length > 0,
+    stopReason: claudeStopReason(record),
+  };
+}
 
 // Claude Code's model name for its own local errors, such as "Invalid API key".
 const CLAUDE_SYNTHETIC_MODEL = "<synthetic>";
@@ -420,6 +490,7 @@ function foldClaudeFields(fields: ClaudeFields, record: DecodedTranscriptRecord)
         : (claudeTitle(record.customTitle) ?? null),
     // Not a model ID that can be selected when the imported session resumes.
     model: model && model !== CLAUDE_SYNTHETIC_MODEL ? model : fields.model,
+    turn: foldClaudeTurn(fields.turn, record),
   };
 }
 
@@ -483,6 +554,125 @@ function claudeUserText(text: string): { readonly text: string; readonly titleTe
 function claudeVisibleText(record: DecodedTranscriptRecord) {
   const text = extractText(record.message?.content);
   return record.type === "user" ? claudeUserText(text) : { text, titleText: text };
+}
+
+// Claude Code writes the API's stop reason on each assistant record; `tool_use` and null mean the
+// turn is still going.
+const isTerminalStopReason = (stopReason: string | null) =>
+  stopReason === "end_turn" ||
+  stopReason === "max_tokens" ||
+  stopReason === "stop_sequence" ||
+  stopReason === "refusal";
+
+/** What a transcript file looked like when it was last read. */
+export interface TranscriptSignature {
+  readonly size: number;
+  readonly mtimeMs: number;
+}
+
+export type TurnsAfterAnchor =
+  | {
+      readonly _tag: "Turns";
+      readonly turns: ReadonlyArray<OrchestrationV2TranscriptTurn>;
+      /** The last record the turns consumed; the anchor itself when there are none. */
+      readonly throughNativeId: string;
+    }
+  | { readonly _tag: "AnchorNotFound" }
+  | { readonly _tag: "NoTranscript" }
+  | { readonly _tag: "Unsupported" };
+
+/** The conversation each compaction replaced, oldest first, found from where its boundary says it ended. */
+function claudeUuidsBeforeCompaction(
+  records: ReadonlyArray<DecodedTranscriptRecord>,
+  byUuid: ReadonlyMap<string, DecodedTranscriptRecord>,
+): Array<string> {
+  return records
+    .filter((record) => record.subtype === "compact_boundary")
+    .flatMap((boundary) => {
+      const end =
+        byUuid.get(boundary.logicalParentUuid ?? "") ??
+        byUuid.get(boundary.compactMetadata?.preservedSegment?.tailUuid ?? "");
+      const uuids: Array<string> = [];
+      for (
+        let record = end;
+        record?.uuid !== undefined && uuids.length <= byUuid.size;
+        record = byUuid.get(record.parentUuid ?? "")
+      ) {
+        uuids.push(record.uuid);
+      }
+      return uuids.toReversed();
+    });
+}
+
+/**
+ * The turns after the anchor on Claude's live `chain` of uuids. A uuid the transcript has no
+ * record for yet ends the walk, and a last turn not yet finished is left for the next read.
+ */
+export function claudeTurnsAfter(
+  records: ReadonlyArray<DecodedTranscriptRecord>,
+  chain: ReadonlyArray<string>,
+  anchorNativeId: string,
+  fallbackTimestamp: string,
+): TurnsAfterAnchor {
+  const byUuid = new Map(
+    records.flatMap((record) =>
+      record.uuid === undefined ? [] : [[record.uuid, record] as const],
+    ),
+  );
+  // Compaction cuts the live chain at its boundary, so an anchor from before it is only in the
+  // conversation the boundary replaced.
+  let sequence = chain;
+  let anchorIndex = chain.indexOf(anchorNativeId);
+  if (anchorIndex === -1) {
+    sequence = [...new Set([...claudeUuidsBeforeCompaction(records, byUuid), ...chain])];
+    anchorIndex = sequence.indexOf(anchorNativeId);
+  }
+  if (anchorIndex === -1) return { _tag: "AnchorNotFound" };
+
+  const turns: Array<OrchestrationV2TranscriptTurn> = [];
+  const replies: Array<string> = [];
+  let open: { userNativeId: string; userText: string; userAt: string } | undefined;
+  let lastReply: { nativeId: string; at: string } | undefined;
+  let turnState = emptyClaudeFields.turn;
+  let throughNativeId = anchorNativeId;
+  const closeTurn = () => {
+    if (open === undefined) return;
+    turns.push({
+      ...open,
+      assistantNativeId: lastReply?.nativeId ?? null,
+      assistantText: replies.join("\n\n"),
+      assistantAt: lastReply?.at ?? null,
+    });
+    throughNativeId = lastReply?.nativeId ?? open.userNativeId;
+    open = undefined;
+    replies.length = 0;
+    lastReply = undefined;
+  };
+  for (const uuid of sequence.slice(anchorIndex + 1)) {
+    const record = byUuid.get(uuid);
+    if (record === undefined) break;
+    if (
+      record.uuid === undefined ||
+      isHiddenClaudeRecord(record) ||
+      (record.type !== "user" && record.type !== "assistant")
+    ) {
+      continue;
+    }
+    // Text-less records count: a tool call or a block still streaming has no terminal stop reason.
+    turnState = foldClaudeTurn(turnState, record);
+    const { text } = claudeVisibleText(record);
+    if (text.length === 0) continue;
+    const at = normalizeTimestamp(record.timestamp, fallbackTimestamp);
+    if (record.type === "user") {
+      closeTurn();
+      open = { userNativeId: record.uuid, userText: text, userAt: at };
+    } else if (open !== undefined) {
+      replies.push(text);
+      lastReply = { nativeId: record.uuid, at };
+    }
+  }
+  if (open !== undefined && isFinishedClaudeTurn(turnState)) closeTurn();
+  return { _tag: "Turns", turns, throughNativeId };
 }
 
 /** Saved titles can be the raw markup of a user turn, such as the command that opened the session. */
@@ -700,6 +890,7 @@ function parseAgentSessionRecords(
         role: record.message.role,
         text,
         createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
+        ...(record.id === undefined ? {} : { nativeId: record.id }),
         codexResponseUser: false,
       });
       continue;
@@ -719,6 +910,7 @@ function parseAgentSessionRecords(
           role: record.type,
           text,
           createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
+          ...(record.uuid === undefined ? {} : { nativeId: record.uuid }),
           codexResponseUser: false,
         },
         titleText,
@@ -776,12 +968,30 @@ function parseAgentSessionRecords(
     if (record.payload.role === "user" && hasMatchingCodexEventInTurn(extractedText)) {
       continue;
     }
+    const codexNativeId =
+      record.payload.role === "user"
+        ? codexTurnId(record.payload.internal_chat_message_metadata_passthrough)
+        : null;
     retainMessage({
       role: record.payload.role,
       text: extractedText,
       createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
+      ...(codexNativeId === null ? {} : { nativeId: codexNativeId }),
       codexResponseUser: record.payload.role === "user",
     });
+  }
+
+  // A turn still running is left for the sync, which records it whole once it has finished.
+  if (input.source === "claudeAgent" && !isFinishedClaudeTurn(claudeFields.turn)) {
+    const lastPrompt = messages.findLastIndex((message) => message.role === "user");
+    // A session of one running turn has nothing earlier to show, so it stays whole.
+    if (lastPrompt > 0 || (lastPrompt === 0 && droppedMessageCount > 0)) {
+      const unfinished = messages.splice(lastPrompt);
+      conversationMessageCount -= unfinished.length;
+      if (firstUserMessage !== undefined && unfinished.includes(firstUserMessage)) {
+        firstUserMessage = undefined;
+      }
+    }
   }
 
   if (messages.length === 0 && droppedMessageCount === 0) return "empty";
@@ -977,6 +1187,7 @@ export const make = Effect.gen(function* () {
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const projectStore = yield* ProjectStore.ProjectStoreV2;
   const runtimes = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+  const claudeChain = yield* ClaudeSessionChain.ClaudeSessionChain;
   const baseDir = path.resolve(serverConfig.baseDir);
   const worktreesDir = path.resolve(serverConfig.worktreesDir);
   const platform = yield* HostProcess.Platform;
@@ -2577,14 +2788,122 @@ export const make = Effect.gen(function* () {
     return Option.getOrElse(found, (): AgentSessionRecentThread => ({ _tag: "Skipped" }));
   });
 
+  const readTurnsAfter: AgentSessionScanner["Service"]["readTurnsAfter"] = Effect.fn(
+    "AgentSessionScanner.readTurnsAfter",
+  )(function* ({ driver, providerInstanceId, providerSessionId, anchorNativeId, unchangedSince }) {
+    if (driver !== "claudeAgent") return { _tag: "Unsupported" } as const;
+    const readError = (cause: unknown) =>
+      new AgentSessionScanError({ operation: "read-transcript", cause });
+    const settings = yield* serverSettings.getSettings.pipe(
+      Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-settings", cause })),
+    );
+    const instance =
+      settings.providerInstances[providerInstanceId] ??
+      (providerInstanceId === "claudeAgent" ? { driver } : undefined);
+    const claudeSettings =
+      instance === undefined ? Option.none() : decodeClaudeSettings(instance.config ?? {});
+    if (instance === undefined || Option.isNone(claudeSettings)) {
+      return { _tag: "NoTranscript" } as const;
+    }
+    const configuredHome = instance.environment?.findLast(
+      (variable) => variable.name === "CLAUDE_CONFIG_DIR",
+    )?.value;
+    const claudeHome = resolveClaudeConfigDir(
+      claudeSettings.value.homePath,
+      typeof configuredHome === "string" ? configuredHome : hostEnvironment.CLAUDE_CONFIG_DIR,
+    );
+    const projectsDir = path.join(claudeHome, "projects");
+    // The same session id can sit in several project folders; the newest copy is the live one.
+    const projectFolders = yield* listDirectory(projectsDir);
+    const copies = yield* Effect.forEach(projectFolders, (folder) => {
+      const filePath = path.join(projectsDir, folder, `${providerSessionId}.jsonl`);
+      return statOption(filePath).pipe(
+        Effect.map((info) =>
+          Option.isSome(info) && info.value.type === "File"
+            ? [
+                {
+                  filePath,
+                  size: Number(info.value.size),
+                  mtimeMs: Option.match(info.value.mtime, {
+                    onNone: () => 0,
+                    onSome: (mtime) => mtime.getTime(),
+                  }),
+                },
+              ]
+            : [],
+        ),
+      );
+    });
+    const transcript = copies.flat().toSorted((left, right) => right.mtimeMs - left.mtimeMs)[0];
+    if (transcript === undefined) return { _tag: "NoTranscript" } as const;
+
+    const signature = { size: transcript.size, mtimeMs: transcript.mtimeMs };
+    if (unchangedSince?.size === signature.size && unchangedSince.mtimeMs === signature.mtimeMs) {
+      return { _tag: "Unchanged" } as const;
+    }
+
+    const records: Array<DecodedTranscriptRecord> = [];
+    let recordBytes = 0;
+    const reserve = (bytes: number) => {
+      recordBytes += bytes;
+      if (recordBytes > MAX_IMPORT_HISTORY_BYTES) {
+        throw new TranscriptJsonLimitError({
+          message: "Transcript record exceeds the 32 MiB memory budget",
+        });
+      }
+    };
+    yield* fileSystem.stream(transcript.filePath).pipe(
+      Stream.decodeText,
+      Stream.splitLines,
+      Stream.runForEach((line) =>
+        Effect.try({
+          try: () => {
+            if (line.length === 0) return;
+            recordBytes = 0;
+            const reader = createTranscriptJsonReader(reserve, selectTranscriptPath);
+            reader.write(line);
+            const decoded = decodeTranscriptValue(reader.finish());
+            if (Option.isSome(decoded) && decoded.value.uuid !== undefined) {
+              records.push(decoded.value);
+            }
+            if (records.length > MAX_IMPORT_RECORDS) {
+              throw new TranscriptJsonLimitError({ message: "Transcript has too many records" });
+            }
+          },
+          catch: readError,
+        }),
+      ),
+      Effect.mapError(readError),
+    );
+    // The SDK documents `dir` as the session's project directory, which its records name.
+    const projectDirectory = records.find((record) => record.cwd !== undefined)?.cwd;
+    const chain = yield* claudeChain
+      .read({
+        sessionId: providerSessionId,
+        environment: { ...hostEnvironment, CLAUDE_CONFIG_DIR: claudeHome },
+        ...(projectDirectory === undefined ? {} : { directory: projectDirectory }),
+      })
+      .pipe(Effect.mapError(readError));
+    // A chain whose first record this file lacks was read from another copy of the session.
+    if (chain[0] === undefined || !records.some((record) => record.uuid === chain[0])) {
+      return { _tag: "NoTranscript" } as const;
+    }
+    return {
+      ...claudeTurnsAfter(records, chain, anchorNativeId, DateTime.formatIso(yield* DateTime.now)),
+      signature,
+    };
+  });
+
   return AgentSessionScanner.of({
     scan,
     recentThreads,
     listProjectSessions,
     findProjectSession,
+    readTurnsAfter,
   });
 });
 
 export const layer = Layer.effect(AgentSessionScanner, make).pipe(
+  Layer.provide(ClaudeSessionChain.layer),
   Layer.provide(ProcessRunner.layer),
 );

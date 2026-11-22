@@ -26,6 +26,7 @@ import {
   ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE,
   type ChatAttachment,
   CommandId,
+  EventId,
   type GuestMessageId,
   isCompactionCommandMessage,
   isDeliveredProviderTurn,
@@ -713,6 +714,7 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
       return command.parentThreadId;
     case "secret_request.record":
     case "link_request.record":
+    case "transcript_turns.record":
       return command.threadId;
     case "thread.fork":
     case "thread.merge_back":
@@ -6046,6 +6048,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         cause: forkableSourceRunStatusError(sourceRun),
       });
     }
+    // Its run has no provider turn, so no native cutoff exists and the fork could include later turns.
+    if (sourceRun?.recordedFrom === "transcript") {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: "A turn made outside T3 cannot be forked from. Fork from a turn made in T3.",
+      });
+    }
     const sourceProviderThread =
       sourceRun === null ? undefined : providerThreadForRun(sourceProjection, sourceRun);
     const now = command.createdAt ?? (yield* DateTime.now);
@@ -11070,6 +11080,209 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         occurredAt: now,
         payload: turnItem,
       });
+    },
+  );
+
+  /**
+   * Records turns made outside T3 as completed runs, one per turn, in one commit. It emits no
+   * `run.updated`, because idle compaction starts a turn on one, and no effects, so nothing
+   * starts provider work. Ids derive from native record ids, so writing a turn twice fails on the
+   * unique event id instead of duplicating it.
+   */
+  const dispatchTranscriptTurnsRecord = Effect.fn("orchestrationV2.dispatch.transcriptTurnsRecord")(
+    function* (
+      command: Extract<
+        OrchestrationV2InternalCommand,
+        { readonly type: "transcript_turns.record" }
+      >,
+      events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+    ) {
+      const projection = yield* projectionStore
+        .getThreadRecords(command.threadId, ["runs", "providerThreads"])
+        .pipe(
+          Effect.mapError(
+            (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+          ),
+        );
+      const { thread } = projection;
+      const refuse = (reason: string) =>
+        new OrchestratorCommandRejectedError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Thread ${command.threadId} changed while its session was read (${reason}).`,
+        });
+      if (thread.deletedAt !== null) return yield* refuse("thread-deleted");
+      if (projection.runs.some((run) => isActiveRun(run) || run.status === "queued")) {
+        return yield* refuse("run-in-progress");
+      }
+      const latestOrdinal = projection.runs.reduce((max, run) => Math.max(max, run.ordinal), 0);
+      if (latestOrdinal !== command.expectedLatestRunOrdinal) return yield* refuse("runs-changed");
+      const providerThread = projection.providerThreads.find(
+        (candidate) => candidate.id === command.providerThreadId,
+      );
+      if (
+        providerThread === undefined ||
+        providerThread.appThreadId !== command.threadId ||
+        thread.activeProviderThreadId !== command.providerThreadId
+      ) {
+        return yield* refuse("provider-thread-changed");
+      }
+      if (command.turns.length === 0) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "No turns to record.",
+        });
+      }
+
+      // Keyed by the native session, which an instance switch carries to a new provider thread.
+      const idKey = providerThread.nativeThreadRef?.nativeId ?? providerThread.id;
+      const event = (
+        kind: string,
+        nativeId: string,
+        fields: { readonly runId?: RunId; readonly occurredAt: DateTime.Utc },
+        record: Omit<OrchestrationV2DomainEvent, "id" | "threadId" | "occurredAt" | "runId">,
+      ) =>
+        Ref.update(events, (existing) => [
+          ...existing,
+          {
+            ...record,
+            id: EventId.make(`transcript:event:${kind}:${idKey}:${nativeId}`),
+            threadId: command.threadId,
+            providerInstanceId: thread.providerInstanceId,
+            ...fields,
+          } as OrchestrationV2DomainEvent,
+        ]);
+
+      // A turn recorded by an earlier read is skipped, so reading the same turns again is a no-op.
+      const recordedRunIds = new Set(projection.runs.map((run) => run.id));
+      const runIdOf = (turn: (typeof command.turns)[number]) =>
+        RunId.make(`transcript-run:${idKey}:${turn.userNativeId}`);
+      const fresh = command.turns.filter((turn) => !recordedRunIds.has(runIdOf(turn)));
+      for (const [index, turn] of fresh.entries()) {
+        const ordinal = latestOrdinal + index + 1;
+        const runId = runIdOf(turn);
+        const userAt = DateTime.makeUnsafe(turn.userAt);
+        const assistantAt =
+          turn.assistantAt === null ? userAt : DateTime.makeUnsafe(turn.assistantAt);
+        const userMessageId = MessageId.make(`transcript:${idKey}:${turn.userNativeId}`);
+        yield* event(
+          "run",
+          turn.userNativeId,
+          { runId, occurredAt: userAt },
+          {
+            type: "run.created",
+            payload: {
+              id: runId,
+              threadId: command.threadId,
+              ordinal,
+              providerInstanceId: thread.providerInstanceId,
+              modelSelection: thread.modelSelection,
+              providerThreadId: command.providerThreadId,
+              userMessageId,
+              rootNodeId: null,
+              activeAttemptId: null,
+              status: "completed",
+              requestedAt: userAt,
+              startedAt: userAt,
+              completedAt: assistantAt,
+              checkpointId: null,
+              contextHandoffId: null,
+              recordedFrom: "transcript",
+            },
+          },
+        );
+        // Runs twice per turn inside this operation's span.
+        const writeMessage = Effect.fnUntraced(function* (input: {
+          readonly role: "user" | "assistant";
+          readonly nativeId: string;
+          readonly text: string;
+          readonly at: DateTime.Utc;
+        }) {
+          const messageId = MessageId.make(`transcript:${idKey}:${input.nativeId}`);
+          const turnItemId = TurnItemId.make(`transcript:turn-item:${idKey}:${input.nativeId}`);
+          const message: OrchestrationV2ConversationMessage = {
+            createdBy: input.role === "user" ? "user" : "agent",
+            creationSource: "server",
+            id: messageId,
+            threadId: command.threadId,
+            runId,
+            nodeId: null,
+            role: input.role,
+            text: input.text,
+            attachments: [],
+            streaming: false,
+            createdAt: input.at,
+            updatedAt: input.at,
+          };
+          const common = {
+            id: turnItemId,
+            threadId: command.threadId,
+            runId,
+            nodeId: null,
+            providerThreadId: command.providerThreadId,
+            providerTurnId: null,
+            // The next sync reads from the native record of the newest item.
+            nativeItemRef: {
+              driver: providerThread.driver,
+              nativeId: input.nativeId,
+              strength: "strong" as const,
+            },
+            parentItemId: null,
+            ordinal: 0,
+            status: "completed" as const,
+            title: null,
+            startedAt: input.at,
+            completedAt: input.at,
+            updatedAt: input.at,
+          };
+          const turnItem: OrchestrationV2TurnItem =
+            input.role === "user"
+              ? {
+                  ...common,
+                  createdBy: "user",
+                  creationSource: "server",
+                  type: "user_message",
+                  messageId,
+                  inputIntent: "turn_start",
+                  text: input.text,
+                  attachments: [],
+                }
+              : {
+                  ...common,
+                  type: "assistant_message",
+                  messageId,
+                  text: input.text,
+                  streaming: false,
+                };
+          yield* event(
+            "message",
+            input.nativeId,
+            { runId, occurredAt: input.at },
+            { type: "message.updated", payload: message },
+          );
+          yield* event(
+            "turn-item",
+            input.nativeId,
+            { runId, occurredAt: input.at },
+            { type: "turn-item.updated", payload: turnItem },
+          );
+        });
+        yield* writeMessage({
+          role: "user",
+          nativeId: turn.userNativeId,
+          text: turn.userText,
+          at: userAt,
+        });
+        if (turn.assistantText.trim() !== "") {
+          yield* writeMessage({
+            role: "assistant",
+            nativeId: turn.assistantNativeId ?? `${turn.userNativeId}:assistant`,
+            text: turn.assistantText,
+            at: assistantAt,
+          });
+        }
+      }
     },
   );
 
@@ -16103,6 +16316,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "link_request.record":
         yield* dispatchLinkRequestRecord(command, events, effects);
         break;
+      case "transcript_turns.record":
+        yield* dispatchTranscriptTurnsRecord(command, events);
+        break;
       default:
         return yield* dispatchUnsupported(command);
     }
@@ -16233,6 +16449,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           // A read can answer a watch again before a push's reopen lands; nothing is left to clear.
           command.type === "thread.pull-request-watch.checks-reopen" ||
           command.type === "thread.interrupt.unresponsive" ||
+          // Every turn was recorded by an earlier read.
+          command.type === "transcript_turns.record" ||
           command.type === "thread.stop" ||
           command.type === "subagent.stop" ||
           // Closing a share again, or after it ended, is not an error.
@@ -16267,6 +16485,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               organization,
             });
           }
+          // The sync reads the transcript again and sends a new command, so no refusal is recorded.
+          if (command.type === "transcript_turns.record") return yield* cause;
           const rejectedAt = yield* DateTime.now;
           const receipt = yield* eventSink
             .commitRejectedCommand({

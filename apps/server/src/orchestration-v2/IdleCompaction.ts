@@ -59,6 +59,8 @@ export function idleCompactionWindow(
       null,
     );
   if (latestRun?.status !== "completed" || latestRun.completedAt === null) return null;
+  // A terminal session's own cache clock is not tracked here, so T3 must not compact it.
+  if (latestRun.recordedFrom === "transcript") return null;
   const message = messages.find((candidate) => candidate.id === latestRun.userMessageId);
   // Never compact a compaction, so one idle spell compacts at most once.
   if (message === undefined || message.text.trim().toLowerCase() === "/compact") return null;
