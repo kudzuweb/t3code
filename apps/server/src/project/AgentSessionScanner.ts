@@ -120,6 +120,8 @@ const TranscriptMessage = Schema.Struct({
   content: Schema.optional(Schema.Union([Schema.String, Schema.Array(TranscriptContentBlock)])),
   model: Schema.optional(Schema.String),
   stop_reason: Schema.optional(Schema.NullOr(Schema.String)),
+  // Pi writes the reason an assistant message ended on, in camel case.
+  stopReason: Schema.optional(Schema.NullOr(Schema.String)),
 });
 
 const CodexTurnMetadata = Schema.Struct({
@@ -283,7 +285,11 @@ export class AgentSessionScanner extends Context.Service<
     readonly findProjectSession: (
       input: AgentSessionKey & { readonly workspaceRoot: string },
     ) => Effect.Effect<AgentSessionRecentThread, AgentSessionScanError>;
-    /** What the session gained after `anchorNativeId`. Only Claude sessions can be read so far. */
+    /**
+     * What the session gained after `anchorNativeId`. Claude and Pi sessions are read from their
+     * files; a Codex thread is read through its app server by `CodexSessionReader`. For Pi,
+     * `providerSessionId` is the session file's path.
+     */
     readonly readTurnsAfter: (
       input: AgentSessionKey & {
         readonly driver: ProviderDriverKind;
@@ -672,6 +678,63 @@ export function claudeTurnsAfter(
     }
   }
   if (open !== undefined && isFinishedClaudeTurn(turnState)) closeTurn();
+  return { _tag: "Turns", turns, throughNativeId };
+}
+
+/**
+ * The turns after the anchor on Pi's visible branch, the path from its last entry back to the
+ * root. An anchor off that branch, because the user rewound or forked, is not found. A last turn
+ * whose final message is not an assistant message that ended is left for the next read: a tool
+ * result or a message that stopped to call a tool means the turn is still running.
+ */
+function piTurnsAfter(
+  records: ReadonlyArray<DecodedTranscriptRecord>,
+  anchorNativeId: string,
+  fallbackTimestamp: string,
+): TurnsAfterAnchor {
+  const branch = activePiBranch(records);
+  const anchorIndex = branch.findIndex((record) => record.id === anchorNativeId);
+  if (anchorIndex === -1) return { _tag: "AnchorNotFound" };
+
+  const lastMessage = branch.findLast((record) => record.type === "message");
+  const lastTurnEnded =
+    lastMessage !== undefined &&
+    isPiConversationRecord(lastMessage) &&
+    lastMessage.message.role === "assistant" &&
+    lastMessage.message.stopReason !== "toolUse";
+
+  const turns: Array<OrchestrationV2TranscriptTurn> = [];
+  const replies: Array<string> = [];
+  let open: { userNativeId: string; userText: string; userAt: string } | undefined;
+  let lastReply: { nativeId: string; at: string } | undefined;
+  let throughNativeId = anchorNativeId;
+  const closeTurn = () => {
+    if (open === undefined) return;
+    turns.push({
+      ...open,
+      assistantNativeId: lastReply?.nativeId ?? null,
+      assistantText: replies.join("\n\n"),
+      assistantAt: lastReply?.at ?? null,
+    });
+    throughNativeId = lastReply?.nativeId ?? open.userNativeId;
+    open = undefined;
+    replies.length = 0;
+    lastReply = undefined;
+  };
+  for (const record of branch.slice(anchorIndex + 1)) {
+    if (record.id === undefined || !isPiConversationRecord(record)) continue;
+    const text = extractText(record.message.content);
+    if (text.length === 0) continue;
+    const at = normalizeTimestamp(record.timestamp, fallbackTimestamp);
+    if (record.message.role === "user") {
+      closeTurn();
+      open = { userNativeId: record.id, userText: text, userAt: at };
+    } else if (open !== undefined) {
+      replies.push(text);
+      lastReply = { nativeId: record.id, at };
+    }
+  }
+  if (lastTurnEnded) closeTurn();
   return { _tag: "Turns", turns, throughNativeId };
 }
 
@@ -2788,12 +2851,88 @@ export const make = Effect.gen(function* () {
     return Option.getOrElse(found, (): AgentSessionRecentThread => ({ _tag: "Skipped" }));
   });
 
+  const readError = (cause: unknown) =>
+    new AgentSessionScanError({ operation: "read-transcript", cause });
+
+  /** Every record of a session file that `keep` retains, within the import's memory budget. */
+  const readSessionRecords = Effect.fn("AgentSessionScanner.readSessionRecords")(function* (
+    filePath: string,
+    keep: (value: unknown) => ReadonlyArray<DecodedTranscriptRecord>,
+  ) {
+    const records: Array<DecodedTranscriptRecord> = [];
+    let recordBytes = 0;
+    const reserve = (bytes: number) => {
+      recordBytes += bytes;
+      if (recordBytes > MAX_IMPORT_HISTORY_BYTES) {
+        throw new TranscriptJsonLimitError({
+          message: "Transcript record exceeds the 32 MiB memory budget",
+        });
+      }
+    };
+    yield* fileSystem.stream(filePath).pipe(
+      Stream.decodeText,
+      Stream.splitLines,
+      Stream.runForEach((line) =>
+        Effect.try({
+          try: () => {
+            if (line.length === 0) return;
+            recordBytes = 0;
+            const reader = createTranscriptJsonReader(reserve, selectTranscriptPath);
+            reader.write(line);
+            records.push(...keep(reader.finish()));
+            if (records.length > MAX_IMPORT_RECORDS) {
+              throw new TranscriptJsonLimitError({ message: "Transcript has too many records" });
+            }
+          },
+          catch: readError,
+        }),
+      ),
+      Effect.mapError(readError),
+    );
+    return records;
+  });
+
+  // A Pi session's native thread id is its file's path.
+  const readPiTurnsAfter = Effect.fn("AgentSessionScanner.readPiTurnsAfter")(function* (
+    filePath: string,
+    anchorNativeId: string,
+    unchangedSince: TranscriptSignature | undefined,
+  ) {
+    const info = yield* statOption(filePath);
+    if (Option.isNone(info) || info.value.type !== "File") return { _tag: "NoTranscript" } as const;
+    const signature = {
+      size: Number(info.value.size),
+      mtimeMs: Option.match(info.value.mtime, {
+        onNone: () => 0,
+        onSome: (mtime) => mtime.getTime(),
+      }),
+    };
+    if (unchangedSince?.size === signature.size && unchangedSince.mtimeMs === signature.mtimeMs) {
+      return { _tag: "Unchanged" } as const;
+    }
+    const records = yield* readSessionRecords(filePath, (value) => {
+      const decoded = decodeTranscriptValue(value);
+      // Pi accepts messages this schema rejects, such as null content; keep their tree links.
+      if (Option.isNone(decoded)) return Option.toArray(decodePiEntryLinks(value));
+      // Tool output can dwarf the conversation; keep only the tree links of what is not a prompt or reply.
+      if (decoded.value.type === "message" && !isPiConversationRecord(decoded.value)) {
+        const { message: _message, ...links } = decoded.value;
+        return [links];
+      }
+      return [decoded.value];
+    });
+    return {
+      ...piTurnsAfter(records, anchorNativeId, DateTime.formatIso(yield* DateTime.now)),
+      signature,
+    };
+  });
+
   const readTurnsAfter: AgentSessionScanner["Service"]["readTurnsAfter"] = Effect.fn(
     "AgentSessionScanner.readTurnsAfter",
   )(function* ({ driver, providerInstanceId, providerSessionId, anchorNativeId, unchangedSince }) {
+    if (driver === "pi")
+      return yield* readPiTurnsAfter(providerSessionId, anchorNativeId, unchangedSince);
     if (driver !== "claudeAgent") return { _tag: "Unsupported" } as const;
-    const readError = (cause: unknown) =>
-      new AgentSessionScanError({ operation: "read-transcript", cause });
     const settings = yield* serverSettings.getSettings.pipe(
       Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-settings", cause })),
     );
@@ -2842,39 +2981,10 @@ export const make = Effect.gen(function* () {
       return { _tag: "Unchanged" } as const;
     }
 
-    const records: Array<DecodedTranscriptRecord> = [];
-    let recordBytes = 0;
-    const reserve = (bytes: number) => {
-      recordBytes += bytes;
-      if (recordBytes > MAX_IMPORT_HISTORY_BYTES) {
-        throw new TranscriptJsonLimitError({
-          message: "Transcript record exceeds the 32 MiB memory budget",
-        });
-      }
-    };
-    yield* fileSystem.stream(transcript.filePath).pipe(
-      Stream.decodeText,
-      Stream.splitLines,
-      Stream.runForEach((line) =>
-        Effect.try({
-          try: () => {
-            if (line.length === 0) return;
-            recordBytes = 0;
-            const reader = createTranscriptJsonReader(reserve, selectTranscriptPath);
-            reader.write(line);
-            const decoded = decodeTranscriptValue(reader.finish());
-            if (Option.isSome(decoded) && decoded.value.uuid !== undefined) {
-              records.push(decoded.value);
-            }
-            if (records.length > MAX_IMPORT_RECORDS) {
-              throw new TranscriptJsonLimitError({ message: "Transcript has too many records" });
-            }
-          },
-          catch: readError,
-        }),
-      ),
-      Effect.mapError(readError),
-    );
+    const records = yield* readSessionRecords(transcript.filePath, (value) => {
+      const decoded = decodeTranscriptValue(value);
+      return Option.isSome(decoded) && decoded.value.uuid !== undefined ? [decoded.value] : [];
+    });
     // The SDK documents `dir` as the session's project directory, which its records name.
     const projectDirectory = records.find((record) => record.cwd !== undefined)?.cwd;
     const chain = yield* claudeChain

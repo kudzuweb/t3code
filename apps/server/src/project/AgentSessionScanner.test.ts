@@ -1937,6 +1937,148 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
       }),
     );
 
+    it.effect(
+      "reads the turns a Pi session gained after an anchor, on its visible branch only",
+      () =>
+        Effect.gen(function* () {
+          const path = yield* Path.Path;
+          const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+          const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+          const sessionsDir = yield* makeTempDir("t3code-pi-sessions-");
+          const entry = (id: string, parentId: string | null, message: Record<string, unknown>) =>
+            encodeTranscriptRecord({
+              type: "message",
+              id,
+              parentId,
+              timestamp: `2026-11-20T10:00:${id.slice(1).padStart(2, "0")}.000Z`,
+              message,
+            });
+          const user = (id: string, parentId: string | null, text: string) =>
+            entry(id, parentId, { role: "user", content: [{ type: "text", text }] });
+          const assistant = (
+            id: string,
+            parentId: string,
+            text: string,
+            stopReason: "stop" | "toolUse" | "aborted",
+          ) =>
+            entry(id, parentId, {
+              role: "assistant",
+              content: [{ type: "text", text }],
+              stopReason,
+            });
+          const toolResult = (id: string, parentId: string) =>
+            entry(id, parentId, {
+              role: "toolResult",
+              toolCallId: "call-1",
+              content: [{ type: "text", text: "x".repeat(50) }],
+            });
+          const session = encodeTranscriptRecord({
+            type: "session",
+            version: 3,
+            id: "pi-session",
+            cwd: "/work/project",
+          });
+          const write = (name: string, lines: ReadonlyArray<string>, mtimeMs: number) => {
+            const filePath = path.join(sessionsDir, name);
+            return writeTranscript({
+              filePath,
+              contents: `${[session, ...lines].join("\n")}\n`,
+              mtimeMs,
+            }).pipe(Effect.as(filePath));
+          };
+          // The user rewound to e2 and asked again: e3 and e4 are an abandoned branch.
+          const rewound = yield* write(
+            "rewound.jsonl",
+            [
+              user("e1", null, "imported prompt"),
+              assistant("e2", "e1", "imported reply", "stop"),
+              user("e3", "e2", "abandoned prompt"),
+              assistant("e4", "e3", "abandoned reply", "stop"),
+              user("e5", "e2", "terminal prompt"),
+              assistant("e6", "e5", "Let me check", "toolUse"),
+              toolResult("e7", "e6"),
+              assistant("e8", "e7", "Done", "stop"),
+            ],
+            2_000_000,
+          );
+          const running = yield* write(
+            "running.jsonl",
+            [
+              user("e1", null, "first"),
+              assistant("e2", "e1", "first reply", "stop"),
+              user("e3", "e2", "second"),
+              assistant("e4", "e3", "second reply", "stop"),
+              user("e5", "e4", "third"),
+              assistant("e6", "e5", "Working", "toolUse"),
+              toolResult("e7", "e6"),
+            ],
+            2_000_000,
+          );
+          const aborted = yield* write(
+            "aborted.jsonl",
+            [
+              user("e1", null, "first"),
+              assistant("e2", "e1", "first reply", "stop"),
+              user("e3", "e2", "second"),
+              assistant("e4", "e3", "Half an answ", "aborted"),
+            ],
+            2_000_000,
+          );
+          const scanner = yield* AgentSessionScanner.AgentSessionScanner.pipe(
+            Effect.provide(layerScannerTest({ claudeHomePath, codexHomePath })),
+          );
+          const read = (
+            providerSessionId: string,
+            anchorNativeId: string,
+            unchangedSince?: AgentSessionScanner.TranscriptSignature,
+          ) =>
+            scanner.readTurnsAfter({
+              driver: ProviderDriverKind.make("pi"),
+              providerInstanceId: ProviderInstanceId.make("pi"),
+              providerSessionId,
+              anchorNativeId,
+              ...(unchangedSince === undefined ? {} : { unchangedSince }),
+            });
+
+          expect(yield* read(rewound, "e2")).toMatchObject({
+            _tag: "Turns",
+            throughNativeId: "e8",
+            turns: [
+              {
+                userNativeId: "e5",
+                userText: "terminal prompt",
+                userAt: "2026-11-20T10:00:05.000Z",
+                assistantNativeId: "e8",
+                assistantText: "Let me check\n\nDone",
+                assistantAt: "2026-11-20T10:00:08.000Z",
+              },
+            ],
+          });
+          // The anchor sits on the branch the user abandoned, so nothing can be placed.
+          expect(yield* read(rewound, "e4")).toMatchObject({ _tag: "AnchorNotFound" });
+          // The third turn is still running, so only the second is read.
+          expect(yield* read(running, "e2")).toMatchObject({
+            _tag: "Turns",
+            throughNativeId: "e4",
+            turns: [{ userNativeId: "e3" }],
+          });
+          // An aborted turn has ended.
+          expect(yield* read(aborted, "e2")).toMatchObject({
+            _tag: "Turns",
+            throughNativeId: "e4",
+            turns: [{ userNativeId: "e3", assistantNativeId: "e4" }],
+          });
+          const second = yield* read(rewound, "e8");
+          expect(second).toMatchObject({ _tag: "Turns", throughNativeId: "e8", turns: [] });
+          const signature = "signature" in second ? second.signature : undefined;
+          expect(signature?.mtimeMs).toBe(2_000_000);
+          expect(yield* read(rewound, "e8", signature)).toEqual({ _tag: "Unchanged" });
+          expect(yield* read(path.join(sessionsDir, "gone.jsonl"), "e2")).toEqual({
+            _tag: "NoTranscript",
+          });
+        }),
+    );
+
     it.effect("lists titles from the head and tail of a transcript larger than the sample", () =>
       Effect.gen(function* () {
         const path = yield* Path.Path;
@@ -3619,6 +3761,42 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")(
 );
 
 describe("parseAgentSessionTranscript", () => {
+  it("names the turn a Codex prompt belongs to, which Codex's app server uses as the turn's id", () => {
+    const thread = AgentSessionScanner.parseAgentSessionTranscript({
+      contents: [
+        encodeTranscriptRecord({ type: "session_meta", payload: { id: "codex-session" } }),
+        encodeTranscriptRecord({
+          type: "response_item",
+          timestamp: "2026-11-20T10:00:00.000Z",
+          payload: {
+            type: "message",
+            role: "user",
+            internal_chat_message_metadata_passthrough: { turn_id: "turn-1" },
+            content: [{ type: "input_text", text: "Prompt" }],
+          },
+        }),
+        encodeTranscriptRecord({
+          type: "response_item",
+          timestamp: "2026-11-20T10:00:05.000Z",
+          payload: {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "Reply" }],
+          },
+        }),
+      ].join("\n"),
+      source: "codex",
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      fallbackSessionId: "unused",
+      lastActiveAtMs: Date.parse("2026-11-20T12:00:00.000Z"),
+    });
+
+    expect(thread?.messages.map((message) => [message.role, message.nativeId])).toEqual([
+      ["user", "turn-1"],
+      ["assistant", undefined],
+    ]);
+  });
+
   it.each([false, true])(
     "handles the exact record limit and an interior blank overflow=%s",
     (overflow) => {
