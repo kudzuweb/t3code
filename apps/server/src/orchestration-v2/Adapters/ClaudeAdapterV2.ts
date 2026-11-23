@@ -8915,8 +8915,15 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           );
           liveQuery.checkMcpSignIns = statuses.some((status) => status.status === "pending");
           for (const status of statuses) {
-            // Every claude.ai connector the user never connected reports this too.
-            if (status.status !== "needs-auth" || status.scope === "claudeai") continue;
+            // Every claude.ai connector the user never connected reports this too, and so does every
+            // server a plugin ships. Claude Code lists both only in /mcp.
+            if (
+              status.status !== "needs-auth" ||
+              status.scope === "claudeai" ||
+              status.source === "plugin"
+            ) {
+              continue;
+            }
             const key = `${liveQuery.nativeThreadId}\u0000${status.name}`;
             if (announcedMcpSignIns.has(key)) continue;
             announcedMcpSignIns.add(key);
