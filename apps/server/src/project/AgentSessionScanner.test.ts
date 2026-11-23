@@ -2055,7 +2055,10 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
             ],
           });
           // The anchor sits on the branch the user abandoned, so nothing can be placed.
-          expect(yield* read(rewound, "e4")).toMatchObject({ _tag: "AnchorNotFound" });
+          expect(yield* read(rewound, "e4")).toMatchObject({
+            _tag: "AnchorNotFound",
+            signature: { mtimeMs: 2_000_000 },
+          });
           // The third turn is still running, so only the second is read.
           expect(yield* read(running, "e2")).toMatchObject({
             _tag: "Turns",
@@ -2102,13 +2105,21 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
           .filter((_line, index) => keep(index))
           .map((line) => line.replaceAll("/work/project", workspace));
 
-      const setup = Effect.fn("AgentSessionScanner.test.codexRollout")(function* () {
+      const setup = Effect.fn("AgentSessionScanner.test.codexRollout")(function* (
+        processRunner?: Layer.Layer<ProcessRunner.ProcessRunner>,
+      ) {
         const path = yield* Path.Path;
         const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
         const codexHomePath = yield* makeTempDir("t3code-codex-home-");
         const workspace = yield* makeTempDir("t3code-workspace-");
         const scanner = yield* AgentSessionScanner.AgentSessionScanner.pipe(
-          Effect.provide(layerScannerTest({ claudeHomePath, codexHomePath })),
+          Effect.provide(
+            layerScannerTest({
+              claudeHomePath,
+              codexHomePath,
+              ...(processRunner === undefined ? {} : { processRunner }),
+            }),
+          ),
         );
         const write = (
           contents: ReadonlyArray<string>,
@@ -2355,7 +2366,7 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
             const { workspace, write, read } = yield* setup();
             yield* write(withoutTurnIds(workspace, () => true));
 
-            expect(yield* read(first)).toEqual({ _tag: "Unsupported" });
+            expect(yield* read(first)).toMatchObject({ _tag: "Unsupported" });
           }),
         );
 
@@ -2391,6 +2402,58 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
 
           expect((yield* read(third, signature, true))._tag).toBe("Turns");
         }),
+      );
+
+      it.effect(
+        "locates and reads a rollout without starting a process, though its cwd is a git checkout",
+        () =>
+          Effect.gen(function* () {
+            const commands: Array<string> = [];
+            const runner = Layer.mock(ProcessRunner.ProcessRunner)({
+              run: (input) =>
+                Effect.sync(() => commands.push(input.command)).pipe(
+                  Effect.andThen(Effect.die("no process")),
+                ),
+            });
+            const { workspace, write, read, scanner, path } = yield* setup(runner);
+            const fileSystem = yield* FileSystem.FileSystem;
+            // Resolving the project of a checkout reads its git files, one process each.
+            yield* fileSystem.makeDirectory(path.join(workspace, ".git"));
+            yield* fileSystem.writeFileString(path.join(workspace, ".git", "config"), "[core]\n");
+            yield* fileSystem.writeFileString(
+              path.join(workspace, ".git", "HEAD"),
+              "ref: refs/heads/main\n",
+            );
+            yield* write(fixtureLines(workspace));
+
+            expect((yield* read(first))._tag).toBe("Turns");
+            const located = yield* scanner.locateTranscript({
+              driver: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              providerSessionId: sessionId,
+            });
+            expect(Option.isSome(located)).toBe(true);
+            expect(commands).toEqual([]);
+          }),
+      );
+
+      it.effect(
+        "returns the file's signature with an anchor it did not find, so a poll waits",
+        () =>
+          Effect.gen(function* () {
+            const { workspace, write, read } = yield* setup();
+            yield* write(fixtureLines(workspace));
+
+            const missing = yield* read("01a20589-0000-7000-8000-000000000000");
+            expect(missing).toMatchObject({
+              _tag: "AnchorNotFound",
+              signature: { mtimeMs: 2_000_000 },
+            });
+            const signature = "signature" in missing ? missing.signature : undefined;
+            expect(yield* read("01a20589-0000-7000-8000-000000000000", signature, true)).toEqual({
+              _tag: "Unchanged",
+            });
+          }),
       );
 
       it.effect("locates the rollout by session id and peeks at it afterwards", () =>

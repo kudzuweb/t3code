@@ -344,11 +344,6 @@ interface RecentThreadOptions {
   readonly headTailOnly?: boolean;
   /** Collects the candidate transcripts again instead of reusing the last collection. */
   readonly refreshCandidates?: boolean;
-  /**
-   * Finds `session` wherever it ran, instead of only inside the workspace root, so a session in a
-   * folder the project scan leaves out, such as a worktree T3 manages, can still be read.
-   */
-  readonly anyDirectory?: boolean;
 }
 
 const IMPORT_OPTIONS: RecentThreadOptions = {
@@ -2564,12 +2559,7 @@ export const make = Effect.gen(function* () {
   ) {
     const root = path.resolve(expandHomePath(workspaceRoot, homeDir));
     const realRoot = yield* fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root));
-    if (
-      options.anyDirectory !== true &&
-      (isExcludedProjectPath(root) || isExcludedProjectPath(realRoot))
-    ) {
-      return Stream.empty;
-    }
+    if (isExcludedProjectPath(root) || isExcludedProjectPath(realRoot)) return Stream.empty;
     const rootIdentity = yield* directoryIdentity(root);
     const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
     const cutoffMs =
@@ -2638,7 +2628,7 @@ export const make = Effect.gen(function* () {
       const expanded = expandHomePath(candidate.cwd.trim(), homeDir);
       if (!path.isAbsolute(expanded)) continue;
       const resolved = path.resolve(expanded);
-      if (options.anyDirectory !== true && !(yield* belongsToRoot(resolved))) continue;
+      if (!(yield* belongsToRoot(resolved))) continue;
 
       for (const transcript of candidate.transcripts) {
         if (
@@ -2813,10 +2803,7 @@ export const make = Effect.gen(function* () {
             projectCwd(snapshot.cwd.value, transcript.projectRoots).trim(),
             homeDir,
           );
-          if (
-            !path.isAbsolute(expandedCwd) ||
-            (options.anyDirectory !== true && !(yield* belongsToRoot(path.resolve(expandedCwd))))
-          ) {
+          if (!path.isAbsolute(expandedCwd) || !(yield* belongsToRoot(path.resolve(expandedCwd)))) {
             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
           }
           const worktree = yield* rootWorktree(path.resolve(expandedCwd));
@@ -2924,33 +2911,23 @@ export const make = Effect.gen(function* () {
     };
   });
 
-  /** `workspaceRoot` null looks for the session in any folder. */
-  const findSession = Effect.fn("AgentSessionScanner.findSession")(function* (
-    workspaceRoot: string | null,
-    session: AgentSessionKey,
-  ) {
+  const findProjectSession: AgentSessionScanner["Service"]["findProjectSession"] = Effect.fn(
+    "AgentSessionScanner.findProjectSession",
+  )(function* ({ workspaceRoot, ...session }) {
     const find = (refreshCandidates: boolean) =>
       Stream.unwrap(
-        prepareRecentThreads(workspaceRoot ?? path.parse(homeDir).root, [], {
+        prepareRecentThreads(workspaceRoot, [], {
           windowMs: null,
           transcriptLimit: MAX_TRANSCRIPTS_PER_SOURCE,
           session,
           refreshCandidates,
-          ...(workspaceRoot === null ? { anyDirectory: true } : {}),
         }),
       ).pipe(Stream.runHead);
-    // The cached collection can predate a session started since, or name a file that has moved,
-    // so look again before giving up.
+    // The cached collection can predate a session started since, so look again before giving up.
     const cached = yield* find(false);
-    const found =
-      Option.isSome(cached) && cached.value._tag !== "Skipped" ? cached : yield* find(true);
+    const found = Option.isSome(cached) ? cached : yield* find(true);
     return Option.getOrElse(found, (): AgentSessionRecentThread => ({ _tag: "Skipped" }));
   });
-
-  const findProjectSession: AgentSessionScanner["Service"]["findProjectSession"] = ({
-    workspaceRoot,
-    ...session
-  }) => findSession(workspaceRoot, session);
 
   const transcriptPaths = new Map<string, string>();
 
@@ -3036,30 +3013,142 @@ export const make = Effect.gen(function* () {
   // Where each Codex session's rollout was last found, so a poll costs one stat of that file.
   const codexRollouts = new Map<string, string>();
 
-  /** The rollout of a Codex session, found by its id wherever it ran, and remembered. */
+  /** Where an instance keeps its Codex sessions; none when the instance is not a Codex one. */
+  const codexSessionsDir = Effect.fn("AgentSessionScanner.codexSessionsDir")(function* (
+    providerInstanceId: ProviderInstanceId,
+  ) {
+    const settings = yield* serverSettings.getSettings.pipe(
+      Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-settings", cause })),
+    );
+    const instance =
+      settings.providerInstances[providerInstanceId] ??
+      (providerInstanceId === "codex" ? { driver: ProviderDriverKind.make("codex") } : undefined);
+    const config =
+      instance === undefined ? Option.none() : decodeCodexSettings(instance.config ?? {});
+    if (instance === undefined || Option.isNone(config)) return Option.none<string>();
+    const configuredHome = instance.environment?.findLast(
+      (variable) => variable.name === "CODEX_HOME",
+    )?.value;
+    const codexHome =
+      typeof configuredHome === "string" ? configuredHome : hostEnvironment.CODEX_HOME;
+    const layout = yield* resolveCodexHomeLayout(
+      config.value.homePath.trim().length === 0 &&
+        config.value.shadowHomePath.trim().length === 0 &&
+        codexHome?.trim()
+        ? { ...config.value, homePath: codexHome }
+        : config.value,
+    ).pipe(Effect.provideService(Path.Path, path));
+    return Option.some(path.join(layout.sharedHomePath, "sessions"));
+  });
+
+  /**
+   * The rollout files `wanted` accepts, newest first, from the newest day folder holding any.
+   * Codex names a rollout with its session id, so this reads folder listings and stats only.
+   */
+  const findCodexRollouts = Effect.fn("AgentSessionScanner.findCodexRollouts")(function* (
+    sessionsDir: string,
+    wanted: (match: RegExpExecArray) => boolean,
+  ) {
+    const newestFirst = (names: ReadonlyArray<string>) => names.toSorted().toReversed();
+    for (const year of newestFirst(yield* listDirectory(sessionsDir))) {
+      for (const month of newestFirst(yield* listDirectory(path.join(sessionsDir, year)))) {
+        for (const day of newestFirst(yield* listDirectory(path.join(sessionsDir, year, month)))) {
+          const directory = path.join(sessionsDir, year, month, day);
+          const files = yield* Effect.forEach(yield* listDirectory(directory), (entry) => {
+            const match = CODEX_ROLLOUT_ID_PATTERN.exec(entry);
+            return entry.startsWith("rollout-") && match !== null && wanted(match)
+              ? statTranscript(path.join(directory, entry))
+              : Effect.succeed([]);
+          });
+          const found = files.flat().toSorted((left, right) => right.mtimeMs - left.mtimeMs);
+          if (found.length > 0) return found;
+        }
+      }
+    }
+    return [];
+  });
+
+  /**
+   * A Codex session's rollout and its parsed history, found by session id wherever the session ran,
+   * with the prefixes a rewound rollout inherits. None when the rollout cannot be found or read.
+   */
+  const readCodexRollout = Effect.fn("AgentSessionScanner.readCodexRollout")(function* (
+    session: AgentSessionKey,
+  ) {
+    const sessionsDir = yield* codexSessionsDir(session.providerInstanceId);
+    if (Option.isNone(sessionsDir)) return undefined;
+    const [rollout] = yield* findCodexRollouts(
+      sessionsDir.value,
+      (match) => match[1] === session.providerSessionId,
+    );
+    if (rollout === undefined) return undefined;
+    const stats = yield* statOption(rollout.filePath);
+    if (Option.isNone(stats) || stats.value.type !== "File") return undefined;
+    const snapshot = yield* readTranscript(
+      rollout.filePath,
+      transcriptIdentity(rollout.filePath, stats.value),
+      "codex",
+    );
+    if (snapshot === null) return undefined;
+    // A rewound rollout holds a byte prefix of the rollout it replaced, oldest prefix first.
+    const prefixes: Array<ReadonlyArray<DecodedTranscriptRecord>> = [];
+    const visited = new Set<string>();
+    let historyBytes = snapshot.historyBytes;
+    for (let base = codexHistoryBase(snapshot.records); base !== undefined;) {
+      if (visited.has(base.thread_id)) return undefined;
+      visited.add(base.thread_id);
+      const [basePath] = yield* findCodexRollouts(
+        sessionsDir.value,
+        (match) => (match[2] ?? match[1]) === base?.thread_id,
+      );
+      const baseStats =
+        basePath === undefined ? Option.none() : yield* statOption(basePath.filePath);
+      if (basePath === undefined || Option.isNone(baseStats) || baseStats.value.type !== "File") {
+        return undefined;
+      }
+      const inherited = yield* readTranscript(
+        basePath.filePath,
+        transcriptIdentity(basePath.filePath, baseStats.value),
+        "codex",
+        { endByteOffset: base.end_byte_offset, historyBytes },
+      );
+      if (inherited === null) return undefined;
+      historyBytes = inherited.historyBytes;
+      prefixes.unshift(inherited.records.filter((record) => record.type !== "session_meta"));
+      base = codexHistoryBase(inherited.records);
+    }
+    const thread = parseAgentSessionRecords(
+      {
+        source: "codex",
+        providerInstanceId: session.providerInstanceId,
+        fallbackSessionId: session.providerSessionId,
+        lastActiveAtMs: rollout.mtimeMs,
+      },
+      [...prefixes.flat(), ...snapshot.records],
+      snapshot.claudeFields,
+      snapshot.droppedMessageCount,
+    );
+    if (thread === "empty" || thread === null) return undefined;
+    codexRollouts.set(
+      `${session.providerInstanceId}\0${session.providerSessionId}`,
+      rollout.filePath,
+    );
+    return { ...rollout, thread };
+  });
+
+  /** The rollout's signature, from the file remembered by an earlier read for a poll. */
   const locateCodexRollout = Effect.fn("AgentSessionScanner.locateCodexRollout")(function* (
     session: AgentSessionKey,
     useRememberedPath: boolean,
   ) {
-    const key = `${session.providerInstanceId}\0${session.providerSessionId}`;
-    const knownPath = codexRollouts.get(key);
+    const knownPath = codexRollouts.get(
+      `${session.providerInstanceId}\0${session.providerSessionId}`,
+    );
     if (useRememberedPath && knownPath !== undefined) {
       const known = (yield* statTranscript(knownPath))[0];
       if (known !== undefined) return { ...known, thread: undefined };
     }
-    // A rollout that moved, as when Codex compressed it, is found again the way the importer finds it.
-    const found = yield* findSession(null, session);
-    if (found._tag !== "Importable") {
-      codexRollouts.delete(key);
-      return undefined;
-    }
-    codexRollouts.set(key, found.source.filePath);
-    return {
-      filePath: found.source.filePath,
-      size: found.source.size,
-      mtimeMs: found.source.mtimeMs ?? 0,
-      thread: found.thread,
-    };
+    return yield* readCodexRollout(session);
   });
 
   const readCodexTurnsAfter = Effect.fn("AgentSessionScanner.readCodexTurnsAfter")(function* (
@@ -3077,13 +3166,13 @@ export const make = Effect.gen(function* () {
         return { _tag: "Unchanged" } as const;
       }
     }
-    const rollout = yield* locateCodexRollout(session, false);
-    if (rollout?.thread === undefined) return { _tag: "NoTranscript" } as const;
-    const turns = codexTurnsAfter(rollout.thread.messages, anchorNativeId);
+    const rollout = yield* readCodexRollout(session);
+    if (rollout === undefined) return { _tag: "NoTranscript" } as const;
     // The signature is of the file as it was read, so a change during the read shows next time.
-    return turns._tag === "Turns"
-      ? { ...turns, signature: { size: rollout.size, mtimeMs: rollout.mtimeMs } }
-      : turns;
+    return {
+      ...codexTurnsAfter(rollout.thread.messages, anchorNativeId),
+      signature: { size: rollout.size, mtimeMs: rollout.mtimeMs },
+    };
   });
 
   /** Where an instance keeps its Claude sessions; none when the instance is not a Claude one. */
