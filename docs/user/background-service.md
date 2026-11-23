@@ -148,9 +148,9 @@ lease left by the dead server whenever `disablesleep` is set, which also clears
 a block another tool set after the crash. A failed release is retried, waiting
 up to 5 minutes between tries.
 
-The guard changes `pmset` only in packaged production builds. In a development
-build the settings row reads "Lid sleep guard is disabled in development
-builds."
+The guard changes `pmset` only in servers started without a Vite dev URL, which
+are the packaged app and `t3` CLI builds. In a development server the settings
+row reads "Lid sleep guard is disabled in development builds."
 
 If T3 Code and another tool, such as the Ghostty fork, both see sleep enabled
 at the same moment, both can set the block and each thinks it owns it. Whichever

@@ -111,7 +111,7 @@ export const make = Effect.fn("LidSleepGuard.make")(function* <E>(input: {
   readonly demand: Stream.Stream<boolean, E>;
   /** The "Keep awake while agents work" setting; Auto never blocks while it is off. */
   readonly keepAwakeEnabled: Stream.Stream<boolean>;
-  /** Only a packaged production build may change `pmset`. */
+  /** Only a server started without a Vite dev URL (packaged app or `t3` CLI) may change `pmset`. */
   readonly production: boolean;
   readonly leasePath: string;
   readonly serverPid: number;
@@ -400,7 +400,7 @@ export const layer = Layer.effect(
     );
     return yield* make({
       platform,
-      production: ServerConfig.telemetryChannel !== "dev",
+      production: config.devUrl === undefined,
       mode,
       demand,
       keepAwakeEnabled,
