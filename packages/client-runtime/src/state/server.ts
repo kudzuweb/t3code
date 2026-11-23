@@ -1486,6 +1486,11 @@ export function createServerEnvironmentAtoms<R, E>(
     }),
     databaseStorage,
     databaseCompactionRecommendations,
+    lidSleepGuardStatus: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
+      label: "environment-data:server:lid-sleep-guard-status",
+      tag: WS_METHODS.serverGetLidSleepGuardStatus,
+      idleTtlMs: 0,
+    }),
     reclaimDatabaseSpace: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:reclaim-database-space",
       tag: WS_METHODS.serverReclaimDatabaseSpace,
