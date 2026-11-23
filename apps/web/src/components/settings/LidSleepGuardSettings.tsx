@@ -52,6 +52,12 @@ export function LidSleepGuardSettingsRow() {
   if (supported.length === 0) return null;
 
   const describe = (status: LidSleepGuardStatus) => {
+    if (status.inactive === "development-build") {
+      return gt("Lid sleep guard is disabled in development builds.");
+    }
+    if (status.inactive === "keep-awake-off") {
+      return gt("Auto is inactive because Keep awake while agents work is off.");
+    }
     if (status.error === "needs-sudoers-rule") return gt("Lid sleep guard needs its sudoers rule");
     if (status.error === "failed") return gt("Lid sleep guard could not change the sleep setting");
     if (status.blocking && status.owned) {
@@ -130,6 +136,11 @@ export function LidSleepGuardSettingsRow() {
             {LID_SLEEP_GUARD_MODES.map((mode) => (
               <SelectItem key={mode} hideIndicator value={mode}>
                 {messages(LID_SLEEP_GUARD_MODE_LABELS[mode])}
+                {mode === "auto" && !settings.keepAwakeWhileAgentsWork ? (
+                  <span className="block text-muted-foreground text-xs">
+                    {gt("Needs Keep awake while agents work")}
+                  </span>
+                ) : null}
               </SelectItem>
             ))}
           </SelectPopup>
