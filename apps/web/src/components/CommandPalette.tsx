@@ -258,6 +258,7 @@ import {
   sourceControlHostIcon,
 } from "./CommandPaletteAddProject";
 import { useCommandPaletteThreadItems } from "./CommandPaletteThreadItems";
+import { useCommandPaletteLidSleepGuardItem } from "./CommandPaletteLidSleepGuardItems";
 import { useCommandPaletteThemeItems } from "./CommandPaletteThemeItems";
 import {
   PORT_FORWARD_GROUP_PREFIX,
@@ -570,6 +571,7 @@ function OpenCommandPaletteDialog(props: {
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const providersByEnvironment = useEnvironmentProviders();
   const { changeThemeItem, changeAppearanceItem, themeEditorItem } = useCommandPaletteThemeItems();
+  const lidSleepGuardItem = useCommandPaletteLidSleepGuardItem();
   const portForwardItem = useCommandPalettePortForwardItem({
     activeThread: activeThread ?? null,
     query: deferredQuery,
@@ -1734,6 +1736,7 @@ function OpenCommandPaletteDialog(props: {
   actionItems.push(changeAppearanceItem);
 
   actionItems.push(themeEditorItem);
+  if (lidSleepGuardItem) actionItems.push(lidSleepGuardItem);
 
   if (environments.some((environment) => environment.serverConfig !== null)) {
     actionItems.push({
