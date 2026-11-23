@@ -196,7 +196,11 @@ export const make = Effect.fn("LidSleepGuard.make")(function* <E>(input: {
       ),
     );
 
-  const publish = (status: LidSleepGuardStatus) => SubscriptionRef.set(statusRef, status);
+  // `inactive` belongs to the mode and keep-awake streams, so a publish never replaces it.
+  const publish = (status: LidSleepGuardStatus) =>
+    SubscriptionRef.update(statusRef, ({ inactive }) =>
+      inactive === undefined ? status : { ...status, inactive },
+    );
   const publishFailure = (failure: LidSleepGuardFailure) =>
     Effect.logWarning("lid sleep guard could not change the sleep setting", {
       reason: failure.reason,
@@ -263,8 +267,14 @@ export const make = Effect.fn("LidSleepGuard.make")(function* <E>(input: {
   // Fails when the block could not be cleared, and keeps the lease so a retry still owns it.
   const releaseOnce = serialized(
     Effect.gen(function* () {
-      if (!(yield* ownsLease)) {
+      const lease = yield* readOwnLease;
+      if (Option.isNone(lease)) {
         return yield* publish({ blocking: yield* readBlocking, owned: false });
+      }
+      if (lease.value.persist) {
+        // If the server dies while a failed release is retried, the watcher must clear the block.
+        yield* writeLease(false);
+        yield* ensureWatcher;
       }
       yield* setBlocking(false);
       if (yield* readBlocking) {

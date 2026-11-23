@@ -468,7 +468,6 @@ describe("LidSleepGuard", () => {
         const t = yield* harness({ initialMode: "off", staleLease: true });
         // The second read comes from the off mode, after the stale lease was settled.
         yield* awaitCommand(t.mac, PMSET_READ, 2);
-        yield* awaitCommand(t.mac, PMSET_READ, 1);
         expect(sudoCommands(t.mac)).toEqual([]);
         expect(yield* t.hasLease).toBe(false);
       }),
@@ -625,6 +624,31 @@ describe("LidSleepGuard", () => {
       }),
     );
 
+    it.effect("marks the lease releasable before a failing release from on to off", () =>
+      Effect.gen(function* () {
+        const t = yield* harness({ initialMode: "on" });
+        yield* t.awaitStatus((status) => status.owned);
+        t.mac.failRelease = true;
+        yield* Queue.offer(t.mode, "off");
+        yield* awaitCommand(t.mac, SET_OFF, 1);
+        yield* t.awaitStatus((status) => status.error === "failed");
+        expect(yield* t.readLease).toMatchObject({ persist: false });
+        expect(t.mac.sleepDisabled).toBe(true);
+      }),
+    );
+
+    it.effect("keeps the inactive reason through on and back to auto", () =>
+      Effect.gen(function* () {
+        const t = yield* harness({ initialMode: "auto", keepAwakeEnabled: false });
+        yield* t.awaitStatus((status) => status.inactive === "keep-awake-off");
+        yield* Queue.offer(t.mode, "on");
+        yield* t.awaitStatus((status) => status.owned && status.inactive === undefined);
+        yield* Queue.offer(t.mode, "auto");
+        const released = yield* t.awaitStatus((status) => !status.owned);
+        expect(released.inactive).toBe("keep-awake-off");
+      }),
+    );
+
     it.effect("sets the block again when something else clears it while on", () =>
       Effect.gen(function* () {
         const t = yield* harness({ initialMode: "on" });
@@ -638,7 +662,7 @@ describe("LidSleepGuard", () => {
     );
   });
 
-  describe("coverage the review found missing", () => {
+  describe("shutdown and recovery", () => {
     it.effect("releases an owned block on normal shutdown in auto", () =>
       Effect.gen(function* () {
         const t = yield* harness({ initialMode: "auto", initialDemand: true });
