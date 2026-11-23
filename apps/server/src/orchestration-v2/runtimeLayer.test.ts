@@ -14300,6 +14300,12 @@ it.layer(layerTest)("guarded provider session detach", (it) => {
       const { orchestrator, threadId, providerSessionId } = yield* seedThread("idle");
       yield* detach(orchestrator, { name: "idle", threadId, providerSessionId, onlyIfIdle: true });
       assert.deepEqual(yield* liveSessionIds(orchestrator, threadId), []);
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const [effect] = yield* outbox.listByCommandId(CommandId.make("guarded-detach-idle-detach"));
+      assert.equal(
+        effect?.request.type === "provider-session.detach" && effect.request.awaitClosed,
+        true,
+      );
     }),
   );
 
@@ -14430,6 +14436,15 @@ it.layer(layerTest)("guarded provider session detach", (it) => {
       });
       yield* detach(orchestrator, { name: "unguarded", threadId, providerSessionId });
       assert.notInclude(yield* liveSessionIds(orchestrator, threadId), providerSessionId);
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const [effect] = yield* outbox.listByCommandId(
+        CommandId.make("guarded-detach-unguarded-detach"),
+      );
+      assert.isUndefined(
+        effect?.request.type === "provider-session.detach"
+          ? effect.request.awaitClosed
+          : "not a detach",
+      );
     }),
   );
 });

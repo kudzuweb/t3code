@@ -227,6 +227,7 @@ interface TestProviderRuntimeState {
   readonly interruptCount: number;
   readonly resumeCount: number;
   readonly unloadedNativeThreadIds: ReadonlyArray<string>;
+  readonly awaitedClosedUnloads: ReadonlyArray<boolean>;
   readonly eventQueues: ReadonlyMap<
     string,
     Queue.Queue<ProviderAdapter.ProviderAdapterV2Event, Cause.Done>
@@ -239,6 +240,7 @@ const emptyState: TestProviderRuntimeState = {
   interruptCount: 0,
   resumeCount: 0,
   unloadedNativeThreadIds: [],
+  awaitedClosedUnloads: [],
   eventQueues: new Map(),
 };
 
@@ -617,7 +619,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
               ...current,
               interruptCount: current.interruptCount + 1,
             })).pipe(Effect.andThen(options.interruptTurn ?? Effect.void)),
-          unloadThread: ({ providerThread, archive }) =>
+          unloadThread: ({ providerThread, archive, awaitClosed }) =>
             (options.beforeUnload ?? Effect.void).pipe(
               Effect.andThen(
                 Ref.update(state, (current) => ({
@@ -626,6 +628,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
                     ...current.unloadedNativeThreadIds,
                     providerThread.nativeThreadRef?.nativeId ?? "",
                   ],
+                  awaitedClosedUnloads: [...current.awaitedClosedUnloads, awaitClosed === true],
                 })),
               ),
               Effect.andThen(
@@ -5405,6 +5408,23 @@ it.effect(
         yield* manager.detach(parent);
 
         assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, ["native-child-thread"]);
+      }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 1000 })), Effect.scoped);
+    }),
+);
+
+it.effect.each([
+  { awaitClosed: true, expected: [true] },
+  { awaitClosed: undefined, expected: [false] },
+] as const)(
+  "ProviderSessionManagerV2 asks the adapter to await thread closing only when the detach does (awaitClosed: $awaitClosed)",
+  ({ awaitClosed, expected }) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      yield* Effect.gen(function* () {
+        const { manager, parent } = yield* makeNativeChildFixture();
+        yield* manager.detach({ ...parent, ...(awaitClosed === undefined ? {} : { awaitClosed }) });
+
+        assert.deepEqual((yield* Ref.get(state)).awaitedClosedUnloads, expected);
       }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 1000 })), Effect.scoped);
     }),
 );

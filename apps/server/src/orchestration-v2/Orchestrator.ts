@@ -5890,6 +5890,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           type: "provider-session.detach",
           providerSessionId: command.providerSessionId,
           ...(command.reason === undefined ? {} : { detail: command.reason }),
+          ...(command.onlyIfIdle === true ? { awaitClosed: true } : {}),
         },
       } satisfies PendingOrchestrationEffectV2;
       yield* Ref.update(effects, (existing) => [...existing, pendingEffect]);
