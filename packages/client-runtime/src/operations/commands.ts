@@ -242,7 +242,10 @@ export interface RevertThreadCheckpointInput extends ThreadCommandInput {
   readonly turnCount?: number;
 }
 
-export type StopThreadSessionInput = ThreadCommandInput;
+export interface StopThreadSessionInput extends ThreadCommandInput {
+  /** Rejects the stop while the thread has a running turn or background tasks. */
+  readonly onlyIfIdle?: true;
+}
 
 export interface ForkThreadFromRunInput extends CommandMetadata {
   readonly sourceThreadId: ThreadId;
@@ -1111,6 +1114,7 @@ export const stopThreadSession = Effect.fn("EnvironmentCommands.stopThreadSessio
       threadId: input.threadId,
       providerSessionId: session.id,
       reason: "client-requested",
+      ...(input.onlyIfIdle === undefined ? {} : { onlyIfIdle: input.onlyIfIdle }),
     });
   }
   return result;

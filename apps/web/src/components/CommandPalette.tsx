@@ -107,7 +107,7 @@ import { useDesktopLocalBootstraps } from "../connection/useDesktopLocalBootstra
 import { useHandleNewThread } from "../hooks/useHandleNewThread";
 import { useOpenPanelPullRequestUrl } from "../hooks/useOpenPanelPullRequestUrl";
 import { copyThreadReference } from "../lib/copyThreadReference";
-import { useThreadResumeCommand } from "../state/threadResumeCommand";
+import { useThreadResume } from "../state/threadResume";
 import { copyResumeCommand } from "../lib/copyResumeCommand";
 import {
   queueWorkspaceFocusFromPalette,
@@ -547,7 +547,7 @@ function OpenCommandPaletteDialog(props: {
     activeThread && pathname !== "/pull-requests"
       ? scopeThreadRef(activeThread.environmentId, activeThread.id)
       : null;
-  const activeThreadResumeCommand = useThreadResumeCommand(
+  const activeThreadResume = useThreadResume(
     activeThreadRef,
     activeThread?.worktreePath ??
       projects.find(
@@ -1523,7 +1523,8 @@ function OpenCommandPaletteDialog(props: {
     });
   }
 
-  if (activeThreadResumeCommand !== null) {
+  if (activeThreadResume !== null && activeThread !== null) {
+    const resumeThread = activeThread;
     actionItems.push({
       kind: "action",
       value: "action:copy-resume-command",
@@ -1531,7 +1532,14 @@ function OpenCommandPaletteDialog(props: {
       title: gt("Copy resume command"),
       description: gt("Continue this thread's session in a terminal"),
       icon: <TerminalIcon className={ITEM_ICON_CLASS} />,
-      run: () => copyResumeCommand(activeThreadResumeCommand),
+      run: () =>
+        copyResumeCommand(activeThreadResume, async () => {
+          const stopped = await stopThreadSession({
+            environmentId: resumeThread.environmentId,
+            input: { threadId: resumeThread.id, onlyIfIdle: true },
+          });
+          return stopped._tag === "Failure" ? squashAtomCommandFailure(stopped) : null;
+        }),
     });
   }
 
