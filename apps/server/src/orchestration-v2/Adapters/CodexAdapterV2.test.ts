@@ -48,6 +48,7 @@ import { MCP_APP_OUTPUT_KEY, readMcpAppReference } from "@t3tools/shared/mcpApp"
 import { toolOutputImages } from "@t3tools/shared/toolOutput";
 import { resolveAttachmentPathById } from "../../attachmentStore.ts";
 import * as Fiber from "effect/Fiber";
+import * as Logger from "effect/Logger";
 import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
@@ -4970,6 +4971,88 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       ),
     ),
   );
+
+  // The unrelated thread/closed fences the reader: the unsubscribe reply was handled before it.
+  it.effect.each([
+    { name: "waits for thread/closed before completing", closes: true },
+    { name: "completes with a warning when thread/closed never arrives", closes: false },
+  ])("detach unload $name", ({ closes }) => {
+    const warnings: Array<string> = [];
+    const logger = Logger.make(({ logLevel, message }) => {
+      if (logLevel === "Warn") warnings.push(JSON.stringify(message));
+    });
+    return Effect.gen(function* () {
+      const nativeThreadId = "detach-closing-thread";
+      const closed = (
+        threadId: string,
+        afterMs?: number,
+      ): CodexReplay.CodexAppServerReplayEntry => ({
+        type: "emit_inbound",
+        label: `thread closed ${threadId}`,
+        frame: { method: "thread/closed", params: { threadId } },
+        ...(afterMs === undefined ? {} : { afterMs }),
+      });
+      const fenced = yield* Deferred.make<void>();
+      const unloaded = yield* Deferred.make<void>();
+      const harness = yield* makeCodexReplayHarness(
+        makeCodexReplayTranscript({
+          scenario: `detach-unload-${closes}`,
+          entries: [
+            ...codexReplayPreamble({
+              nativeThreadId,
+              nativeTurnId: "unused-turn",
+              prompt: "unused-prompt",
+            }).slice(0, 5),
+            {
+              type: "expect_outbound",
+              label: "unsubscribe",
+              frame: { id: 3, method: "thread/unsubscribe", params: { threadId: nativeThreadId } },
+            },
+            {
+              type: "emit_inbound",
+              label: "unsubscribe result",
+              frame: { id: 3, result: { status: "unsubscribed" } },
+            },
+            closed("unrelated-thread"),
+            ...(closes ? [closed(nativeThreadId, 1_000)] : []),
+          ],
+        }),
+        () => Effect.void,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        (method) =>
+          method === "thread/closed" ? Deferred.succeed(fenced, undefined) : Effect.void,
+      );
+      const unloading = yield* harness.runtime.unloadThread!({
+        providerThread: harness.providerThread,
+        awaitClosed: true,
+      }).pipe(
+        Effect.andThen(Deferred.succeed(unloaded, undefined)),
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* Deferred.await(fenced);
+      yield* Effect.yieldNow;
+      assert.isFalse(yield* Deferred.isDone(unloaded));
+      yield* TestClock.adjust(closes ? "1 second" : "5 seconds");
+      yield* Fiber.join(unloading);
+      assert.isTrue(yield* Deferred.isDone(unloaded));
+      assert.equal(warnings.length, closes ? 0 : 1);
+      if (!closes) assert.include(warnings[0], nativeThreadId);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          NodeServices.layer,
+          NodeCrypto.layer,
+          Logger.layer([logger], { mergeWithExisting: false }),
+        ),
+      ),
+    );
+  });
 
   it.effect.each([
     "recover",

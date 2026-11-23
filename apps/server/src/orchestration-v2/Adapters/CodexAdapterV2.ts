@@ -1700,6 +1700,8 @@ const decodeCodexChildThread = Schema.decodeUnknownEffect(
 
 // Without a deadline the spawner waits indefinitely for a process that ignores SIGTERM.
 const CODEX_APP_SERVER_FORCE_KILL_AFTER = "2 seconds";
+/** How long an unload that must release the thread waits for Codex to emit `thread/closed`. */
+const CODEX_THREAD_CLOSED_WAIT = "5 seconds";
 
 export const makeCodexAppServerSpawnCommand = Effect.fn(
   "CodexAdapterV2.makeCodexAppServerSpawnCommand",
@@ -8479,6 +8481,19 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   status: "interrupted",
                   completedAt,
                 });
+              }
+              const closing = threadClosings.get(nativeThreadId);
+              if (unloadInput.awaitClosed === true && closing !== undefined) {
+                yield* Deferred.await(closing).pipe(
+                  Effect.timeoutOrElse({
+                    duration: CODEX_THREAD_CLOSED_WAIT,
+                    orElse: () =>
+                      Effect.logWarning(
+                        "Codex did not report thread/closed in time; the thread may still be held",
+                        { nativeThreadId },
+                      ),
+                  }),
+                );
               }
             },
             (effect, unloadInput) =>

@@ -3586,7 +3586,7 @@ export const layerWithOptions = (
                     ) {
                       return;
                     }
-                    yield* unloadThread({ providerThread }).pipe(
+                    yield* unloadThread({ providerThread, awaitClosed: true }).pipe(
                       Effect.timeout(UNLOAD_THREAD_TIMEOUT_MS),
                       Effect.catchCause((cause) =>
                         Effect.logWarning("orchestration-v2.driver-session.detach-unload-failed", {
