@@ -109,11 +109,11 @@ On macOS, T3 Code already keeps the Mac from idle-sleeping while agents work
 a Mac from sleeping when you close the lid. **Lid sleep guard** does, by
 turning on macOS's `disablesleep` flag.
 
-| Mode | What it does                                                             |
-| ---- | ------------------------------------------------------------------------ |
-| Off  | Never changes the flag. This is the default.                             |
-| Auto | Blocks lid sleep while agents work and for a minute after, then lets go. |
-| On   | Blocks lid sleep for as long as the T3 Code server runs.                 |
+| Mode | What it does                                                                                                                                                                               |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Off  | Never changes the flag. This is the default.                                                                                                                                               |
+| Auto | Blocks lid sleep while agents work and for a minute after, then lets go. It needs **Keep awake while agents work**; with that setting off, Auto does nothing and the settings row says so. |
+| On   | Blocks lid sleep for as long as the T3 Code server runs.                                                                                                                                   |
 
 Choose the mode in **Settings > Maintenance**, or with **Lid sleep guard** in
 the command palette. The setting appears only for servers running on macOS. The
@@ -136,9 +136,26 @@ the same two commands, such as the Ghostty fork's
 `fork/sudoers.d/ghostty-sleep-guard`, works for T3 Code as is.
 
 T3 Code releases only a block it set. If something else already disabled sleep,
-it leaves that block alone. T3 Code records its own block in
-`lid-sleep-guard.lease` in its data directory, so after a crash the next start
-releases a block that is no longer needed.
+it leaves that block alone, and it checks every 30 seconds whether that block
+dropped so it can take over. T3 Code records its own block in
+`lid-sleep-guard.lease` in its data directory, with the server's process id, a
+start token and the data directory.
+
+If the server crashes or is killed, a small background process that T3 Code
+started when it set the block notices and clears `disablesleep`, as long as the
+lease still names that server. If that fails, the next T3 Code start clears a
+lease left by the dead server whenever `disablesleep` is set, which also clears
+a block another tool set after the crash. A failed release is retried, waiting
+up to 5 minutes between tries.
+
+The guard changes `pmset` only in packaged production builds. In a development
+build the settings row reads "Lid sleep guard is disabled in development
+builds."
+
+If T3 Code and another tool, such as the Ghostty fork, both see sleep enabled
+at the same moment, both can set the block and each thinks it owns it. Whichever
+releases first clears it for the other, so the Mac can sleep while the other tool
+expects it awake. The Mac is never left unable to sleep.
 
 A closed Mac keeps running, which uses battery and produces heat, especially in
 a bag. Closing the lid on battery drains it, so use Auto and check that the Mac
