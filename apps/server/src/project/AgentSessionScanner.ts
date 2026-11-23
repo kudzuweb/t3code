@@ -44,6 +44,7 @@ import * as ClaudeSessionChain from "./ClaudeSessionChain.ts";
 import { resolveCodexHomeLayout } from "../provider/Drivers/CodexHomeLayout.ts";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
+import { type CodexTurnStatus, codexTurnsAfter, isEndedCodexTurnStatus } from "./CodexTurns.ts";
 import { piHome, resolvePiSessionsDir } from "@t3tools/provider-pi/server/usage";
 import * as ServerSettings from "../serverSettings.ts";
 import { sourceControlDefinitions } from "../sourceControl/sourceControlDefinitions.ts";
@@ -120,10 +121,14 @@ const TranscriptMessage = Schema.Struct({
   content: Schema.optional(Schema.Union([Schema.String, Schema.Array(TranscriptContentBlock)])),
   model: Schema.optional(Schema.String),
   stop_reason: Schema.optional(Schema.NullOr(Schema.String)),
+  // Pi writes the reason an assistant message ended on, in camel case.
+  stopReason: Schema.optional(Schema.NullOr(Schema.String)),
 });
 
 const CodexTurnMetadata = Schema.Struct({
   turn_id: Schema.optional(Schema.Union([Schema.String, Schema.Null])),
+  // What each part of a message is, such as `user.text` for a prompt the user typed.
+  content_item_kinds: Schema.optional(Schema.Array(Schema.String)),
 });
 
 const TranscriptRecord = Schema.Struct({
@@ -164,6 +169,7 @@ const TranscriptRecord = Schema.Struct({
       model: Schema.optional(Schema.String),
       cwd: Schema.optional(Schema.String),
       history_base: Schema.optional(Schema.Unknown),
+      turn_id: Schema.optional(Schema.String),
       content: Schema.optional(Schema.Array(TranscriptContentBlock)),
       internal_chat_message_metadata_passthrough: Schema.optional(Schema.Unknown),
     }),
@@ -302,7 +308,11 @@ export class AgentSessionScanner extends Context.Service<
         readonly useRememberedPath?: boolean;
       },
     ) => Effect.Effect<Option.Option<TranscriptSignature>, AgentSessionScanError>;
-    /** What the session gained after `anchorNativeId`. Only Claude sessions can be read so far. */
+    /**
+     * What the session gained after `anchorNativeId`, read from its file. For Pi,
+     * `providerSessionId` is the session file's path. A Codex rollout is found by its session id,
+     * the way the importer finds it, wherever it ran.
+     */
     readonly readTurnsAfter: (
       input: AgentSessionKey & {
         readonly driver: ProviderDriverKind;
@@ -423,6 +433,12 @@ function normalizeTimestamp(value: string | undefined, fallback: string): string
   if (value === undefined) return fallback;
   const parsed = DateTime.make(value);
   return Option.isSome(parsed) ? DateTime.formatIso(parsed.value) : fallback;
+}
+
+/** A user message Codex made up, such as the instructions it injects, names no part as the user's own. */
+function isCodexInjectedMessage(metadata: unknown): boolean {
+  const kinds = Option.getOrUndefined(decodeCodexTurnMetadata(metadata))?.content_item_kinds;
+  return kinds !== undefined && kinds.length > 0 && !kinds.some((kind) => kind.startsWith("user."));
 }
 
 function codexTurnId(metadata: unknown): string | null {
@@ -696,6 +712,63 @@ export function claudeTurnsAfter(
   return { _tag: "Turns", turns, throughNativeId };
 }
 
+/**
+ * The turns after the anchor on Pi's visible branch, the path from its last entry back to the
+ * root. An anchor off that branch, because the user rewound or forked, is not found. A last turn
+ * whose final message is not an assistant message that ended is left for the next read: a tool
+ * result or a message that stopped to call a tool means the turn is still running.
+ */
+function piTurnsAfter(
+  records: ReadonlyArray<DecodedTranscriptRecord>,
+  anchorNativeId: string,
+  fallbackTimestamp: string,
+): TurnsAfterAnchor {
+  const branch = activePiBranch(records);
+  const anchorIndex = branch.findIndex((record) => record.id === anchorNativeId);
+  if (anchorIndex === -1) return { _tag: "AnchorNotFound" };
+
+  const lastMessage = branch.findLast((record) => record.type === "message");
+  const lastTurnEnded =
+    lastMessage !== undefined &&
+    isPiConversationRecord(lastMessage) &&
+    lastMessage.message.role === "assistant" &&
+    lastMessage.message.stopReason !== "toolUse";
+
+  const turns: Array<OrchestrationV2TranscriptTurn> = [];
+  const replies: Array<string> = [];
+  let open: { userNativeId: string; userText: string; userAt: string } | undefined;
+  let lastReply: { nativeId: string; at: string } | undefined;
+  let throughNativeId = anchorNativeId;
+  const closeTurn = () => {
+    if (open === undefined) return;
+    turns.push({
+      ...open,
+      assistantNativeId: lastReply?.nativeId ?? null,
+      assistantText: replies.join("\n\n"),
+      assistantAt: lastReply?.at ?? null,
+    });
+    throughNativeId = lastReply?.nativeId ?? open.userNativeId;
+    open = undefined;
+    replies.length = 0;
+    lastReply = undefined;
+  };
+  for (const record of branch.slice(anchorIndex + 1)) {
+    if (record.id === undefined || !isPiConversationRecord(record)) continue;
+    const text = extractText(record.message.content);
+    if (text.length === 0) continue;
+    const at = normalizeTimestamp(record.timestamp, fallbackTimestamp);
+    if (record.message.role === "user") {
+      closeTurn();
+      open = { userNativeId: record.id, userText: text, userAt: at };
+    } else if (open !== undefined) {
+      replies.push(text);
+      lastReply = { nativeId: record.id, at };
+    }
+  }
+  if (lastTurnEnded) closeTurn();
+  return { _tag: "Turns", turns, throughNativeId };
+}
+
 /** Saved titles can be the raw markup of a user turn, such as the command that opened the session. */
 function claudeTitle(title: string | undefined): string | undefined {
   const trimmed = title?.trim();
@@ -779,6 +852,29 @@ export function parseAgentSessionTranscript(
       : emptyClaudeFields;
   const thread = parseAgentSessionRecords(input, records, claudeFields, 0);
   return thread === "empty" ? null : thread;
+}
+
+// A rollout marks each turn's start and end with events; one without them, as older rollouts,
+// gives no sign that its last turn is running.
+function codexLastTurn(records: ReadonlyArray<DecodedTranscriptRecord>): {
+  readonly turnId: string | undefined;
+  readonly status: CodexTurnStatus;
+} {
+  let last: { turnId: string | undefined; status: CodexTurnStatus } = {
+    turnId: undefined,
+    status: "completed",
+  };
+  for (const record of records) {
+    if (record.type !== "event_msg") continue;
+    if (record.payload?.type === "task_started") {
+      last = { turnId: record.payload.turn_id, status: "inProgress" };
+    } else if (record.payload?.type === "task_complete") {
+      last = { ...last, status: "completed" };
+    } else if (record.payload?.type === "turn_aborted") {
+      last = { ...last, status: "interrupted" };
+    }
+  }
+  return last;
 }
 
 function parseAgentSessionRecords(
@@ -900,6 +996,7 @@ function parseAgentSessionRecords(
     return false;
   };
 
+  let codexTurn: string | undefined;
   let recordIndex = -1;
   for (const record of input.source === "pi" ? activePiBranch(records) : records) {
     recordIndex += 1;
@@ -951,6 +1048,11 @@ function parseAgentSessionRecords(
       model = record.payload.model.trim();
       continue;
     }
+    // A message in an older rollout names no turn, so it belongs to the one the last start opened.
+    if (record.type === "event_msg" && record.payload?.type === "task_started") {
+      codexTurn = record.payload.turn_id ?? codexTurn;
+      continue;
+    }
     if (record.type === "event_msg" && record.payload?.type === "user_message") {
       const text = record.payload.message ?? "";
       if (text.trim().length === 0) continue;
@@ -969,6 +1071,7 @@ function parseAgentSessionRecords(
         role: "user",
         text,
         createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
+        ...(codexTurn === undefined ? {} : { nativeId: codexTurn }),
         codexResponseUser: false,
       });
       continue;
@@ -986,25 +1089,38 @@ function parseAgentSessionRecords(
     if (record.payload.role === "user" && canonicalCodexResponseUserIndices.has(recordIndex)) {
       continue;
     }
+    if (
+      record.payload.role === "user" &&
+      isCodexInjectedMessage(record.payload.internal_chat_message_metadata_passthrough)
+    ) {
+      continue;
+    }
     if (record.payload.role === "user" && hasMatchingCodexEventInTurn(extractedText)) {
       continue;
     }
     const codexNativeId =
-      record.payload.role === "user"
-        ? codexTurnId(record.payload.internal_chat_message_metadata_passthrough)
-        : null;
+      codexTurnId(record.payload.internal_chat_message_metadata_passthrough) ?? codexTurn;
     retainMessage({
       role: record.payload.role,
       text: extractedText,
       createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
-      ...(codexNativeId === null ? {} : { nativeId: codexNativeId }),
+      ...(codexNativeId === undefined ? {} : { nativeId: codexNativeId }),
       codexResponseUser: record.payload.role === "user",
     });
   }
 
   // A turn still running is left for the sync, which records it whole once it has finished.
-  if (input.source === "claudeAgent" && !isFinishedClaudeTurn(claudeFields.turn)) {
-    const lastPrompt = messages.findLastIndex((message) => message.role === "user");
+  const codexLast = input.source === "codex" ? codexLastTurn(records) : undefined;
+  const lastTurnRunning =
+    (input.source === "claudeAgent" && !isFinishedClaudeTurn(claudeFields.turn)) ||
+    // A running turn that names no id, as in older rollouts, cannot be told from the rest.
+    (codexLast?.turnId !== undefined && !isEndedCodexTurnStatus(codexLast.status));
+  if (lastTurnRunning) {
+    // Claude's turn starts at its last prompt; a Codex turn is every message that names it.
+    const lastPrompt =
+      codexLast === undefined
+        ? messages.findLastIndex((message) => message.role === "user")
+        : messages.findIndex((message) => message.nativeId === codexLast.turnId);
     // A session of one running turn has nothing earlier to show, so it stays whole.
     if (lastPrompt > 0 || (lastPrompt === 0 && droppedMessageCount > 0)) {
       const unfinished = messages.splice(lastPrompt);
@@ -1074,7 +1190,11 @@ function shouldRetainDecodedRecord(
   return (
     record.type === "session_meta" ||
     record.type === "turn_context" ||
-    (record.type === "event_msg" && record.payload?.type === "user_message") ||
+    (record.type === "event_msg" &&
+      (record.payload?.type === "user_message" ||
+        record.payload?.type === "task_started" ||
+        record.payload?.type === "task_complete" ||
+        record.payload?.type === "turn_aborted")) ||
     (record.type === "response_item" &&
       record.payload?.type === "message" &&
       (record.payload.role === "user" || record.payload.role === "assistant"))
@@ -2811,10 +2931,249 @@ export const make = Effect.gen(function* () {
 
   const transcriptPaths = new Map<string, string>();
 
-  const supportsTranscriptSync = (driver: ProviderDriverKind) => driver === "claudeAgent";
+  const supportsTranscriptSync = (driver: ProviderDriverKind) =>
+    driver === "claudeAgent" || driver === "codex" || driver === "pi";
 
   const readError = (cause: unknown) =>
     new AgentSessionScanError({ operation: "read-transcript", cause });
+
+  /** Every record of a session file that `keep` retains, within the import's memory budget. */
+  const readSessionRecords = Effect.fn("AgentSessionScanner.readSessionRecords")(function* (
+    filePath: string,
+    keep: (value: unknown) => ReadonlyArray<DecodedTranscriptRecord>,
+  ) {
+    const records: Array<DecodedTranscriptRecord> = [];
+    let recordBytes = 0;
+    const reserve = (bytes: number) => {
+      recordBytes += bytes;
+      if (recordBytes > MAX_IMPORT_HISTORY_BYTES) {
+        throw new TranscriptJsonLimitError({
+          message: "Transcript record exceeds the 32 MiB memory budget",
+        });
+      }
+    };
+    yield* fileSystem.stream(filePath).pipe(
+      Stream.decodeText,
+      Stream.splitLines,
+      Stream.runForEach((line) =>
+        Effect.try({
+          try: () => {
+            if (line.length === 0) return;
+            recordBytes = 0;
+            const reader = createTranscriptJsonReader(reserve, selectTranscriptPath);
+            reader.write(line);
+            records.push(...keep(reader.finish()));
+            if (records.length > MAX_IMPORT_RECORDS) {
+              throw new TranscriptJsonLimitError({ message: "Transcript has too many records" });
+            }
+          },
+          catch: readError,
+        }),
+      ),
+      Effect.mapError(readError),
+    );
+    return records;
+  });
+
+  // A Pi session's native thread id is its file's path.
+  const readPiTurnsAfter = Effect.fn("AgentSessionScanner.readPiTurnsAfter")(function* (
+    filePath: string,
+    anchorNativeId: string,
+    unchangedSince: TranscriptSignature | undefined,
+  ) {
+    const info = yield* statOption(filePath);
+    if (Option.isNone(info) || info.value.type !== "File") return { _tag: "NoTranscript" } as const;
+    const signature = {
+      size: Number(info.value.size),
+      mtimeMs: Option.match(info.value.mtime, {
+        onNone: () => 0,
+        onSome: (mtime) => mtime.getTime(),
+      }),
+    };
+    if (unchangedSince?.size === signature.size && unchangedSince.mtimeMs === signature.mtimeMs) {
+      return { _tag: "Unchanged" } as const;
+    }
+    const records = yield* readSessionRecords(filePath, (value) => {
+      const decoded = decodeTranscriptValue(value);
+      // Pi accepts messages this schema rejects, such as null content; keep their tree links.
+      if (Option.isNone(decoded)) return Option.toArray(decodePiEntryLinks(value));
+      // Tool output can dwarf the conversation; keep only the tree links of what is not a prompt or reply.
+      if (decoded.value.type === "message" && !isPiConversationRecord(decoded.value)) {
+        const { message: _message, ...links } = decoded.value;
+        return [links];
+      }
+      return [decoded.value];
+    });
+    return {
+      ...piTurnsAfter(records, anchorNativeId, DateTime.formatIso(yield* DateTime.now)),
+      signature,
+    };
+  });
+
+  // Where each Codex session's rollout was last found, so a poll costs one stat of that file.
+  const codexRollouts = new Map<string, string>();
+
+  /** Where an instance keeps its Codex sessions; none when the instance is not a Codex one. */
+  const codexSessionsDir = Effect.fn("AgentSessionScanner.codexSessionsDir")(function* (
+    providerInstanceId: ProviderInstanceId,
+  ) {
+    const settings = yield* serverSettings.getSettings.pipe(
+      Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-settings", cause })),
+    );
+    const instance =
+      settings.providerInstances[providerInstanceId] ??
+      (providerInstanceId === "codex" ? { driver: ProviderDriverKind.make("codex") } : undefined);
+    const config =
+      instance === undefined ? Option.none() : decodeCodexSettings(instance.config ?? {});
+    if (instance === undefined || Option.isNone(config)) return Option.none<string>();
+    const configuredHome = instance.environment?.findLast(
+      (variable) => variable.name === "CODEX_HOME",
+    )?.value;
+    const codexHome =
+      typeof configuredHome === "string" ? configuredHome : hostEnvironment.CODEX_HOME;
+    const layout = yield* resolveCodexHomeLayout(
+      config.value.homePath.trim().length === 0 &&
+        config.value.shadowHomePath.trim().length === 0 &&
+        codexHome?.trim()
+        ? { ...config.value, homePath: codexHome }
+        : config.value,
+    ).pipe(Effect.provideService(Path.Path, path));
+    return Option.some(path.join(layout.sharedHomePath, "sessions"));
+  });
+
+  /**
+   * The rollout files `wanted` accepts, newest first, from the newest day folder holding any.
+   * Codex names a rollout with its session id, so this reads folder listings and stats only.
+   */
+  const findCodexRollouts = Effect.fn("AgentSessionScanner.findCodexRollouts")(function* (
+    sessionsDir: string,
+    wanted: (match: RegExpExecArray) => boolean,
+  ) {
+    const newestFirst = (names: ReadonlyArray<string>) => names.toSorted().toReversed();
+    for (const year of newestFirst(yield* listDirectory(sessionsDir))) {
+      for (const month of newestFirst(yield* listDirectory(path.join(sessionsDir, year)))) {
+        for (const day of newestFirst(yield* listDirectory(path.join(sessionsDir, year, month)))) {
+          const directory = path.join(sessionsDir, year, month, day);
+          const files = yield* Effect.forEach(yield* listDirectory(directory), (entry) => {
+            const match = CODEX_ROLLOUT_ID_PATTERN.exec(entry);
+            return entry.startsWith("rollout-") && match !== null && wanted(match)
+              ? statTranscript(path.join(directory, entry))
+              : Effect.succeed([]);
+          });
+          const found = files.flat().toSorted((left, right) => right.mtimeMs - left.mtimeMs);
+          if (found.length > 0) return found;
+        }
+      }
+    }
+    return [];
+  });
+
+  /**
+   * A Codex session's rollout and its parsed history, found by session id wherever the session ran,
+   * with the prefixes a rewound rollout inherits. None when the rollout cannot be found or read.
+   */
+  const readCodexRollout = Effect.fn("AgentSessionScanner.readCodexRollout")(function* (
+    session: AgentSessionKey,
+  ) {
+    const sessionsDir = yield* codexSessionsDir(session.providerInstanceId);
+    if (Option.isNone(sessionsDir)) return undefined;
+    const [rollout] = yield* findCodexRollouts(
+      sessionsDir.value,
+      (match) => match[1] === session.providerSessionId,
+    );
+    if (rollout === undefined) return undefined;
+    const stats = yield* statOption(rollout.filePath);
+    if (Option.isNone(stats) || stats.value.type !== "File") return undefined;
+    const snapshot = yield* readTranscript(
+      rollout.filePath,
+      transcriptIdentity(rollout.filePath, stats.value),
+      "codex",
+    );
+    if (snapshot === null) return undefined;
+    // A rewound rollout holds a byte prefix of the rollout it replaced, oldest prefix first.
+    const prefixes: Array<ReadonlyArray<DecodedTranscriptRecord>> = [];
+    const visited = new Set<string>();
+    let historyBytes = snapshot.historyBytes;
+    for (let base = codexHistoryBase(snapshot.records); base !== undefined;) {
+      if (visited.has(base.thread_id)) return undefined;
+      visited.add(base.thread_id);
+      const [basePath] = yield* findCodexRollouts(
+        sessionsDir.value,
+        (match) => (match[2] ?? match[1]) === base?.thread_id,
+      );
+      const baseStats =
+        basePath === undefined ? Option.none() : yield* statOption(basePath.filePath);
+      if (basePath === undefined || Option.isNone(baseStats) || baseStats.value.type !== "File") {
+        return undefined;
+      }
+      const inherited = yield* readTranscript(
+        basePath.filePath,
+        transcriptIdentity(basePath.filePath, baseStats.value),
+        "codex",
+        { endByteOffset: base.end_byte_offset, historyBytes },
+      );
+      if (inherited === null) return undefined;
+      historyBytes = inherited.historyBytes;
+      prefixes.unshift(inherited.records.filter((record) => record.type !== "session_meta"));
+      base = codexHistoryBase(inherited.records);
+    }
+    const thread = parseAgentSessionRecords(
+      {
+        source: "codex",
+        providerInstanceId: session.providerInstanceId,
+        fallbackSessionId: session.providerSessionId,
+        lastActiveAtMs: rollout.mtimeMs,
+      },
+      [...prefixes.flat(), ...snapshot.records],
+      snapshot.claudeFields,
+      snapshot.droppedMessageCount,
+    );
+    if (thread === "empty" || thread === null) return undefined;
+    codexRollouts.set(
+      `${session.providerInstanceId}\0${session.providerSessionId}`,
+      rollout.filePath,
+    );
+    return { ...rollout, thread };
+  });
+
+  /** The rollout's signature, from the file remembered by an earlier read for a poll. */
+  const locateCodexRollout = Effect.fn("AgentSessionScanner.locateCodexRollout")(function* (
+    session: AgentSessionKey,
+    useRememberedPath: boolean,
+  ) {
+    const knownPath = codexRollouts.get(
+      `${session.providerInstanceId}\0${session.providerSessionId}`,
+    );
+    if (useRememberedPath && knownPath !== undefined) {
+      const known = (yield* statTranscript(knownPath))[0];
+      if (known !== undefined) return { ...known, thread: undefined };
+    }
+    return yield* readCodexRollout(session);
+  });
+
+  const readCodexTurnsAfter = Effect.fn("AgentSessionScanner.readCodexTurnsAfter")(function* (
+    session: AgentSessionKey,
+    anchorNativeId: string,
+    unchangedSince: TranscriptSignature | undefined,
+    useRememberedPath: boolean,
+  ) {
+    if (useRememberedPath && unchangedSince !== undefined) {
+      const knownPath = codexRollouts.get(
+        `${session.providerInstanceId}\0${session.providerSessionId}`,
+      );
+      const known = knownPath === undefined ? undefined : (yield* statTranscript(knownPath))[0];
+      if (known?.size === unchangedSince.size && known.mtimeMs === unchangedSince.mtimeMs) {
+        return { _tag: "Unchanged" } as const;
+      }
+    }
+    const rollout = yield* readCodexRollout(session);
+    if (rollout === undefined) return { _tag: "NoTranscript" } as const;
+    // The signature is of the file as it was read, so a change during the read shows next time.
+    return {
+      ...codexTurnsAfter(rollout.thread.messages, anchorNativeId),
+      signature: { size: rollout.size, mtimeMs: rollout.mtimeMs },
+    };
+  });
 
   /** Where an instance keeps its Claude sessions; none when the instance is not a Claude one. */
   const claudeProjectsDir = Effect.fn("AgentSessionScanner.claudeProjectsDir")(function* (
@@ -2887,6 +3246,21 @@ export const make = Effect.gen(function* () {
     "AgentSessionScanner.locateTranscript",
   )(function* ({ driver, providerInstanceId, providerSessionId, useRememberedPath }) {
     if (!supportsTranscriptSync(driver)) return Option.none();
+    if (driver === "pi") {
+      const file = (yield* statTranscript(providerSessionId))[0];
+      return file === undefined
+        ? Option.none()
+        : Option.some({ size: file.size, mtimeMs: file.mtimeMs });
+    }
+    if (driver === "codex") {
+      const rollout = yield* locateCodexRollout(
+        { providerInstanceId, providerSessionId },
+        useRememberedPath === true,
+      );
+      return rollout === undefined
+        ? Option.none()
+        : Option.some({ size: rollout.size, mtimeMs: rollout.mtimeMs });
+    }
     const projectsDir = yield* claudeProjectsDir(driver, providerInstanceId);
     if (Option.isNone(projectsDir)) return Option.none();
     const cacheKey = `${providerInstanceId}\0${providerSessionId}`;
@@ -2906,6 +3280,16 @@ export const make = Effect.gen(function* () {
       providerSessionId,
     }) {
       if (!supportsTranscriptSync(driver)) return Option.none();
+      if (driver === "pi" || driver === "codex") {
+        const knownPath =
+          driver === "pi"
+            ? providerSessionId
+            : codexRollouts.get(`${providerInstanceId}\0${providerSessionId}`);
+        const file = knownPath === undefined ? undefined : (yield* statTranscript(knownPath))[0];
+        return file === undefined
+          ? Option.none()
+          : Option.some({ size: file.size, mtimeMs: file.mtimeMs });
+      }
       const projectsDir = yield* claudeProjectsDir(driver, providerInstanceId);
       if (Option.isNone(projectsDir)) return Option.none();
       const remembered = yield* rememberedTranscript(
@@ -2927,6 +3311,17 @@ export const make = Effect.gen(function* () {
     unchangedSince,
     useRememberedPath,
   }) {
+    if (driver === "codex") {
+      return yield* readCodexTurnsAfter(
+        { providerInstanceId, providerSessionId },
+        anchorNativeId,
+        unchangedSince,
+        useRememberedPath === true,
+      );
+    }
+    if (driver === "pi") {
+      return yield* readPiTurnsAfter(providerSessionId, anchorNativeId, unchangedSince);
+    }
     if (!supportsTranscriptSync(driver)) return { _tag: "Unsupported" } as const;
     const projectsDir = yield* claudeProjectsDir(driver, providerInstanceId);
     if (Option.isNone(projectsDir)) return { _tag: "NoTranscript" } as const;
@@ -2950,39 +3345,10 @@ export const make = Effect.gen(function* () {
       return { _tag: "Unchanged" } as const;
     }
 
-    const records: Array<DecodedTranscriptRecord> = [];
-    let recordBytes = 0;
-    const reserve = (bytes: number) => {
-      recordBytes += bytes;
-      if (recordBytes > MAX_IMPORT_HISTORY_BYTES) {
-        throw new TranscriptJsonLimitError({
-          message: "Transcript record exceeds the 32 MiB memory budget",
-        });
-      }
-    };
-    yield* fileSystem.stream(transcript.filePath).pipe(
-      Stream.decodeText,
-      Stream.splitLines,
-      Stream.runForEach((line) =>
-        Effect.try({
-          try: () => {
-            if (line.length === 0) return;
-            recordBytes = 0;
-            const reader = createTranscriptJsonReader(reserve, selectTranscriptPath);
-            reader.write(line);
-            const decoded = decodeTranscriptValue(reader.finish());
-            if (Option.isSome(decoded) && decoded.value.uuid !== undefined) {
-              records.push(decoded.value);
-            }
-            if (records.length > MAX_IMPORT_RECORDS) {
-              throw new TranscriptJsonLimitError({ message: "Transcript has too many records" });
-            }
-          },
-          catch: readError,
-        }),
-      ),
-      Effect.mapError(readError),
-    );
+    const records = yield* readSessionRecords(transcript.filePath, (value) => {
+      const decoded = decodeTranscriptValue(value);
+      return Option.isSome(decoded) && decoded.value.uuid !== undefined ? [decoded.value] : [];
+    });
     // Nothing after the anchor in the file means nothing new, so the session reader is not started.
     const anchorIndex = records.findIndex((record) => record.uuid === anchorNativeId);
     if (anchorIndex >= 0 && anchorIndex === records.length - 1) {

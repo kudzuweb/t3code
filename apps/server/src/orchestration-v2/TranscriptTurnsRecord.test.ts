@@ -324,6 +324,40 @@ it.effect("skips turns recorded under an earlier provider thread of the same nat
   }).pipe(Effect.provide(layerTest)),
 );
 
+it.effect("names the turn an item belongs to in its native ref when the turn carries one", () =>
+  Effect.gen(function* () {
+    const { orchestrator, projections } = yield* setup("completed");
+    // A Codex turn is named by its turn id, and its messages by that id and their role.
+    const codexTurn: OrchestrationV2TranscriptTurn = {
+      ...turn("c", 1),
+      userNativeId: "turn-c:user:0",
+      assistantNativeId: "turn-c:assistant:0",
+      nativeRefId: "turn-c",
+    };
+
+    yield* orchestrator.dispatch(record("record-codex-turn", 1, [codexTurn]));
+    // The same turn read again is a repeat, whatever ref it names.
+    yield* orchestrator.dispatch(record("record-codex-turn-again", 2, [codexTurn]));
+
+    const after = yield* projections.getThreadProjection(threadId);
+    const recorded = after.runs.filter((run) => run.recordedFrom === "transcript");
+    assert.deepEqual(
+      recorded.map((run) => run.id),
+      ["transcript-run:native-session:turn-c:user:0"],
+    );
+    assert.deepEqual(
+      after.turnItems
+        .filter((item) => item.runId === recorded[0]?.id)
+        .map((item) => [item.type, item.nativeItemRef?.nativeId])
+        .toSorted(),
+      [
+        ["assistant_message", "turn-c"],
+        ["user_message", "turn-c"],
+      ],
+    );
+  }).pipe(Effect.provide(layerTest)),
+);
+
 it.effect("recording an older terminal turn never moves the thread's updated time back", () =>
   Effect.gen(function* () {
     yield* TestClock.setTime(Date.parse("2026-12-01T00:00:00.000Z"));

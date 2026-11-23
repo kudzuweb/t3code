@@ -160,9 +160,13 @@ function runsOffNativeBranch(input: {
   readonly providerThreadId: ProviderThreadId;
   readonly retainedNativeTurnIds: ReadonlySet<string>;
   readonly reportingRunId: RunId | undefined;
+  /** The native record each recorded terminal turn started at, which stands in for a provider turn. */
+  readonly recordedTurnNativeIds: ReadonlyMap<RunId, string>;
 }): ReadonlyArray<OrchestrationV2Run> {
   const { attempts, providerTurns, runs } = input.projection;
   const nativeTurnId = (run: OrchestrationV2Run) => {
+    const recorded = input.recordedTurnNativeIds.get(run.id);
+    if (recorded !== undefined) return recorded;
     const attempt = attempts.find((candidate) => candidate.id === run.activeAttemptId);
     if (attempt === undefined) return null;
     const ref = providerTurns.find(
@@ -407,11 +411,33 @@ export const layer: Layer.Layer<
         "nodes",
         "checkpoints",
       ]);
+      // A turn recorded from the transcript has no provider turn, so its user item names the native
+      // record it started at, the same record a T3 turn's provider turn names.
+      const recordedRunIds = projection.runs
+        .filter((run) => run.recordedFrom === "transcript")
+        .map((run) => run.id);
+      const { turnItems: recordedItems } =
+        recordedRunIds.length === 0
+          ? { turnItems: [] }
+          : yield* projections.getThreadRecords(rewind.threadId, ["turnItems"], {
+              turnItemRunIds: recordedRunIds,
+            });
+      const recordedTurnNativeIds = new Map(
+        recordedItems.flatMap((item) =>
+          item.type === "user_message" &&
+          item.runId !== null &&
+          item.nativeItemRef?.strength === "strong" &&
+          item.nativeItemRef.nativeId !== null
+            ? [[item.runId, item.nativeItemRef.nativeId] as const]
+            : [],
+        ),
+      );
       const runs = runsOffNativeBranch({
         projection,
         providerThreadId: rewind.providerThreadId,
         retainedNativeTurnIds: rewind.retainedNativeTurnIds,
         reportingRunId: input.runId,
+        recordedTurnNativeIds,
       });
       if (runs.length === 0) return [];
       const now = yield* DateTime.now;

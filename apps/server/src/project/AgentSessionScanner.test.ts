@@ -1933,8 +1933,563 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
         ).toEqual({ _tag: "Unchanged" });
         expect(chainDirectories).toHaveLength(readCount);
         expect(yield* read("claude-gone", "claudeAgent", "a2")).toEqual({ _tag: "NoTranscript" });
-        expect(yield* read("claude-live", "codex", "a2")).toEqual({ _tag: "Unsupported" });
+        expect(yield* read("claude-live", "opencode", "a2")).toEqual({ _tag: "Unsupported" });
       }),
+    );
+
+    it.effect(
+      "reads the turns a Pi session gained after an anchor, on its visible branch only",
+      () =>
+        Effect.gen(function* () {
+          const path = yield* Path.Path;
+          const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+          const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+          const sessionsDir = yield* makeTempDir("t3code-pi-sessions-");
+          const entry = (id: string, parentId: string | null, message: Record<string, unknown>) =>
+            encodeTranscriptRecord({
+              type: "message",
+              id,
+              parentId,
+              timestamp: `2026-11-20T10:00:${id.slice(1).padStart(2, "0")}.000Z`,
+              message,
+            });
+          const user = (id: string, parentId: string | null, text: string) =>
+            entry(id, parentId, { role: "user", content: [{ type: "text", text }] });
+          const assistant = (
+            id: string,
+            parentId: string,
+            text: string,
+            stopReason: "stop" | "toolUse" | "aborted",
+          ) =>
+            entry(id, parentId, {
+              role: "assistant",
+              content: [{ type: "text", text }],
+              stopReason,
+            });
+          const toolResult = (id: string, parentId: string) =>
+            entry(id, parentId, {
+              role: "toolResult",
+              toolCallId: "call-1",
+              content: [{ type: "text", text: "x".repeat(50) }],
+            });
+          const session = encodeTranscriptRecord({
+            type: "session",
+            version: 3,
+            id: "pi-session",
+            cwd: "/work/project",
+          });
+          const write = (name: string, lines: ReadonlyArray<string>, mtimeMs: number) => {
+            const filePath = path.join(sessionsDir, name);
+            return writeTranscript({
+              filePath,
+              contents: `${[session, ...lines].join("\n")}\n`,
+              mtimeMs,
+            }).pipe(Effect.as(filePath));
+          };
+          // The user rewound to e2 and asked again: e3 and e4 are an abandoned branch.
+          const rewound = yield* write(
+            "rewound.jsonl",
+            [
+              user("e1", null, "imported prompt"),
+              assistant("e2", "e1", "imported reply", "stop"),
+              user("e3", "e2", "abandoned prompt"),
+              assistant("e4", "e3", "abandoned reply", "stop"),
+              user("e5", "e2", "terminal prompt"),
+              assistant("e6", "e5", "Let me check", "toolUse"),
+              toolResult("e7", "e6"),
+              assistant("e8", "e7", "Done", "stop"),
+            ],
+            2_000_000,
+          );
+          const running = yield* write(
+            "running.jsonl",
+            [
+              user("e1", null, "first"),
+              assistant("e2", "e1", "first reply", "stop"),
+              user("e3", "e2", "second"),
+              assistant("e4", "e3", "second reply", "stop"),
+              user("e5", "e4", "third"),
+              assistant("e6", "e5", "Working", "toolUse"),
+              toolResult("e7", "e6"),
+            ],
+            2_000_000,
+          );
+          const aborted = yield* write(
+            "aborted.jsonl",
+            [
+              user("e1", null, "first"),
+              assistant("e2", "e1", "first reply", "stop"),
+              user("e3", "e2", "second"),
+              assistant("e4", "e3", "Half an answ", "aborted"),
+            ],
+            2_000_000,
+          );
+          const scanner = yield* AgentSessionScanner.AgentSessionScanner.pipe(
+            Effect.provide(layerScannerTest({ claudeHomePath, codexHomePath })),
+          );
+          const read = (
+            providerSessionId: string,
+            anchorNativeId: string,
+            unchangedSince?: AgentSessionScanner.TranscriptSignature,
+          ) =>
+            scanner.readTurnsAfter({
+              driver: ProviderDriverKind.make("pi"),
+              providerInstanceId: ProviderInstanceId.make("pi"),
+              providerSessionId,
+              anchorNativeId,
+              ...(unchangedSince === undefined ? {} : { unchangedSince }),
+            });
+
+          expect(yield* read(rewound, "e2")).toMatchObject({
+            _tag: "Turns",
+            throughNativeId: "e8",
+            turns: [
+              {
+                userNativeId: "e5",
+                userText: "terminal prompt",
+                userAt: "2026-11-20T10:00:05.000Z",
+                assistantNativeId: "e8",
+                assistantText: "Let me check\n\nDone",
+                assistantAt: "2026-11-20T10:00:08.000Z",
+              },
+            ],
+          });
+          // The anchor sits on the branch the user abandoned, so nothing can be placed.
+          expect(yield* read(rewound, "e4")).toMatchObject({
+            _tag: "AnchorNotFound",
+            signature: { mtimeMs: 2_000_000 },
+          });
+          // The third turn is still running, so only the second is read.
+          expect(yield* read(running, "e2")).toMatchObject({
+            _tag: "Turns",
+            throughNativeId: "e4",
+            turns: [{ userNativeId: "e3" }],
+          });
+          // An aborted turn has ended.
+          expect(yield* read(aborted, "e2")).toMatchObject({
+            _tag: "Turns",
+            throughNativeId: "e4",
+            turns: [{ userNativeId: "e3", assistantNativeId: "e4" }],
+          });
+          const second = yield* read(rewound, "e8");
+          expect(second).toMatchObject({ _tag: "Turns", throughNativeId: "e8", turns: [] });
+          const signature = "signature" in second ? second.signature : undefined;
+          expect(signature?.mtimeMs).toBe(2_000_000);
+          expect(yield* read(rewound, "e8", signature)).toEqual({ _tag: "Unchanged" });
+          expect(yield* read(path.join(sessionsDir, "gone.jsonl"), "e2")).toEqual({
+            _tag: "NoTranscript",
+          });
+        }),
+    );
+
+    describe("a Codex rollout", () => {
+      // A real rollout from `codex exec` and two `codex exec resume`, three turns of one word each,
+      // with Codex's long instructions and tool lists stripped and the project path replaced.
+      const rollout = NodeFS.readFileSync(
+        new URL("./fixtures/codex-rollout-three-turns.jsonl", import.meta.url),
+        "utf8",
+      );
+      const sessionId = "01a20589-acf8-7271-a193-b28afb21f588";
+      const [first, second, third] = [
+        "01a20589-afb5-7ef1-9a5c-d26339375ad4",
+        "01a20589-eb0b-7143-82e6-0af37bd9648a",
+        "01a20589-f6c5-79a3-823d-d44fcfadca6c",
+      ];
+      const lines = rollout.trimEnd().split("\n");
+      const endOf = (turnId: string) =>
+        lines.findIndex(
+          (line) => line.includes('"task_complete"') && line.includes(`"turn_id":"${turnId}"`),
+        );
+      const fixtureLines = (workspace: string, keep: (index: number) => boolean = () => true) =>
+        lines
+          .filter((_line, index) => keep(index))
+          .map((line) => line.replaceAll("/work/project", workspace));
+
+      const setup = Effect.fn("AgentSessionScanner.test.codexRollout")(function* (
+        processRunner?: Layer.Layer<ProcessRunner.ProcessRunner>,
+      ) {
+        const path = yield* Path.Path;
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const workspace = yield* makeTempDir("t3code-workspace-");
+        const scanner = yield* AgentSessionScanner.AgentSessionScanner.pipe(
+          Effect.provide(
+            layerScannerTest({
+              claudeHomePath,
+              codexHomePath,
+              ...(processRunner === undefined ? {} : { processRunner }),
+            }),
+          ),
+        );
+        const write = (
+          contents: ReadonlyArray<string>,
+          options: { day?: string; name?: string; mtimeMs?: number } = {},
+        ) =>
+          writeTranscript({
+            filePath: path.join(
+              codexHomePath,
+              "sessions",
+              "2026",
+              "11",
+              options.day ?? "22",
+              options.name ?? `rollout-2026-11-22T18-13-59-${sessionId}.jsonl`,
+            ),
+            contents: `${contents.join("\n")}\n`,
+            mtimeMs: options.mtimeMs ?? 2_000_000,
+          });
+        const read = (
+          anchorNativeId: string,
+          unchangedSince?: AgentSessionScanner.TranscriptSignature,
+          useRememberedPath?: true,
+        ) =>
+          scanner.readTurnsAfter({
+            driver: ProviderDriverKind.make("codex"),
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            providerSessionId: sessionId,
+            anchorNativeId,
+            ...(unchangedSince === undefined ? {} : { unchangedSince }),
+            ...(useRememberedPath === undefined ? {} : { useRememberedPath }),
+          });
+        return { claudeHomePath, codexHomePath, workspace, write, read, path, scanner };
+      });
+
+      it.effect(
+        "returns the turns after an anchor turn id, each named by its turn id and role",
+        () =>
+          Effect.gen(function* () {
+            const { workspace, write, read } = yield* setup();
+            yield* write(fixtureLines(workspace));
+
+            expect(yield* read(first)).toMatchObject({
+              _tag: "Turns",
+              throughNativeId: third,
+              turns: [
+                {
+                  userNativeId: `${second}:user:0`,
+                  userText: "Reply with exactly one word: beta. Do not use tools.",
+                  assistantNativeId: `${second}:assistant:0`,
+                  assistantText: "beta",
+                  nativeRefId: second,
+                },
+                {
+                  userNativeId: `${third}:user:0`,
+                  userText: "Reply with exactly one word: gamma. Do not use tools.",
+                  assistantNativeId: `${third}:assistant:0`,
+                  assistantText: "gamma",
+                  nativeRefId: third,
+                },
+              ],
+            });
+            // A T3 turn between two terminal turns anchors on its own turn id.
+            expect(yield* read(second)).toMatchObject({
+              _tag: "Turns",
+              throughNativeId: third,
+              turns: [{ nativeRefId: third }],
+            });
+            expect(yield* read("01a20589-0000-7000-8000-000000000000")).toMatchObject({
+              _tag: "AnchorNotFound",
+            });
+          }),
+      );
+
+      it.effect("reads nothing again while the rollout file is unchanged", () =>
+        Effect.gen(function* () {
+          const { workspace, write, read } = yield* setup();
+          yield* write(fixtureLines(workspace));
+
+          const caughtUp = yield* read(third);
+          expect(caughtUp).toMatchObject({ _tag: "Turns", turns: [], throughNativeId: third });
+          const signature = "signature" in caughtUp ? caughtUp.signature : undefined;
+          expect(signature?.mtimeMs).toBe(2_000_000);
+          // Only a poll trusts the remembered file; opening or focusing the thread looks again.
+          expect(yield* read(third, signature, true)).toEqual({ _tag: "Unchanged" });
+          expect((yield* read(third, signature))._tag).toBe("Turns");
+          // A turn appended to the rollout changes its size.
+          yield* write([...fixtureLines(workspace), ...fixtureLines(workspace).slice(-3)]);
+          expect((yield* read(third, signature, true))._tag).toBe("Turns");
+        }),
+      );
+
+      it.effect("holds back a last turn that has started and not ended", () =>
+        Effect.gen(function* () {
+          const { workspace, write, read } = yield* setup();
+          yield* write(fixtureLines(workspace, (index) => index !== endOf(third)));
+
+          expect(yield* read(first)).toMatchObject({
+            _tag: "Turns",
+            throughNativeId: second,
+            turns: [{ nativeRefId: second }],
+          });
+        }),
+      );
+
+      it.effect("counts a middle turn that never ended as ended, since a later turn exists", () =>
+        Effect.gen(function* () {
+          const { workspace, write, read } = yield* setup();
+          yield* write(fixtureLines(workspace, (index) => index !== endOf(second)));
+
+          expect(yield* read(first)).toMatchObject({
+            _tag: "Turns",
+            throughNativeId: third,
+            turns: [{ nativeRefId: second }, { nativeRefId: third }],
+          });
+        }),
+      );
+
+      it.effect("reads a compressed rollout", () =>
+        Effect.gen(function* () {
+          const { codexHomePath, workspace, read, path } = yield* setup();
+          yield* writeCompressedTranscript({
+            filePath: path.join(
+              codexHomePath,
+              "sessions",
+              "2026",
+              "11",
+              "22",
+              `rollout-2026-11-22T18-13-59-${sessionId}.jsonl.zst`,
+            ),
+            contents: `${fixtureLines(workspace).join("\n")}\n`,
+            mtimeMs: 2_000_000,
+          });
+
+          expect(yield* read(first)).toMatchObject({ _tag: "Turns", throughNativeId: third });
+        }),
+      );
+
+      it.effect("follows a rewound rollout that inherits the turns before the rewind", () =>
+        Effect.gen(function* () {
+          const { workspace, write, read } = yield* setup();
+          // The original rollout ran three turns. The user then rewound to after the second and
+          // asked again, which Codex writes as a new rollout holding the first two turns by offset.
+          const original = fixtureLines(workspace);
+          yield* write(original, { mtimeMs: 2_000_000 });
+          const inherited = `${original.slice(0, endOf(second) + 1).join("\n")}\n`;
+          const rewoundId = "01a20590-0000-7000-8000-000000000001";
+          const fourth = "01a20590-1111-7000-8000-000000000002";
+          const turn = (type: string, extra: object) =>
+            JSON.stringify({
+              timestamp: "2026-11-22T23:20:00.000Z",
+              type: "event_msg",
+              payload: { type, turn_id: fourth, ...extra },
+            });
+          const message = (role: "user" | "assistant", text: string) =>
+            JSON.stringify({
+              timestamp: "2026-11-22T23:20:01.000Z",
+              type: "response_item",
+              payload: {
+                type: "message",
+                role,
+                content: [{ type: role === "user" ? "input_text" : "output_text", text }],
+                internal_chat_message_metadata_passthrough: { turn_id: fourth },
+              },
+            });
+          yield* write(
+            [
+              JSON.stringify({
+                timestamp: "2026-11-22T23:20:00.000Z",
+                type: "session_meta",
+                payload: {
+                  id: sessionId,
+                  cwd: workspace,
+                  history_base: {
+                    thread_id: sessionId,
+                    end_byte_offset: Buffer.byteLength(inherited),
+                  },
+                },
+              }),
+              turn("task_started", {}),
+              message("user", "Reply with exactly one word: delta."),
+              message("assistant", "delta"),
+              turn("task_complete", {}),
+            ],
+            {
+              day: "23",
+              name: `rollout-2026-11-23T10-00-00-${sessionId}_${rewoundId}.jsonl`,
+              mtimeMs: 3_000_000,
+            },
+          );
+
+          expect(yield* read(second)).toMatchObject({
+            _tag: "Turns",
+            throughNativeId: fourth,
+            turns: [{ nativeRefId: fourth, assistantText: "delta" }],
+          });
+          // The third turn was rewound away.
+          expect(yield* read(third)).toMatchObject({ _tag: "AnchorNotFound" });
+        }),
+      );
+
+      it.effect("reads a rollout whose cwd is a worktree T3 manages", () =>
+        Effect.gen(function* () {
+          const { claudeHomePath, write, read, path } = yield* setup();
+          const worktree = path.join(claudeHomePath, ".t3", "worktrees", "project", "wt-1");
+          yield* (yield* FileSystem.FileSystem).makeDirectory(worktree, { recursive: true });
+          yield* write(fixtureLines(worktree));
+
+          expect(yield* read(first)).toMatchObject({ _tag: "Turns", throughNativeId: third });
+        }),
+      );
+
+      it.effect("shows the user's own prompt, not the instructions Codex injects before it", () =>
+        Effect.gen(function* () {
+          const { workspace } = yield* setup();
+          const thread = AgentSessionScanner.parseAgentSessionTranscript({
+            contents: fixtureLines(workspace).join("\n"),
+            source: "codex",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            fallbackSessionId: "unused",
+            lastActiveAtMs: Date.parse("2026-11-22T12:00:00.000Z"),
+          });
+
+          expect(thread?.messages.map((message) => [message.role, message.text])).toEqual([
+            ["user", "Reply with exactly one word: alpha. Do not use tools."],
+            ["assistant", "alpha"],
+            ["user", "Reply with exactly one word: beta. Do not use tools."],
+            ["assistant", "beta"],
+            ["user", "Reply with exactly one word: gamma. Do not use tools."],
+            ["assistant", "gamma"],
+          ]);
+        }),
+      );
+
+      describe("a rollout from before Codex named its turns", () => {
+        // The same session with every turn id removed, as older rollouts have it.
+        const withoutTurnIds = (workspace: string, keep: (index: number) => boolean) =>
+          fixtureLines(workspace, keep).map((line) =>
+            JSON.stringify(JSON.parse(line), (key, value) =>
+              key === "turn_id" || key === "turn_attribution" ? undefined : value,
+            ),
+          );
+
+        it.effect("is not read, since its turns cannot be told apart", () =>
+          Effect.gen(function* () {
+            const { workspace, write, read } = yield* setup();
+            yield* write(withoutTurnIds(workspace, () => true));
+
+            expect(yield* read(first)).toMatchObject({ _tag: "Unsupported" });
+          }),
+        );
+
+        it.effect("keeps every message in the import, though its last turn never ended", () =>
+          Effect.gen(function* () {
+            const { workspace } = yield* setup();
+            const thread = AgentSessionScanner.parseAgentSessionTranscript({
+              contents: withoutTurnIds(workspace, (index) => index !== endOf(third)).join("\n"),
+              source: "codex",
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              fallbackSessionId: "unused",
+              lastActiveAtMs: Date.parse("2026-11-22T12:00:00.000Z"),
+            });
+
+            expect(thread?.messages).toHaveLength(6);
+          }),
+        );
+      });
+
+      it.effect("finds the rollout again where it moved when the file it knew is gone", () =>
+        Effect.gen(function* () {
+          const { codexHomePath, workspace, write, read, path } = yield* setup();
+          yield* write(fixtureLines(workspace));
+          const known = yield* read(third);
+          const signature = "signature" in known ? known.signature : undefined;
+          expect(yield* read(third, signature, true)).toEqual({ _tag: "Unchanged" });
+
+          const fileSystem = yield* FileSystem.FileSystem;
+          yield* fileSystem.remove(path.join(codexHomePath, "sessions", "2026", "11", "22"), {
+            recursive: true,
+          });
+          yield* write(fixtureLines(workspace), { day: "24", mtimeMs: 2_000_000 });
+
+          expect((yield* read(third, signature, true))._tag).toBe("Turns");
+        }),
+      );
+
+      it.effect(
+        "locates and reads a rollout without starting a process, though its cwd is a git checkout",
+        () =>
+          Effect.gen(function* () {
+            const commands: Array<string> = [];
+            const runner = Layer.mock(ProcessRunner.ProcessRunner)({
+              run: (input) =>
+                Effect.sync(() => commands.push(input.command)).pipe(
+                  Effect.andThen(Effect.die("no process")),
+                ),
+            });
+            const { workspace, write, read, scanner, path } = yield* setup(runner);
+            const fileSystem = yield* FileSystem.FileSystem;
+            // Resolving the project of a checkout reads its git files, one process each.
+            yield* fileSystem.makeDirectory(path.join(workspace, ".git"));
+            yield* fileSystem.writeFileString(path.join(workspace, ".git", "config"), "[core]\n");
+            yield* fileSystem.writeFileString(
+              path.join(workspace, ".git", "HEAD"),
+              "ref: refs/heads/main\n",
+            );
+            yield* write(fixtureLines(workspace));
+
+            expect((yield* read(first))._tag).toBe("Turns");
+            const located = yield* scanner.locateTranscript({
+              driver: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              providerSessionId: sessionId,
+            });
+            expect(Option.isSome(located)).toBe(true);
+            expect(commands).toEqual([]);
+          }),
+      );
+
+      it.effect(
+        "returns the file's signature with an anchor it did not find, so a poll waits",
+        () =>
+          Effect.gen(function* () {
+            const { workspace, write, read } = yield* setup();
+            yield* write(fixtureLines(workspace));
+
+            const missing = yield* read("01a20589-0000-7000-8000-000000000000");
+            expect(missing).toMatchObject({
+              _tag: "AnchorNotFound",
+              signature: { mtimeMs: 2_000_000 },
+            });
+            const signature = "signature" in missing ? missing.signature : undefined;
+            expect(yield* read("01a20589-0000-7000-8000-000000000000", signature, true)).toEqual({
+              _tag: "Unchanged",
+            });
+          }),
+      );
+
+      it.effect("locates the rollout by session id and peeks at it afterwards", () =>
+        Effect.gen(function* () {
+          const { workspace, write, scanner } = yield* setup();
+          yield* write(fixtureLines(workspace));
+          const session = {
+            driver: ProviderDriverKind.make("codex"),
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            providerSessionId: sessionId,
+          };
+
+          expect(yield* scanner.peekTranscriptSignature(session)).toEqual(Option.none());
+          const located = yield* scanner.locateTranscript(session);
+          expect(Option.isSome(located) && located.value.mtimeMs).toBe(2_000_000);
+          expect(yield* scanner.peekTranscriptSignature(session)).toEqual(located);
+        }),
+      );
+    });
+
+    it.effect.each(["claudeAgent", "codex", "pi", "opencode"])(
+      "says whether a %s session can be read for terminal turns",
+      (driver) =>
+        Effect.gen(function* () {
+          const scanner = yield* AgentSessionScanner.AgentSessionScanner.pipe(
+            Effect.provide(
+              layerScannerTest({
+                claudeHomePath: yield* makeTempDir("t3code-claude-home-"),
+                codexHomePath: yield* makeTempDir("t3code-codex-home-"),
+              }),
+            ),
+          );
+          expect(scanner.supportsTranscriptSync(ProviderDriverKind.make(driver))).toBe(
+            driver !== "opencode",
+          );
+        }),
     );
 
     it.effect(
@@ -3759,6 +4314,68 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")(
 );
 
 describe("parseAgentSessionTranscript", () => {
+  it("names the turn a Codex message belongs to, which Codex's app server uses as the turn's id", () => {
+    const thread = AgentSessionScanner.parseAgentSessionTranscript({
+      contents: [
+        encodeTranscriptRecord({ type: "session_meta", payload: { id: "codex-session" } }),
+        encodeTranscriptRecord({
+          type: "response_item",
+          timestamp: "2026-11-20T10:00:00.000Z",
+          payload: {
+            type: "message",
+            role: "user",
+            internal_chat_message_metadata_passthrough: { turn_id: "turn-1" },
+            content: [{ type: "input_text", text: "Prompt" }],
+          },
+        }),
+        encodeTranscriptRecord({
+          type: "response_item",
+          timestamp: "2026-11-20T10:00:05.000Z",
+          payload: {
+            type: "message",
+            role: "assistant",
+            internal_chat_message_metadata_passthrough: { turn_id: "turn-1" },
+            content: [{ type: "output_text", text: "Reply" }],
+          },
+        }),
+        // Older rollouts name no turn on a message, only on the event that starts the turn.
+        encodeTranscriptRecord({
+          type: "event_msg",
+          payload: { type: "task_started", turn_id: "turn-2" },
+        }),
+        encodeTranscriptRecord({
+          type: "event_msg",
+          timestamp: "2026-11-20T10:01:00.000Z",
+          payload: { type: "user_message", message: "Second prompt" },
+        }),
+        encodeTranscriptRecord({
+          type: "response_item",
+          timestamp: "2026-11-20T10:01:05.000Z",
+          payload: {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "Second reply" }],
+          },
+        }),
+        encodeTranscriptRecord({
+          type: "event_msg",
+          payload: { type: "task_complete", turn_id: "turn-2" },
+        }),
+      ].join("\n"),
+      source: "codex",
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      fallbackSessionId: "unused",
+      lastActiveAtMs: Date.parse("2026-11-20T12:00:00.000Z"),
+    });
+
+    expect(thread?.messages.map((message) => [message.role, message.nativeId])).toEqual([
+      ["user", "turn-1"],
+      ["assistant", "turn-1"],
+      ["user", "turn-2"],
+      ["assistant", "turn-2"],
+    ]);
+  });
+
   it.each([false, true])(
     "handles the exact record limit and an interior blank overflow=%s",
     (overflow) => {

@@ -1,4 +1,4 @@
-import { assert, it } from "@effect/vitest";
+import { assert, describe, it } from "@effect/vitest";
 import {
   CommandId,
   EventId,
@@ -15,6 +15,7 @@ import {
   TurnItemId,
   type OrchestrationV2TranscriptTurn,
 } from "@t3tools/contracts";
+import { PI_PROVIDER } from "@t3tools/provider-pi/server";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -70,7 +71,7 @@ const terminalTurn: OrchestrationV2TranscriptTurn = {
 };
 
 type SeedRun = {
-  readonly status: "completed" | "running" | "failed" | "cancelled";
+  readonly status: "completed" | "running" | "failed" | "cancelled" | "rolled_back";
   /**
    * What the run left in the provider: its native turn id, `"no-native-id"` for a turn without
    * one, or `"never-started"` for a run that never reached the provider.
@@ -82,6 +83,8 @@ type SeedRun = {
   readonly turnStrength?: "strong" | "weak";
   /** A provider thread other than the active one, which holds the same native session. */
   readonly onEarlierProviderThread?: true;
+  /** The run left an assistant message in the thread. */
+  readonly output?: true;
 };
 
 const seed = Effect.fn("TranscriptSyncService.test.seed")(function* (input: {
@@ -89,7 +92,12 @@ const seed = Effect.fn("TranscriptSyncService.test.seed")(function* (input: {
   /** Native ids of imported history items, which have no run. */
   readonly importedItems?: ReadonlyArray<string>;
   readonly nativeConversationHeadRef?: boolean;
+  /** The driver of the native session; Claude unless the test says otherwise. */
+  readonly provider?: "claudeAgent" | "codex" | "pi";
+  /** The native record a provider that keeps its position there, such as Pi, left after its last turn. */
+  readonly head?: string;
 }) {
+  const kind = ProviderDriverKind.make(input.provider ?? "claudeAgent");
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const now = yield* DateTime.now;
@@ -114,7 +122,7 @@ const seed = Effect.fn("TranscriptSyncService.test.seed")(function* (input: {
       type: "provider-thread.updated",
       threadId,
       occurredAt: now,
-      payload: { ...providerThreadAt(now, false), id: earlierProviderThreadId },
+      payload: { ...providerThreadAt(now, false, kind), id: earlierProviderThreadId },
     });
   }
   yield* projections.apply({
@@ -122,7 +130,7 @@ const seed = Effect.fn("TranscriptSyncService.test.seed")(function* (input: {
     type: "provider-thread.updated",
     threadId,
     occurredAt: now,
-    payload: providerThreadAt(now, input.nativeConversationHeadRef === true),
+    payload: providerThreadAt(now, input.nativeConversationHeadRef === true, kind, input.head),
   });
   for (const [index, nativeId] of (input.importedItems ?? []).entries()) {
     yield* projections.apply({
@@ -137,7 +145,7 @@ const seed = Effect.fn("TranscriptSyncService.test.seed")(function* (input: {
         nodeId: null,
         providerThreadId: null,
         providerTurnId: null,
-        nativeItemRef: { driver, nativeId, strength: "strong" },
+        nativeItemRef: { driver: kind, nativeId, strength: "strong" },
         parentItemId: null,
         ordinal: index + 1,
         status: "completed",
@@ -195,7 +203,7 @@ const seed = Effect.fn("TranscriptSyncService.test.seed")(function* (input: {
           nativeTurnRef:
             run.turn === "no-native-id"
               ? null
-              : { driver, nativeId: run.turn, strength: run.turnStrength ?? "weak" },
+              : { driver: kind, nativeId: run.turn, strength: run.turnStrength ?? "weak" },
           ordinal,
           status: run.turnStatus ?? "completed",
           startedAt: now,
@@ -203,21 +211,57 @@ const seed = Effect.fn("TranscriptSyncService.test.seed")(function* (input: {
         },
       });
     }
+    if (run.output === true) {
+      yield* projections.apply({
+        id: EventId.make(`sync:output:${ordinal}`),
+        type: "turn-item.updated",
+        threadId,
+        occurredAt: now,
+        payload: {
+          id: TurnItemId.make(`output:${ordinal}`),
+          threadId,
+          runId: RunId.make(`run:${ordinal}`),
+          nodeId: null,
+          providerThreadId,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal: 0,
+          status: "completed",
+          title: null,
+          startedAt: now,
+          completedAt: now,
+          updatedAt: now,
+          type: "assistant_message",
+          messageId: MessageId.make(`output-message:${ordinal}`),
+          text: "It wrote something before it lost its place.",
+          streaming: false,
+        },
+      });
+    }
   }
   return projections;
 });
 
-const providerThreadAt = (now: DateTime.Utc, pinnedHead: boolean) => ({
+const providerThreadAt = (
+  now: DateTime.Utc,
+  pinnedHead: boolean,
+  kind: ProviderDriverKind = driver,
+  head?: string,
+) => ({
   id: providerThreadId,
-  driver,
+  driver: kind,
   providerInstanceId: instanceId,
   providerSessionId: null,
   appThreadId: threadId,
   ownerNodeId: null,
-  nativeThreadRef: { driver, nativeId: "native-session", strength: "strong" as const },
-  nativeConversationHeadRef: pinnedHead
-    ? { driver, nativeId: "rolled-back-head", strength: "weak" as const }
-    : null,
+  nativeThreadRef: { driver: kind, nativeId: "native-session", strength: "strong" as const },
+  nativeConversationHeadRef:
+    head !== undefined
+      ? { driver: kind, nativeId: head, strength: "strong" as const }
+      : pinnedHead
+        ? { driver: kind, nativeId: "rolled-back-head", strength: "weak" as const }
+        : null,
   status: "idle" as const,
   firstRunOrdinal: null,
   lastRunOrdinal: null,
@@ -670,6 +714,312 @@ it.effect("reads again after a dispatch the thread refused, though the file is u
   }).pipe(Effect.provide(layerStores)),
 );
 
+describe("Codex sessions", () => {
+  it.effect.each([
+    {
+      name: "a T3 run anchors on the turn id its provider turn ended with",
+      seeded: {
+        provider: "codex",
+        runs: [{ status: "completed", turn: "turn-t3", turnStrength: "strong" }],
+      },
+      anchor: "turn-t3",
+    },
+    {
+      name: "imported history anchors on the turn id of its last item",
+      seeded: { provider: "codex", runs: [], importedItems: ["turn-a", "turn-b"] },
+      anchor: "turn-b",
+    },
+  ] as const)("reads the rollout when $name", ({ seeded, anchor }) =>
+    Effect.gen(function* () {
+      const projections = yield* seed(seeded);
+      const sync = yield* makeService({ [anchor]: turnsOf("one") });
+
+      assert.equal(yield* sync.service.sync(threadId), 1);
+
+      assert.deepEqual(sync.anchors, [anchor]);
+      assert.equal(
+        (yield* projections.getThreadProjection(threadId)).runs.at(-1)?.recordedFrom,
+        "transcript",
+      );
+    }).pipe(Effect.provide(layerStores)),
+  );
+
+  it.effect.each([
+    {
+      name: "the latest run's provider turn has a weak Codex turn id",
+      seeded: { provider: "codex", runs: [{ status: "completed", turn: "turn-t3" }] },
+    },
+    {
+      name: "the provider turn never ended",
+      seeded: {
+        provider: "codex",
+        runs: [
+          { status: "completed", turn: "turn-t3", turnStrength: "strong", turnStatus: "running" },
+        ],
+      },
+    },
+    {
+      name: "a rollback pinned the native conversation head",
+      seeded: {
+        provider: "codex",
+        runs: [{ status: "completed", turn: "turn-t3", turnStrength: "strong" }],
+        nativeConversationHeadRef: true,
+      },
+    },
+  ] as const)("does not read the rollout when $name", ({ seeded }) =>
+    Effect.gen(function* () {
+      yield* seed(seeded);
+      const sync = yield* makeService({ "turn-t3": turnsOf("one") });
+
+      assert.equal(yield* sync.service.sync(threadId), 0);
+
+      assert.deepEqual(sync.anchors, []);
+    }).pipe(Effect.provide(layerStores)),
+  );
+
+  it.effect("moves its anchor to the turn it recorded, which names the turn and not an item", () =>
+    Effect.gen(function* () {
+      const projections = yield* seed({
+        provider: "codex",
+        runs: [{ status: "completed", turn: "turn-t3", turnStrength: "strong" }],
+      });
+      const recorded: AgentSessionScanner.TurnsAfterAnchor = {
+        _tag: "Turns",
+        turns: [{ ...terminal("one"), nativeRefId: "turn-one" }],
+        throughNativeId: "turn-one",
+      };
+      const sync = yield* makeService({
+        "turn-t3": recorded,
+        "turn-one": { _tag: "Turns", turns: [], throughNativeId: "turn-one" },
+      });
+
+      assert.equal(yield* sync.service.sync(threadId), 1);
+      assert.equal(yield* sync.service.sync(threadId), 0);
+
+      assert.deepEqual(sync.anchors, ["turn-t3", "turn-one"]);
+      assert.equal((yield* projections.getThreadProjection(threadId)).runs.length, 2);
+    }).pipe(Effect.provide(layerStores)),
+  );
+});
+
+describe("Pi sessions", () => {
+  it.effect("anchors on the leaf entry its last T3 turn ended at, though the head is set", () =>
+    Effect.gen(function* () {
+      const projections = yield* seed({
+        provider: "pi",
+        head: "leaf-1",
+        runs: [{ status: "completed", turn: "user-entry-1", turnStrength: "strong" }],
+      });
+      const sync = yield* makeService({ "leaf-1": turnsOf("one") });
+
+      assert.equal(yield* sync.service.sync(threadId), 1);
+
+      assert.deepEqual(sync.anchors, ["leaf-1"]);
+      assert.equal(
+        (yield* projections.getThreadProjection(threadId)).runs.at(-1)?.recordedFrom,
+        "transcript",
+      );
+    }).pipe(Effect.provide(layerStores)),
+  );
+
+  it.effect("anchors on the last imported entry when no T3 turn has run", () =>
+    Effect.gen(function* () {
+      yield* seed({ provider: "pi", runs: [], importedItems: ["entry-1", "entry-2"] });
+      const sync = yield* makeService({ "entry-2": turnsOf("one") });
+
+      assert.equal(yield* sync.service.sync(threadId), 1);
+
+      assert.deepEqual(sync.anchors, ["entry-2"]);
+    }).pipe(Effect.provide(layerStores)),
+  );
+
+  it.effect("follows a T3 turn after a terminal turn to the head that turn left", () =>
+    Effect.gen(function* () {
+      const projections = yield* seed({
+        provider: "pi",
+        head: "leaf-1",
+        runs: [{ status: "completed", turn: "user-entry-1", turnStrength: "strong" }],
+      });
+      const sync = yield* makeService({ "leaf-1": turnsOf("one"), "leaf-2": turnsOf("two") });
+      assert.equal(yield* sync.service.sync(threadId), 1);
+
+      // A second T3 turn follows the terminal turn and moves the head.
+      const now = yield* DateTime.now;
+      yield* projections.apply({
+        id: EventId.make("sync:run:pi-again"),
+        type: "run.created",
+        threadId,
+        occurredAt: now,
+        payload: {
+          id: RunId.make("run:pi-again"),
+          threadId,
+          ordinal: 3,
+          providerInstanceId: instanceId,
+          modelSelection,
+          providerThreadId,
+          userMessageId: MessageId.make("message:pi-again"),
+          rootNodeId: null,
+          activeAttemptId: RunAttemptId.make("attempt:pi-again"),
+          status: "completed",
+          requestedAt: now,
+          startedAt: now,
+          completedAt: now,
+          checkpointId: null,
+          contextHandoffId: null,
+        },
+      });
+      yield* projections.apply({
+        id: EventId.make("sync:turn:pi-again"),
+        type: "provider-turn.updated",
+        threadId,
+        occurredAt: now,
+        payload: {
+          id: ProviderTurnId.make("provider-turn:pi-again"),
+          providerThreadId,
+          nodeId: NodeId.make("node:pi-again"),
+          runAttemptId: RunAttemptId.make("attempt:pi-again"),
+          nativeTurnRef: { driver: PI_PROVIDER, nativeId: "user-entry-2", strength: "strong" },
+          ordinal: 2,
+          status: "completed",
+          startedAt: now,
+          completedAt: now,
+        },
+      });
+      yield* projections.apply({
+        id: EventId.make("sync:provider-thread:pi-again"),
+        type: "provider-thread.updated",
+        threadId,
+        occurredAt: now,
+        payload: providerThreadAt(now, false, PI_PROVIDER, "leaf-2"),
+      });
+      assert.equal(yield* sync.service.sync(threadId), 1);
+
+      assert.deepEqual(sync.anchors, ["leaf-1", "leaf-2"]);
+      assert.equal((yield* projections.getThreadProjection(threadId)).runs.length, 4);
+    }).pipe(Effect.provide(layerStores)),
+  );
+
+  it.effect(
+    "writes nothing when the user rewound the session, so the head is not on its branch",
+    () =>
+      Effect.gen(function* () {
+        const projections = yield* seed({
+          provider: "pi",
+          head: "leaf-1",
+          runs: [{ status: "completed", turn: "user-entry-1", turnStrength: "strong" }],
+        });
+        const sync = yield* makeService({});
+
+        assert.equal(yield* sync.service.sync(threadId), 0);
+
+        assert.deepEqual(sync.anchors, ["leaf-1"]);
+        assert.equal((yield* projections.getThreadProjection(threadId)).runs.length, 1);
+      }).pipe(Effect.provide(layerStores)),
+  );
+
+  it.effect("anchors on the head a rollback left, passing over the runs it removed", () =>
+    Effect.gen(function* () {
+      yield* seed({
+        provider: "pi",
+        head: "fork-leaf",
+        runs: [
+          { status: "completed", turn: "user-entry-1", turnStrength: "strong" },
+          { status: "rolled_back", turn: "no-native-id" },
+        ],
+      });
+      const sync = yield* makeService({ "fork-leaf": turnsOf("one") });
+
+      assert.equal(yield* sync.service.sync(threadId), 1);
+
+      assert.deepEqual(sync.anchors, ["fork-leaf"]);
+    }).pipe(Effect.provide(layerStores)),
+  );
+
+  it.effect.each([
+    {
+      name: "the latest run's provider turn holds a weak synthetic ref, as after a stale cursor",
+      seeded: {
+        provider: "pi",
+        head: "leaf-1",
+        runs: [{ status: "completed", turn: "turn:synthetic" }],
+      },
+    },
+    {
+      name: "the latest run's provider turn left no entry ref",
+      seeded: {
+        provider: "pi",
+        head: "leaf-1",
+        runs: [{ status: "failed", turn: "no-native-id" }],
+      },
+    },
+    {
+      name: "the provider thread has no head",
+      seeded: {
+        provider: "pi",
+        runs: [{ status: "completed", turn: "user-entry-1", turnStrength: "strong" }],
+      },
+    },
+  ] as const)("does not read the Pi session when $name", ({ seeded }) =>
+    Effect.gen(function* () {
+      yield* seed(seeded);
+      const sync = yield* makeService({ "leaf-1": turnsOf("one") });
+
+      assert.equal(yield* sync.service.sync(threadId), 0);
+
+      assert.deepEqual(sync.anchors, []);
+    }).pipe(Effect.provide(layerStores)),
+  );
+});
+
+describe("a newest turn with no native ref", () => {
+  const providers = [
+    { provider: "claudeAgent", anchor: "a-t3", head: undefined, turn: "a-t3" },
+    { provider: "codex", anchor: "turn-t3", head: undefined, turn: "turn-t3" },
+    { provider: "pi", anchor: "leaf-1", head: "leaf-1", turn: "user-entry-1" },
+  ] as const;
+
+  it.effect.each(providers)(
+    "is passed over for the turn before it when it wrote nothing: $provider",
+    ({ provider, anchor, head, turn }) =>
+      Effect.gen(function* () {
+        yield* seed({
+          provider,
+          ...(head === undefined ? {} : { head }),
+          runs: [
+            { status: "completed", turn, turnStrength: "strong" },
+            // A Codex /goal control turn, or a Pi turn that wrote no entries.
+            { status: "completed", turn: "no-native-id" },
+          ],
+        });
+        const sync = yield* makeService({ [anchor]: turnsOf("one") });
+
+        assert.equal(yield* sync.service.sync(threadId), 1);
+
+        assert.deepEqual(sync.anchors, [anchor]);
+      }).pipe(Effect.provide(layerStores)),
+  );
+
+  it.effect.each(providers)(
+    "stops the sync when it left output, since nothing after it can be told apart: $provider",
+    ({ provider, head, turn }) =>
+      Effect.gen(function* () {
+        yield* seed({
+          provider,
+          ...(head === undefined ? {} : { head }),
+          runs: [
+            { status: "completed", turn, turnStrength: "strong" },
+            { status: "failed", turn: "no-native-id", output: true },
+          ],
+        });
+        const sync = yield* makeService({});
+
+        assert.equal(yield* sync.service.sync(threadId), 0);
+
+        assert.deepEqual(sync.anchors, []);
+      }).pipe(Effect.provide(layerStores)),
+  );
+});
+
 it.effect("syncs a batch of threads, and one that fails does not stop the others", () =>
   Effect.gen(function* () {
     yield* seed({ runs: [{ status: "completed", turn: "a-t3" }] });
@@ -766,6 +1116,35 @@ it.effect("a poll over unchanged sessions reads nothing from the projection", ()
     assert.equal(sync.recordReads.length, readsAfterFirstSync);
     assert.equal(sync.asked.length, 1);
   }).pipe(Effect.provide(layerStores)),
+);
+
+it.effect.each(["codex", "pi"] as const)(
+  "a poll over an unchanged %s session reads no turns and no projection",
+  (provider) =>
+    Effect.gen(function* () {
+      yield* seed({
+        provider,
+        ...(provider === "pi" ? { head: "leaf-1" } : {}),
+        runs: [{ status: "completed", turn: "turn-t3", turnStrength: "strong" }],
+      });
+      const anchor = provider === "pi" ? "leaf-1" : "turn-t3";
+      const sync = yield* makeService(
+        { [anchor]: { _tag: "Turns", turns: [], throughNativeId: anchor } },
+        { peek: Option.some(signature) },
+      );
+      yield* sync.service.sync(threadId);
+      const readsAfterFirstSync = sync.recordReads.length;
+
+      assert.equal(
+        yield* sync.service.pollMany([
+          { ...candidateFor(), driver: ProviderDriverKind.make(provider) },
+        ]),
+        0,
+      );
+
+      assert.equal(sync.recordReads.length, readsAfterFirstSync);
+      assert.equal(sync.asked.length, 1);
+    }).pipe(Effect.provide(layerStores)),
 );
 
 it.effect("a poll syncs a session whose file changed since it was read", () =>

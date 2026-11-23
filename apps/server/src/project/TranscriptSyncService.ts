@@ -10,6 +10,7 @@ import {
   type ProviderThreadId,
   type ThreadId,
 } from "@t3tools/contracts";
+import { PI_PROVIDER } from "@t3tools/provider-pi/server";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as Context from "effect/Context";
 import * as Clock from "effect/Clock";
@@ -18,10 +19,12 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 
-import { claudeTurnCursor } from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
+import { CLAUDE_PROVIDER, claudeTurnCursor } from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
+import { CODEX_DRIVER_KIND } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import type { ProjectionRecords } from "../orchestration-v2/ProjectionStore.ts";
 import * as AgentSessionScanner from "./AgentSessionScanner.ts";
+import { codexTurnCursor } from "./CodexTurns.ts";
 
 /**
  * Brings a thread up to date with turns made in its native session outside T3. A turn T3 cannot
@@ -76,6 +79,26 @@ const providerTurnEnded = (turn: OrchestrationV2ProviderTurn) =>
   turn.status === "failed" ||
   turn.status === "cancelled";
 
+/**
+ * Where an ended T3 turn left its provider's session, or null when that cannot be told. Claude
+ * and Codex name it in the turn. Pi's turn names only the entry it started at, and the end of the
+ * turn is the provider thread's head, which the same write set when it captured the turn's entries.
+ */
+const endedTurnCursor = (
+  providerThread: OrchestrationV2ProviderThread,
+  turn: OrchestrationV2ProviderTurn,
+): string | null => {
+  if (!providerTurnEnded(turn)) return null;
+  if (providerThread.driver === CLAUDE_PROVIDER) return claudeTurnCursor(turn);
+  if (providerThread.driver === CODEX_DRIVER_KIND) return codexTurnCursor(turn);
+  if (providerThread.driver === PI_PROVIDER) {
+    return turn.nativeTurnRef?.strength === "strong"
+      ? (providerThread.nativeConversationHeadRef?.nativeId ?? null)
+      : null;
+  }
+  return null;
+};
+
 const isTerminal = (run: OrchestrationV2Run) =>
   run.status !== "preparing" &&
   run.status !== "queued" &&
@@ -100,6 +123,16 @@ const make = Effect.gen(function* () {
     items.findLast((item) => item.nativeItemRef?.nativeId != null)?.nativeItemRef?.nativeId ??
     undefined;
 
+  const leftOutput = Effect.fn("TranscriptSyncService.leftOutput")(function* (
+    threadId: ThreadId,
+    run: OrchestrationV2Run,
+  ) {
+    const { turnItems } = yield* orchestrator.getThreadRecords(threadId, ["turnItems"], {
+      turnItemRunIds: [run.id],
+    });
+    return turnItems.some((item) => item.type === "assistant_message" && item.text.trim() !== "");
+  });
+
   /**
    * Where the transcript was last shown: the newest run that reached this provider thread decides.
    * Runs that never started wrote nothing to the transcript, so they are passed over. Null means
@@ -122,6 +155,8 @@ const make = Effect.gen(function* () {
     );
     const newestFirst = records.runs.toSorted((left, right) => right.ordinal - left.ordinal);
     for (const run of newestFirst) {
+      // A run a rollback removed no longer shows where the session stands.
+      if (run.status === "rolled_back") continue;
       if (run.providerThreadId === null || !sessionThreadIds.has(run.providerThreadId)) continue;
       if (run.recordedFrom === "transcript") {
         const { turnItems } = yield* orchestrator.getThreadRecords(threadId, ["turnItems"], {
@@ -131,9 +166,19 @@ const make = Effect.gen(function* () {
       }
       const providerTurn = Orchestrator.providerTurnForRun(records, run);
       if (providerTurn === undefined) continue;
-      // A turn that never ended, or ended with no record uuid (it failed before Claude wrote
-      // anything), may sit beside output of its own, so nothing after it can be told apart.
-      return providerTurnEnded(providerTurn) ? claudeTurnCursor(providerTurn) : null;
+      const cursor = endedTurnCursor(providerThread, providerTurn);
+      if (cursor !== null) return cursor;
+      // A turn with no native ref that wrote nothing never reached the provider's session, as
+      // with a Codex goal control turn, so the anchor stays where the turn before it left it. One
+      // that wrote something may sit beside output of its own, so nothing after it can be told apart.
+      if (
+        providerTurn.nativeTurnRef === null &&
+        providerTurnEnded(providerTurn) &&
+        !(yield* leftOutput(threadId, run))
+      ) {
+        continue;
+      }
+      return null;
     }
     const { turnItems } = yield* orchestrator.getThreadRecords(threadId, ["turnItems"], {
       turnItemRunIds: [null],
@@ -202,7 +247,11 @@ const make = Effect.gen(function* () {
       return 0;
     }
     // A rollback resumes the next T3 turn at its head, which leaves out what the terminal added.
-    if (providerThread.nativeConversationHeadRef !== null) {
+    // Pi keeps its head there after every turn, so only the other providers read it as a rollback.
+    if (
+      providerThread.driver !== PI_PROVIDER &&
+      providerThread.nativeConversationHeadRef !== null
+    ) {
       yield* rememberFile(providerThread, nativeSessionId, pollingRememberedPath);
       quietSince.set(providerThread.id, yield* Clock.currentTimeMillis);
       return 0;
