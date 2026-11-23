@@ -10,7 +10,7 @@ import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
-import type { ScopedProjectRef } from "@t3tools/contracts";
+import type { ScopedProjectRef, ThreadId } from "@t3tools/contracts";
 import { useNavigate } from "@tanstack/react-router";
 import { T, useGT, useMessages } from "gt-react";
 import { GitBranchIcon } from "lucide-react";
@@ -26,7 +26,6 @@ import { buildThreadRouteParams } from "~/threadRoutes";
 
 import { CommandPaletteContent } from "../CommandPaletteContent";
 import { RelativeTime } from "../RelativeTime";
-import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { CommandDialog, CommandDialogPopup } from "../ui/command";
 import { ScrollArea } from "../ui/scroll-area";
@@ -96,14 +95,7 @@ function ProjectSessions(props: { readonly projectRef: ScopedProjectRef }) {
   const importingRef = useRef(false);
   const [failure, setFailure] = useState<string | null>(null);
 
-  // A cached list can name threads that were deleted or created since, so "In T3" waits for an
-  // answer from this open. Until then a pick goes through the server, which resolves it correctly.
-  const [openedAt] = useState(() => Date.now());
-  const isFresh = sessions.dataUpdatedAt >= openedAt;
-  const cachedSessions = sessions.data?.sessions ?? [];
-  const rows = buildResumeSessionRows(
-    isFresh ? cachedSessions : cachedSessions.map((session) => ({ ...session, threadId: null })),
-  );
+  const rows = buildResumeSessionRows(sessions.data?.sessions ?? []);
   const visibleRows = filterResumeSessionRows(rows, search);
   const [searchSeen, setSearchSeen] = useState(search);
   if (searchSeen !== search) {
@@ -124,7 +116,7 @@ function ProjectSessions(props: { readonly projectRef: ScopedProjectRef }) {
     return () => window.removeEventListener("focus", sessions.refresh);
   }, [sessions.refresh]);
 
-  const openThread = (threadId: NonNullable<ResumeSessionRow["threadId"]>) => {
+  const openThread = (threadId: ThreadId) => {
     closeDialog();
     void navigate({
       to: "/$environmentId/$threadId",
@@ -135,10 +127,6 @@ function ProjectSessions(props: { readonly projectRef: ScopedProjectRef }) {
   const choose = async (row: ResumeSessionRow) => {
     if (importingRef.current) return;
     setFailure(null);
-    if (row.state === "open" && row.threadId !== null) {
-      openThread(row.threadId);
-      return;
-    }
     importingRef.current = true;
     setResumingKey(row.key);
     const openedFor = appAtomRegistry.get(resumeSessionRequestAtom);
@@ -208,11 +196,6 @@ function ProjectSessions(props: { readonly projectRef: ScopedProjectRef }) {
       {failure !== null ? (
         <p className="shrink-0 border-b px-3 py-2 text-destructive text-xs" role="alert">
           {failure}
-        </p>
-      ) : null}
-      {!isFresh && sessions.data !== null ? (
-        <p className="flex shrink-0 items-center gap-2 border-b px-3 py-1.5 text-muted-foreground text-xs">
-          <Spinner size="sm" /> <T>Refreshing…</T>
         </p>
       ) : null}
       {status ?? (
@@ -301,11 +284,6 @@ function SessionRow(props: {
       <span className="flex min-w-0 items-center gap-2">
         <span className="min-w-0 flex-1 truncate text-sm">{row.title}</span>
         {props.resuming ? <Spinner size="sm" /> : null}
-        {row.state === "open" ? (
-          <Badge size="sm" variant="secondary">
-            <T>In T3</T>
-          </Badge>
-        ) : null}
       </span>
       <span className="flex min-w-0 items-center gap-2 text-muted-foreground text-xs">
         <span className="shrink-0">{row.providerLabel}</span>

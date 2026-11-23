@@ -70,7 +70,6 @@ import {
   FolderGit2Icon,
   FolderIcon,
   FolderPlusIcon,
-  HistoryIcon,
   MessageSquareDashedIcon,
   LinkIcon,
   MessageSquareIcon,
@@ -272,7 +271,6 @@ import { EnvironmentMachineIcon } from "./EnvironmentMachineIcon";
 import { Checkbox } from "./ui/checkbox";
 import { ProjectFilePicker } from "./files/ProjectFilePicker";
 import { openLinkPullRequestDialog } from "./pullRequest/LinkPullRequestDialog";
-import { openResumeSessionDialog } from "./resumeSession/resumeSessionDialogState";
 import { canShareWithGuestAtom } from "./chat/guestShareAvailability";
 import { openGuestShareDialog } from "./chat/guestShareDialogState";
 import { openUseInAnotherApp } from "./mcp/UseInAnotherAppDialog";
@@ -1657,20 +1655,6 @@ function OpenCommandPaletteDialog(props: {
       openChildSearch("content", { query, linkedThreadSearch });
     },
   });
-
-  if (contextualProjectRef !== null) {
-    actionItems.push({
-      kind: "action",
-      value: "action:resume-session",
-      searchTerms: ["resume", "continue", "session", "claude", "codex", "pi", "terminal", "import"],
-      title: gt("Resume session…"),
-      icon: <HistoryIcon className={ITEM_ICON_CLASS} />,
-      shortcutCommand: "agentSessions.resume",
-      run: async () => {
-        openResumeSessionDialog(contextualProjectRef);
-      },
-    });
-  }
 
   if (newProjectEnvironmentOptions.length > 0) {
     actionItems.push({

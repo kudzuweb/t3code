@@ -134,14 +134,6 @@ function importThreadIdOf(providerInstanceId: ProviderInstanceId, providerSessio
   return ThreadId.make(`import:${providerInstanceId}:${providerSessionId}`);
 }
 
-function sessionKeyOf(source: AgentSessionImportSource): SessionKey {
-  return {
-    providerInstanceId: source.providerInstanceId,
-    nativeThreadId: nativeThreadIdOf(source),
-    importThreadId: importThreadIdOf(source.providerInstanceId, source.providerSessionId),
-  };
-}
-
 const sessionKeyId = (key: SessionKey) => `${key.providerInstanceId}\0${key.nativeThreadId}`;
 
 function dateTime(value: string): DateTime.Utc {
@@ -700,23 +692,15 @@ const make = Effect.gen(function* () {
   ) {
     const project = yield* loadProject(input.projectId);
     const listing = yield* scanner.listProjectSessions(project.workspaceRoot);
-    const owners = yield* findOwners(
-      input.projectId,
-      listing.sessions.map(({ source }) => sessionKeyOf(source)),
-    );
     const sessions = listing.sessions.map(
-      ({ source, title, lastActiveAt, worktree }): AgentSessionSummary => {
-        const owner = owners.get(sessionKeyId(sessionKeyOf(source)));
-        return {
-          provider: source.provider,
-          providerInstanceId: source.providerInstanceId,
-          providerSessionId: source.providerSessionId,
-          title,
-          lastActiveAt,
-          worktree,
-          threadId: owner?.threadId ?? null,
-        };
-      },
+      ({ source, title, lastActiveAt, worktree }): AgentSessionSummary => ({
+        provider: source.provider,
+        providerInstanceId: source.providerInstanceId,
+        providerSessionId: source.providerSessionId,
+        title,
+        lastActiveAt,
+        worktree,
+      }),
     );
     return { sessions, truncated: listing.truncated } satisfies AgentSessionListResult;
   });

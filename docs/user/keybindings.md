@@ -190,8 +190,8 @@ field gets its own undo back. Terminals always keep their native shortcut.
 `navigation.back` (`mod+[` by default) and `navigation.forward` (`mod+]`) move
 through the pages you have visited, like a browser's back and forward buttons.
 
-`agentSessions.resume` (`mod+shift+u` by default) opens the
-[Resume session](./thread-sidebar.md#resume-a-session) list for the project on screen.
+`agentSessions.resume` (`mod+shift+u` by default) opens a list of the project on
+screen's Claude Code, Codex and Pi sessions. Choosing one opens a thread that continues it.
 
 `chat.new` may ask you to choose a project when there is more than one.
 `chat.newLocal` skips that chooser. Both use your
