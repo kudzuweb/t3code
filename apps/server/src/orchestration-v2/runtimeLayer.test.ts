@@ -14215,3 +14215,221 @@ it.layer(layerQueueResumeDisabledInstanceTest)(
     );
   },
 );
+
+it.layer(layerTest)("guarded provider session detach", (it) => {
+  const seedThread = (name: string) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const threadId = ThreadId.make(`guarded-detach-${name}`);
+      const projectId = ProjectId.make(`guarded-detach-project-${name}`);
+      const providerSessionId = ProviderSessionId.make(`guarded-detach-session-${name}`);
+      const now = yield* DateTime.now;
+      yield* seedProject({
+        projectId,
+        title: "Guarded detach",
+        workspaceRoot: `/workspace/guarded-detach-${name}`,
+        defaultModelSelection: null,
+        createdAt: "2026-09-07T00:00:00.000Z",
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make(`guarded-detach-${name}-create`),
+        threadId,
+        projectId,
+        title: "Guarded detach",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+      });
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make(`guarded-detach-${name}-session`),
+            type: "provider-session.attached",
+            threadId,
+            driver,
+            providerInstanceId: modelSelection.instanceId,
+            occurredAt: now,
+            payload: {
+              id: providerSessionId,
+              driver,
+              providerInstanceId: modelSelection.instanceId,
+              status: "ready",
+              cwd: `/workspace/guarded-detach-${name}`,
+              model: modelSelection.model,
+              capabilities: CodexProviderCapabilitiesV2,
+              createdAt: now,
+              updatedAt: now,
+              lastError: null,
+            },
+          },
+        ],
+      });
+      return { orchestrator, sink, threadId, providerSessionId, now };
+    });
+
+  const detach = (
+    orchestrator: Orchestrator.OrchestratorV2Shape,
+    input: {
+      readonly name: string;
+      readonly threadId: ThreadId;
+      readonly providerSessionId: ProviderSessionId;
+      readonly onlyIfIdle?: true;
+    },
+  ) =>
+    orchestrator.dispatch({
+      type: "provider-session.detach",
+      commandId: CommandId.make(`guarded-detach-${input.name}-detach`),
+      threadId: input.threadId,
+      providerSessionId: input.providerSessionId,
+      ...(input.onlyIfIdle === undefined ? {} : { onlyIfIdle: input.onlyIfIdle }),
+    });
+
+  const liveSessionIds = (orchestrator: Orchestrator.OrchestratorV2Shape, threadId: ThreadId) =>
+    orchestrator
+      .getThreadProjection(threadId)
+      .pipe(Effect.map((projection) => projection.providerSessions.map((session) => session.id)));
+
+  it.effect("detaches an idle thread when asked to only if idle", () =>
+    Effect.gen(function* () {
+      const { orchestrator, threadId, providerSessionId } = yield* seedThread("idle");
+      yield* detach(orchestrator, { name: "idle", threadId, providerSessionId, onlyIfIdle: true });
+      assert.deepEqual(yield* liveSessionIds(orchestrator, threadId), []);
+    }),
+  );
+
+  it.effect("rejects an only-if-idle detach while a run is unfinished", () =>
+    Effect.gen(function* () {
+      const { orchestrator, threadId, providerSessionId } = yield* seedThread("busy");
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("guarded-detach-busy-message"),
+        threadId,
+        messageId: MessageId.make("guarded-detach-busy-message"),
+        text: "Keep this run active.",
+        attachments: [],
+        modelSelection,
+        dispatchMode: { type: "start_immediately" },
+      });
+      const error = yield* detach(orchestrator, {
+        name: "busy",
+        threadId,
+        providerSessionId,
+        onlyIfIdle: true,
+      }).pipe(Effect.flip);
+      assert.instanceOf(error, Orchestrator.OrchestratorDispatchError);
+      assert.equal(
+        error.cause,
+        `Thread ${threadId} is still working. Wait for the current turn to finish.`,
+      );
+      assert.include(yield* liveSessionIds(orchestrator, threadId), providerSessionId);
+    }),
+  );
+
+  it.effect("rejects an only-if-idle detach while background tasks are pending", () =>
+    Effect.gen(function* () {
+      const { orchestrator, sink, threadId, providerSessionId, now } =
+        yield* seedThread("background");
+      const runId = RunId.make("guarded-detach-background-run");
+      const providerThreadId = ProviderThreadId.make("guarded-detach-background-provider-thread");
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("guarded-detach-background-run"),
+            type: "run.created",
+            threadId,
+            runId,
+            driver,
+            providerInstanceId: modelSelection.instanceId,
+            occurredAt: now,
+            payload: {
+              id: runId,
+              threadId,
+              ordinal: 1,
+              providerInstanceId: modelSelection.instanceId,
+              modelSelection,
+              providerThreadId,
+              userMessageId: MessageId.make("guarded-detach-background-message"),
+              rootNodeId: null,
+              activeAttemptId: null,
+              status: "completed",
+              requestedAt: now,
+              startedAt: now,
+              completedAt: now,
+              checkpointId: null,
+              contextHandoffId: null,
+            },
+          },
+          {
+            id: EventId.make("guarded-detach-background-provider-thread"),
+            type: "provider-thread.updated",
+            threadId,
+            driver,
+            providerInstanceId: modelSelection.instanceId,
+            occurredAt: now,
+            payload: {
+              id: providerThreadId,
+              driver,
+              providerInstanceId: modelSelection.instanceId,
+              providerSessionId,
+              appThreadId: threadId,
+              ownerNodeId: null,
+              nativeThreadRef: null,
+              nativeConversationHeadRef: null,
+              status: "idle",
+              firstRunOrdinal: 1,
+              lastRunOrdinal: 1,
+              handoffIds: [],
+              forkedFrom: null,
+              pendingBackgroundTasks: [{ taskId: "tests", kind: "command" }],
+              createdAt: now,
+              updatedAt: now,
+            },
+          },
+        ],
+      });
+      const error = yield* detach(orchestrator, {
+        name: "background",
+        threadId,
+        providerSessionId,
+        onlyIfIdle: true,
+      }).pipe(Effect.flip);
+      assert.instanceOf(error, Orchestrator.OrchestratorDispatchError);
+      assert.equal(
+        error.cause,
+        `Thread ${threadId} has background tasks running. Wait for them to finish.`,
+      );
+      assert.include(yield* liveSessionIds(orchestrator, threadId), providerSessionId);
+
+      yield* detach(orchestrator, { name: "background-unguarded", threadId, providerSessionId });
+      assert.deepEqual(yield* liveSessionIds(orchestrator, threadId), []);
+    }),
+  );
+
+  it.effect("detaches a busy thread without the only-if-idle flag", () =>
+    Effect.gen(function* () {
+      const { orchestrator, threadId, providerSessionId } = yield* seedThread("unguarded");
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("guarded-detach-unguarded-message"),
+        threadId,
+        messageId: MessageId.make("guarded-detach-unguarded-message"),
+        text: "Keep this run active.",
+        attachments: [],
+        modelSelection,
+        dispatchMode: { type: "start_immediately" },
+      });
+      yield* detach(orchestrator, { name: "unguarded", threadId, providerSessionId });
+      assert.notInclude(yield* liveSessionIds(orchestrator, threadId), providerSessionId);
+    }),
+  );
+});

@@ -5825,7 +5825,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
     ) {
       const projection = yield* projectionStore
-        .getThreadRecords(command.threadId, ["providerSessions"])
+        .getThreadRecords(
+          command.threadId,
+          ["providerSessions", "providerThreads", "runs", "runtimeRequests", "turnItems"],
+          { turnItemTypes: ["command_execution", "dynamic_tool", "subagent"] },
+        )
         .pipe(
           Effect.mapError(
             (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
@@ -5840,6 +5844,27 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           commandType: command.type,
           cause: `Provider session ${command.providerSessionId} does not belong to thread ${command.threadId}.`,
         });
+      }
+      if (command.onlyIfIdle === true) {
+        const rejectBusy = (reason: string) =>
+          new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: `Thread ${command.threadId} ${reason}`,
+          });
+        if (threadHasUnfinishedWork(projection)) {
+          return yield* rejectBusy("is still working. Wait for the current turn to finish.");
+        }
+        const pendingBackgroundTasks = derivePendingBackgroundWork({
+          latestRun: projection.runs.findLast((run) => run.status !== "queued"),
+          providerThreads: projection.providerThreads,
+          turnItems: projection.turnItems,
+          activeProviderThreadId: projection.thread.activeProviderThreadId,
+          runs: projection.runs,
+        });
+        if (pendingBackgroundTasks.length > 0) {
+          return yield* rejectBusy("has background tasks running. Wait for them to finish.");
+        }
       }
       const now = yield* DateTime.now;
       yield* emit(

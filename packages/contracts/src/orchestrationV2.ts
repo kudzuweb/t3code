@@ -3546,6 +3546,8 @@ export const OrchestrationV2Command = Schema.Union([
     threadId: ThreadId,
     providerSessionId: ProviderSessionId,
     reason: Schema.optional(Schema.String),
+    /** Rejects the detach while the thread has a running turn or pending background tasks. */
+    onlyIfIdle: Schema.optional(Schema.Literal(true)),
   }),
   Schema.Struct({
     type: Schema.Literal("message.dispatch"),
