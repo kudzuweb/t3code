@@ -68,6 +68,7 @@ export const releaseWatcher = (input: {
     [
       'while kill -0 "$1" 2>/dev/null; do sleep 5; done',
       'grep -q "\\"pid\\":$1," "$2" && grep -q "\\"token\\":\\"$3\\"" "$2"' +
+        ' && grep -q "\\"persist\\":false" "$2"' +
         ` && ${SUDO} ${setSleepDisabledArgs(false).join(" ")} && rm -f "$2"`,
     ].join("; "),
     "_",
@@ -81,6 +82,8 @@ const LeaseContents = Schema.Struct({
   pid: Schema.Number,
   token: Schema.String,
   home: Schema.String,
+  /** Written for mode On, whose block stays set after the server exits. */
+  persist: Schema.Boolean,
 });
 const decodeLease = Schema.decodeUnknownOption(Schema.fromJsonString(LeaseContents));
 
@@ -156,31 +159,35 @@ export const make = Effect.fn("LidSleepGuard.make")(function* <E>(input: {
   );
   const setBlocking = (blocking: boolean) =>
     runCommand(SUDO, setSleepDisabledArgs(blocking)).pipe(Effect.asVoid);
-  const writeLease = DateTime.now.pipe(
-    Effect.flatMap((now) =>
-      fileSystem.writeFileString(
-        input.leasePath,
-        // The watcher greps for the pid and token in this order.
-        JSON.stringify({
-          pid: input.serverPid,
-          token: input.startToken,
-          home: input.home,
-          acquiredAt: DateTime.formatIso(now),
-        }),
+  const writeLease = (persist: boolean) =>
+    DateTime.now.pipe(
+      Effect.flatMap((now) =>
+        fileSystem.writeFileString(
+          input.leasePath,
+          // The watcher greps for the pid and token in this order.
+          JSON.stringify({
+            pid: input.serverPid,
+            token: input.startToken,
+            home: input.home,
+            acquiredAt: DateTime.formatIso(now),
+            persist,
+          }),
+        ),
       ),
-    ),
-    Effect.mapError(
-      (cause) => new LidSleepGuardFailure({ reason: "failed", detail: cause.message }),
-    ),
-  );
+      Effect.mapError(
+        (cause) => new LidSleepGuardFailure({ reason: "failed", detail: cause.message }),
+      ),
+    );
   const hasLease = fileSystem.exists(input.leasePath).pipe(Effect.orElseSucceed(() => false));
-  /** True only when the lease names this server start. */
-  const ownsLease = fileSystem.readFileString(input.leasePath).pipe(
-    Effect.map((text) =>
-      Option.exists(decodeLease(text), (lease) => lease.token === input.startToken),
-    ),
-    Effect.orElseSucceed(() => false),
+  const readLease = fileSystem.readFileString(input.leasePath).pipe(
+    Effect.map(decodeLease),
+    Effect.orElseSucceed(() => Option.none<typeof LeaseContents.Type>()),
   );
+  const readOwnLease = readLease.pipe(
+    Effect.map(Option.filter((lease) => lease.token === input.startToken)),
+  );
+  /** True only when the lease names this server start. */
+  const ownsLease = readOwnLease.pipe(Effect.map(Option.isSome));
   const removeLease = fileSystem
     .remove(input.leasePath, { force: true })
     .pipe(
@@ -223,29 +230,35 @@ export const make = Effect.fn("LidSleepGuard.make")(function* <E>(input: {
     ),
   );
 
-  const acquire = serialized(
-    Effect.gen(function* () {
-      const owned = yield* ownsLease;
-      const blocking = yield* readBlocking;
-      if (blocking) {
-        // An existing block is adopted only when this server start's lease says it set it.
-        if (owned) yield* ensureWatcher;
-        yield* publish({ blocking: true, owned });
-        return;
-      }
-      yield* writeLease;
-      // A failed set leaves no lease: losing a block is acceptable, a Mac stuck awake is not.
-      yield* setBlocking(true).pipe(Effect.tapError(() => Effect.ignore(removeLease)));
-      if (!(yield* readBlocking)) {
-        return yield* new LidSleepGuardFailure({
-          reason: "failed",
-          detail: "sleep stayed enabled after disablesleep 1",
-        });
-      }
-      yield* ensureWatcher;
-      yield* publish({ blocking: true, owned: true });
-    }).pipe(Effect.tapError(publishFailure)),
-  );
+  // `persist` is true for mode On, whose block outlives the server, and false for Auto.
+  const acquire = (persist: boolean) =>
+    serialized(
+      Effect.gen(function* () {
+        const ownLease = yield* readOwnLease;
+        const owned = Option.isSome(ownLease);
+        const blocking = yield* readBlocking;
+        if (blocking) {
+          // An existing block is adopted only when this server start's lease says it set it.
+          if (owned) {
+            if (ownLease.value.persist !== persist) yield* writeLease(persist);
+            yield* ensureWatcher;
+          }
+          yield* publish({ blocking: true, owned });
+          return;
+        }
+        yield* writeLease(persist);
+        // A failed set leaves no lease: losing a block is acceptable, a Mac stuck awake is not.
+        yield* setBlocking(true).pipe(Effect.tapError(() => Effect.ignore(removeLease)));
+        if (!(yield* readBlocking)) {
+          return yield* new LidSleepGuardFailure({
+            reason: "failed",
+            detail: "sleep stayed enabled after disablesleep 1",
+          });
+        }
+        yield* ensureWatcher;
+        yield* publish({ blocking: true, owned: true });
+      }).pipe(Effect.tapError(publishFailure)),
+    );
 
   // Fails when the block could not be cleared, and keeps the lease so a retry still owns it.
   const releaseOnce = serialized(
@@ -279,15 +292,15 @@ export const make = Effect.fn("LidSleepGuard.make")(function* <E>(input: {
   const takeOverWhenReleased = Effect.gen(function* () {
     if (yield* ownsLease) return;
     if (yield* readBlocking) return;
-    yield* acquire;
+    yield* acquire(false);
   }).pipe(
     Effect.ignore,
     Effect.schedule(Schedule.spaced(STATUS_RECHECK_INTERVAL)),
     Effect.andThen(Effect.never),
   );
 
-  const hold = Effect.acquireRelease(
-    FiberHandle.clear(pendingRelease).pipe(Effect.andThen(acquire)),
+  const holdAuto = Effect.acquireRelease(
+    FiberHandle.clear(pendingRelease).pipe(Effect.andThen(acquire(false))),
     () => release,
   ).pipe(
     Effect.andThen(takeOverWhenReleased),
@@ -295,6 +308,31 @@ export const make = Effect.fn("LidSleepGuard.make")(function* <E>(input: {
     KeepAwake.retryWithBackoff("lid sleep guard could not acquire the sleep block"),
     Effect.ignore,
   );
+
+  // Mode On has no release on interruption: the block stays set after the server quits. While On
+  // is selected it is set again whenever it reads as cleared, by another tool or by `pmset`.
+  const setAgainWhenCleared = Effect.gen(function* () {
+    if (yield* readBlocking) return;
+    yield* acquire(true);
+  }).pipe(
+    Effect.ignore,
+    Effect.schedule(Schedule.spaced(STATUS_RECHECK_INTERVAL)),
+    Effect.andThen(Effect.never),
+  );
+
+  const holdOn = FiberHandle.clear(pendingRelease).pipe(
+    Effect.andThen(acquire(true)),
+    Effect.andThen(setAgainWhenCleared),
+    KeepAwake.retryWithBackoff("lid sleep guard could not acquire the sleep block"),
+    Effect.ignore,
+  );
+
+  // A block left by mode On has a lease that Auto's finalizer would never release when there is
+  // no work, so Auto starts by releasing it and acquires again when work arrives.
+  const releasePersistentBlock = Effect.gen(function* () {
+    const lease = yield* readOwnLease;
+    if (Option.exists(lease, (value) => value.persist)) yield* release;
+  });
 
   // A lease at startup belongs to a server that is gone, because one server per home runs at a
   // time. Clearing it is safe only while `disablesleep` is set; if another tool set it after a
@@ -304,7 +342,14 @@ export const make = Effect.fn("LidSleepGuard.make")(function* <E>(input: {
       const blocking = yield* readBlocking.pipe(Effect.orElseSucceed(() => false));
       return yield* publish({ blocking, owned: false });
     }
-    if (yield* readBlocking) yield* setBlocking(false);
+    const blocking = yield* readBlocking;
+    // Mode On's block outlives the server, so the new server takes over its lease and leaves
+    // the block to the mode that is selected.
+    if (blocking && Option.exists(yield* readLease, (lease) => lease.persist)) {
+      yield* writeLease(true);
+      return yield* publish({ blocking: true, owned: true });
+    }
+    if (blocking) yield* setBlocking(false);
     yield* removeLease;
     yield* publish({ blocking: false, owned: false });
   }).pipe(serialized, Effect.tapError(publishFailure), Effect.retry(releaseBackoff), Effect.ignore);
@@ -316,9 +361,11 @@ export const make = Effect.fn("LidSleepGuard.make")(function* <E>(input: {
           Effect.asVoid,
         );
       case "on":
-        return hold;
+        return holdOn;
       case "auto":
-        return KeepAwake.holdWhileWanted(input.demand, hold, input.grace);
+        return releasePersistentBlock.pipe(
+          Effect.andThen(KeepAwake.holdWhileWanted(input.demand, holdAuto, input.grace)),
+        );
     }
   };
 

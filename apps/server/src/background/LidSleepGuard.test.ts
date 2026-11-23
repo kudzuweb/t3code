@@ -71,7 +71,8 @@ const fakeRunner = (mac: FakeMac) =>
       }),
   });
 
-const STALE_LEASE = JSON.stringify({ pid: 999, token: "old-token", home: "/home/t3" });
+const staleLease = (persist: boolean) =>
+  JSON.stringify({ pid: 999, token: "old-token", home: "/home/t3", persist });
 const SERVER_PID = 4242;
 const START_TOKEN = "token-a";
 const HOME = "/home/t3";
@@ -85,6 +86,8 @@ const harness = (options: {
   readonly initialMode?: LidSleepGuardMode;
   readonly sleepDisabled?: boolean;
   readonly staleLease?: boolean;
+  /** The stale lease was written by a server whose mode was On. */
+  readonly stalePersist?: boolean;
   readonly platform?: NodeJS.Platform;
   readonly initialDemand?: boolean;
   readonly sudo?: FakeMac["sudo"];
@@ -97,7 +100,9 @@ const harness = (options: {
     const fileSystem = yield* FileSystem.FileSystem;
     const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-lid-sleep-guard-" });
     const leasePath = `${directory}/lid-sleep-guard.lease`;
-    if (options.staleLease) yield* fileSystem.writeFileString(leasePath, STALE_LEASE);
+    if (options.staleLease) {
+      yield* fileSystem.writeFileString(leasePath, staleLease(options.stalePersist ?? false));
+    }
     const mac: FakeMac = {
       sleepDisabled: options.sleepDisabled ?? false,
       sudo: options.sudo ?? "allowed",
@@ -196,8 +201,8 @@ describe("LidSleepGuard", () => {
       const t = yield* harness({ initialMode: "on", sleepDisabled: true });
       yield* t.awaitStatus((status) => status.blocking);
       yield* Queue.offer(t.mode, "off");
-      // Reads from the startup check, the acquire attempt and the release attempt; none runs sudo.
-      yield* awaitCommand(t.mac, PMSET_READ, 3);
+      // Reads from the startup check and the release attempt; neither runs sudo.
+      yield* awaitCommand(t.mac, PMSET_READ, 2);
       expect(sudoCommands(t.mac)).toEqual([]);
       expect(t.mac.sleepDisabled).toBe(true);
     }),
@@ -290,6 +295,7 @@ describe("LidSleepGuard", () => {
       expect(script).not.toContain("caffeinate");
       expect(script).toContain('grep -q "\\"pid\\":$1," "$2"');
       expect(script).toContain('grep -q "\\"token\\":\\"$3\\"" "$2"');
+      expect(script).toContain('grep -q "\\"persist\\":false" "$2"');
       expect(script).toContain("/usr/bin/sudo -n /usr/bin/pmset -a disablesleep 0");
       expect(script).toContain('rm -f "$2"');
     });
@@ -331,8 +337,7 @@ describe("LidSleepGuard", () => {
         yield* t.awaitStatus((status) => status.owned);
         t.mac.failRelease = true;
         yield* Queue.offer(t.mode, "off");
-        // The shutdown-style release and the retry loop each try once right away.
-        yield* awaitCommand(t.mac, SET_OFF, 2);
+        yield* awaitCommand(t.mac, SET_OFF, 1);
         const delays = [
           "5 seconds",
           "10 seconds",
@@ -343,13 +348,13 @@ describe("LidSleepGuard", () => {
         ] as const;
         for (const [index, delay] of delays.entries()) {
           yield* TestClock.adjust(delay);
-          yield* awaitCommand(t.mac, SET_OFF, index + 3);
+          yield* awaitCommand(t.mac, SET_OFF, index + 2);
         }
         // The next delay would be 320 seconds uncapped, so 300 seconds proves the cap.
         yield* TestClock.adjust("300 seconds");
-        yield* awaitCommand(t.mac, SET_OFF, 9);
+        yield* awaitCommand(t.mac, SET_OFF, 8);
         yield* TestClock.adjust("300 seconds");
-        yield* awaitCommand(t.mac, SET_OFF, 10);
+        yield* awaitCommand(t.mac, SET_OFF, 9);
       }),
     );
 
@@ -359,13 +364,13 @@ describe("LidSleepGuard", () => {
         yield* t.awaitStatus((status) => status.owned);
         t.mac.failRelease = true;
         yield* Queue.offer(t.mode, "off");
-        yield* awaitCommand(t.mac, SET_OFF, 2);
+        yield* awaitCommand(t.mac, SET_OFF, 1);
         t.mac.failRelease = false;
         yield* TestClock.adjust("5 seconds");
         yield* t.awaitStatus((status) => !status.owned && !status.blocking);
         expect(yield* t.hasLease).toBe(false);
         yield* TestClock.adjust("10 minutes");
-        expect(countOf(t.mac, SET_OFF)).toBe(3);
+        expect(countOf(t.mac, SET_OFF)).toBe(2);
       }),
     );
 
@@ -392,11 +397,11 @@ describe("LidSleepGuard", () => {
         yield* t.awaitStatus((status) => status.owned);
         t.mac.failRelease = true;
         yield* Queue.offer(t.mode, "off");
-        yield* awaitCommand(t.mac, SET_OFF, 2);
+        yield* awaitCommand(t.mac, SET_OFF, 1);
         yield* Queue.offer(t.mode, "on");
         yield* t.awaitStatus((status) => status.owned && status.error === undefined);
         yield* TestClock.adjust("10 minutes");
-        expect(countOf(t.mac, SET_OFF)).toBe(2);
+        expect(countOf(t.mac, SET_OFF)).toBe(1);
         expect(yield* t.hasLease).toBe(true);
       }),
     );
@@ -515,10 +520,128 @@ describe("LidSleepGuard", () => {
     );
   });
 
-  describe("coverage the review found missing", () => {
-    it.effect("releases an owned block on normal shutdown", () =>
+  describe("mode on persists", () => {
+    it.effect("leaves the block and a persistent lease when the server shuts down", () =>
       Effect.gen(function* () {
         const t = yield* harness({ initialMode: "on" });
+        yield* t.awaitStatus((status) => status.owned);
+        expect(yield* t.readLease).toMatchObject({ persist: true });
+        yield* t.shutDown;
+        expect(sudoCommands(t.mac)).toEqual([SET_ON]);
+        expect(t.mac.sleepDisabled).toBe(true);
+        expect(yield* t.readLease).toMatchObject({ persist: true });
+      }),
+    );
+
+    it.effect("keeps a persistent lease's block at startup and owns it in mode on", () =>
+      Effect.gen(function* () {
+        const t = yield* harness({
+          initialMode: "on",
+          sleepDisabled: true,
+          staleLease: true,
+          stalePersist: true,
+        });
+        yield* t.awaitStatus((status) => status.owned);
+        expect(sudoCommands(t.mac)).toEqual([]);
+        expect(yield* t.readLease).toMatchObject({
+          pid: SERVER_PID,
+          token: START_TOKEN,
+          persist: true,
+        });
+      }),
+    );
+
+    it.effect("releases a persistent lease's block at startup in mode off", () =>
+      Effect.gen(function* () {
+        const t = yield* harness({
+          initialMode: "off",
+          sleepDisabled: true,
+          staleLease: true,
+          stalePersist: true,
+        });
+        yield* awaitCommand(t.mac, SET_OFF, 1);
+        yield* t.awaitStatus((status) => !status.owned && !status.blocking);
+        expect(sudoCommands(t.mac)).toEqual([SET_OFF]);
+        expect(yield* t.hasLease).toBe(false);
+      }),
+    );
+
+    it.effect("releases a persistent lease's block when auto has no work", () =>
+      Effect.gen(function* () {
+        const t = yield* harness({
+          initialMode: "auto",
+          initialDemand: false,
+          sleepDisabled: true,
+          staleLease: true,
+          stalePersist: true,
+        });
+        yield* awaitCommand(t.mac, SET_OFF, 1);
+        yield* t.awaitStatus((status) => !status.owned && !status.blocking);
+        expect(t.mac.sleepDisabled).toBe(false);
+        expect(yield* t.hasLease).toBe(false);
+      }),
+    );
+
+    it.effect("drops a persistent lease without sudo when nothing is blocked", () =>
+      Effect.gen(function* () {
+        const t = yield* harness({ initialMode: "off", staleLease: true, stalePersist: true });
+        yield* awaitCommand(t.mac, PMSET_READ, 2);
+        expect(sudoCommands(t.mac)).toEqual([]);
+        expect(yield* t.hasLease).toBe(false);
+      }),
+    );
+
+    it.effect("rewrites the lease as releasable when switching from on to auto", () =>
+      Effect.gen(function* () {
+        const t = yield* harness({ initialMode: "on", initialDemand: true });
+        yield* t.awaitStatus((status) => status.owned);
+        yield* Queue.offer(t.mode, "auto");
+        yield* awaitCommand(t.mac, SET_ON, 2);
+        yield* t.awaitStatus((status) => status.owned);
+        expect(yield* t.readLease).toMatchObject({ persist: false });
+      }),
+    );
+
+    it.effect("releases the block when switching from on to auto with no work", () =>
+      Effect.gen(function* () {
+        const t = yield* harness({ initialMode: "on", initialDemand: false });
+        yield* t.awaitStatus((status) => status.owned);
+        yield* Queue.offer(t.mode, "auto");
+        yield* t.awaitStatus((status) => !status.owned && !status.blocking);
+        expect(t.mac.sleepDisabled).toBe(false);
+        expect(yield* t.hasLease).toBe(false);
+      }),
+    );
+
+    it.effect("writes a persistent lease when switching from auto to on", () =>
+      Effect.gen(function* () {
+        const t = yield* harness({ initialMode: "auto", initialDemand: true });
+        yield* t.awaitStatus((status) => status.owned);
+        expect(yield* t.readLease).toMatchObject({ persist: false });
+        yield* Queue.offer(t.mode, "on");
+        yield* awaitCommand(t.mac, SET_ON, 2);
+        yield* t.awaitStatus((status) => status.owned);
+        expect(yield* t.readLease).toMatchObject({ persist: true });
+      }),
+    );
+
+    it.effect("sets the block again when something else clears it while on", () =>
+      Effect.gen(function* () {
+        const t = yield* harness({ initialMode: "on" });
+        yield* t.awaitStatus((status) => status.owned);
+        t.mac.sleepDisabled = false;
+        yield* TestClock.adjust("30 seconds");
+        yield* awaitCommand(t.mac, SET_ON, 2);
+        yield* t.awaitStatus((status) => status.owned && status.blocking);
+        expect(t.mac.sleepDisabled).toBe(true);
+      }),
+    );
+  });
+
+  describe("coverage the review found missing", () => {
+    it.effect("releases an owned block on normal shutdown in auto", () =>
+      Effect.gen(function* () {
+        const t = yield* harness({ initialMode: "auto", initialDemand: true });
         yield* t.awaitStatus((status) => status.owned);
         yield* t.shutDown;
         expect(sudoCommands(t.mac)).toEqual([SET_ON, SET_OFF]);
@@ -529,7 +652,11 @@ describe("LidSleepGuard", () => {
 
     it.effect("recovers when a set succeeds and the read after it fails", () =>
       Effect.gen(function* () {
-        const t = yield* harness({ initialMode: "on", failReadAfterSet: true });
+        const t = yield* harness({
+          initialMode: "auto",
+          initialDemand: true,
+          failReadAfterSet: true,
+        });
         yield* t.awaitStatus((status) => status.error === "failed");
         expect(yield* t.hasLease).toBe(true);
         yield* TestClock.adjust("5 seconds");
@@ -542,11 +669,12 @@ describe("LidSleepGuard", () => {
       }),
     );
 
-    it.effect("switches mode while a release is in flight and ends owning the block", () =>
+    it.effect("switches off and back on and ends owning the block", () =>
       Effect.gen(function* () {
         const t = yield* harness({ initialMode: "on" });
         yield* t.awaitStatus((status) => status.owned);
         yield* Queue.offer(t.mode, "off");
+        yield* t.awaitStatus((status) => !status.owned);
         yield* Queue.offer(t.mode, "on");
         yield* t.awaitStatus((status) => status.owned && status.error === undefined);
         yield* TestClock.adjust("1 minute");

@@ -113,7 +113,7 @@ turning on macOS's `disablesleep` flag.
 | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Off  | Never changes the flag. This is the default.                                                                                                                                               |
 | Auto | Blocks lid sleep while agents work and for a minute after, then lets go. It needs **Keep awake while agents work**; with that setting off, Auto does nothing and the settings row says so. |
-| On   | Blocks lid sleep for as long as the T3 Code server runs.                                                                                                                                   |
+| On   | Blocks lid sleep until you switch the mode to Off. The block stays in effect when T3 Code quits, crashes or restarts, and `sudo pmset -a disablesleep 0` clears it without T3 Code.        |
 
 Choose the mode in **Settings > Maintenance**, or with **Lid sleep guard** in
 the command palette. The setting appears only for servers running on macOS. The
@@ -141,12 +141,20 @@ dropped so it can take over. T3 Code records its own block in
 `lid-sleep-guard.lease` in its data directory, with the server's process id, a
 start token and the data directory.
 
-If the server crashes or is killed, a small background process that T3 Code
-started when it set the block notices and clears `disablesleep`, as long as the
-lease still names that server. If that fails, the next T3 Code start clears a
-lease left by the dead server whenever `disablesleep` is set, which also clears
-a block another tool set after the crash. A failed release is retried, waiting
-up to 5 minutes between tries.
+In Auto, if the server crashes or is killed, a small background process that
+T3 Code started when it set the block notices and clears `disablesleep`, as
+long as the lease still names that server. If that fails, the next T3 Code start
+clears a lease left by the dead server whenever `disablesleep` is set, which
+also clears a block another tool set after the crash. A failed release is
+retried, waiting up to 5 minutes between tries.
+
+In On, the lease is marked persistent, so neither the background process nor
+the next start clears the block. The next start keeps it, and the mode then
+decides: On keeps it, Off clears it and Auto clears it unless agents are
+working. While On is selected, T3 Code sets the block again within 30 seconds if
+something clears it. A Mac left in On does not sleep with the lid closed, even
+after T3 Code quits, until you switch the mode to Off or run
+`sudo pmset -a disablesleep 0`.
 
 The guard changes `pmset` only in servers started without a Vite dev URL, which
 are the packaged app and `t3` CLI builds. In a development server the settings
@@ -158,8 +166,8 @@ releases first clears it for the other, so the Mac can sleep while the other too
 expects it awake. The Mac is never left unable to sleep.
 
 A closed Mac keeps running, which uses battery and produces heat, especially in
-a bag. Closing the lid on battery drains it, so use Auto and check that the Mac
-is on power or ventilated.
+a bag. Closing the lid on battery drains it, so use Auto, or switch On back to
+Off when you are done, and check that the Mac is on power or ventilated.
 
 ## Keep the server responsive when agents use all memory
 

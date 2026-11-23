@@ -61,7 +61,7 @@ export function LidSleepGuardSettingsRow() {
     if (status.error === "needs-sudoers-rule") return gt("Lid sleep guard needs its sudoers rule");
     if (status.error === "failed") return gt("Lid sleep guard could not change the sleep setting");
     if (status.blocking && status.owned) {
-      return gt("Blocking lid sleep. T3 Code set this and will release it.");
+      return gt("Blocking lid sleep. T3 Code set this.");
     }
     if (status.blocking) {
       return gt("Lid sleep is blocked by something else. T3 Code will leave it alone.");
@@ -93,7 +93,7 @@ export function LidSleepGuardSettingsRow() {
       settingKeys={["lidSleepGuard"]}
       {...setting("lid-sleep-guard")}
       description={gt(
-        "Keeps the Mac awake with the lid closed. Auto does it only while agents are working.",
+        "Keeps the Mac awake with the lid closed. Auto does it only while agents are working. On stays in effect after T3 Code quits, until you switch it Off or run `sudo pmset -a disablesleep 0`.",
       )}
       status={
         lines.length > 0 ? (
