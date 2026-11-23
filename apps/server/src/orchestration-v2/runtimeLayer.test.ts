@@ -14331,10 +14331,7 @@ it.layer(layerTest)("guarded provider session detach", (it) => {
         onlyIfIdle: true,
       }).pipe(Effect.flip);
       assert.instanceOf(error, Orchestrator.OrchestratorDispatchError);
-      assert.equal(
-        error.cause,
-        `Thread ${threadId} is still working. Wait for the current turn to finish.`,
-      );
+      assert.equal(error.cause, "Wait for the current turn to finish.");
       assert.include(yield* liveSessionIds(orchestrator, threadId), providerSessionId);
     }),
   );
@@ -14408,10 +14405,7 @@ it.layer(layerTest)("guarded provider session detach", (it) => {
         onlyIfIdle: true,
       }).pipe(Effect.flip);
       assert.instanceOf(error, Orchestrator.OrchestratorDispatchError);
-      assert.equal(
-        error.cause,
-        `Thread ${threadId} has background tasks running. Wait for them to finish.`,
-      );
+      assert.equal(error.cause, "Wait for the background tasks to finish.");
       assert.include(yield* liveSessionIds(orchestrator, threadId), providerSessionId);
 
       yield* detach(orchestrator, { name: "background-unguarded", threadId, providerSessionId });

@@ -5850,10 +5850,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           new OrchestratorDispatchError({
             commandId: command.commandId,
             commandType: command.type,
-            cause: `Thread ${command.threadId} ${reason}`,
+            cause: reason,
           });
         if (threadHasUnfinishedWork(projection)) {
-          return yield* rejectBusy("is still working. Wait for the current turn to finish.");
+          return yield* rejectBusy("Wait for the current turn to finish.");
         }
         const pendingBackgroundTasks = derivePendingBackgroundWork({
           latestRun: projection.runs.findLast((run) => run.status !== "queued"),
@@ -5863,7 +5863,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           runs: projection.runs,
         });
         if (pendingBackgroundTasks.length > 0) {
-          return yield* rejectBusy("has background tasks running. Wait for them to finish.");
+          return yield* rejectBusy("Wait for the background tasks to finish.");
         }
       }
       const now = yield* DateTime.now;
