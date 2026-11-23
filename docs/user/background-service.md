@@ -102,6 +102,48 @@ the service is still installed and will start at the next sign-in.
 `t3 up` installs the service when you set up T3 Connect, but the two are managed
 separately. Signing out of T3 Connect does not stop or uninstall the service.
 
+## Keep the Mac awake with the lid closed
+
+On macOS, T3 Code already keeps the Mac from idle-sleeping while agents work
+(**Settings > Maintenance > Keep awake while agents work**). That does not stop
+a Mac from sleeping when you close the lid. **Lid sleep guard** does, by
+turning on macOS's `disablesleep` flag.
+
+| Mode | What it does                                                             |
+| ---- | ------------------------------------------------------------------------ |
+| Off  | Never changes the flag. This is the default.                             |
+| Auto | Blocks lid sleep while agents work and for a minute after, then lets go. |
+| On   | Blocks lid sleep for as long as the T3 Code server runs.                 |
+
+Choose the mode in **Settings > Maintenance**, or with **Lid sleep guard** in
+the command palette. The setting appears only for servers running on macOS. The
+settings row shows whether lid sleep is blocked now and whether T3 Code set the
+block.
+
+Changing `disablesleep` needs administrator rights, so T3 Code runs
+`sudo -n /usr/bin/pmset -a disablesleep 1` and `... 0`. It never asks for a
+password and never edits your sudoers files. Install this rule once, with
+`sudo visudo -f /etc/sudoers.d/t3-lid-sleep-guard`, replacing `youruser` with
+your login:
+
+```
+youruser ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1, /usr/bin/pmset -a disablesleep 0
+```
+
+Without the rule, the settings row reads "Lid sleep guard needs its sudoers
+rule" and nothing else changes. A rule already installed for another tool with
+the same two commands, such as the Ghostty fork's
+`fork/sudoers.d/ghostty-sleep-guard`, works for T3 Code as is.
+
+T3 Code releases only a block it set. If something else already disabled sleep,
+it leaves that block alone. T3 Code records its own block in
+`lid-sleep-guard.lease` in its data directory, so after a crash the next start
+releases a block that is no longer needed.
+
+A closed Mac keeps running, which uses battery and produces heat, especially in
+a bag. Closing the lid on battery drains it, so use Auto and check that the Mac
+is on power or ventilated.
+
 ## Keep the server responsive when agents use all memory
 
 On Linux, agents already run with lower priority than the server. When they
