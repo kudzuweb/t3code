@@ -53,10 +53,9 @@ export interface ReleaseWatcher {
 }
 
 /**
- * A process that outlives the server. `caffeinate -w` returns when the server pid exits, whether
- * it exited cleanly or was killed. The watcher then clears `disablesleep` only if the lease still
- * names this server's pid and start token; after a normal shutdown the lease is already gone, so
- * it does nothing. $1 is the server pid, $2 the lease path and $3 the start token.
+ * Outlives the server. Polls with `kill -0`, not `caffeinate -w`, which would hold an idle-sleep
+ * assertion. Clears `disablesleep` only if the lease still names this server's pid and start token.
+ * $1 is the server pid, $2 the lease path and $3 the start token.
  */
 export const releaseWatcher = (input: {
   readonly serverPid: number;
@@ -67,7 +66,7 @@ export const releaseWatcher = (input: {
   args: [
     "-c",
     [
-      '/usr/bin/caffeinate -w "$1"',
+      'while kill -0 "$1" 2>/dev/null; do sleep 5; done',
       'grep -q "\\"pid\\":$1," "$2" && grep -q "\\"token\\":\\"$3\\"" "$2"' +
         ` && ${SUDO} ${setSleepDisabledArgs(false).join(" ")} && rm -f "$2"`,
     ].join("; "),

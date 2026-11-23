@@ -286,7 +286,8 @@ describe("LidSleepGuard", () => {
         "token-a",
       ]);
       const script = watcher.args[1] ?? "";
-      expect(script).toContain('/usr/bin/caffeinate -w "$1"');
+      expect(script).toContain('while kill -0 "$1" 2>/dev/null; do sleep 5; done');
+      expect(script).not.toContain("caffeinate");
       expect(script).toContain('grep -q "\\"pid\\":$1," "$2"');
       expect(script).toContain('grep -q "\\"token\\":\\"$3\\"" "$2"');
       expect(script).toContain("/usr/bin/sudo -n /usr/bin/pmset -a disablesleep 0");
