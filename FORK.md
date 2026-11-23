@@ -28,6 +28,19 @@ This is Mauria's fork of `pingdotgg/t3code`. It adds a way to resume Claude Code
 | Codex anchors older than the last 200 messages aren't found    | The sync then writes nothing for that thread until a T3 turn moves the anchor.                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | Pi is fixture-tested only                                      | `pi` wasn't installed on the machine the sync was built on.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 
+## CI
+
+`.github/workflows/fork-ci.yml` runs on every pull request to `main` and every push to `main`. It runs on GitHub's free standard runners (`ubuntu-latest`), which cost nothing on a public repository; it never uses a larger runner. It runs:
+
+| Job                        | What it runs                                                                                                |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| Lint, format and typecheck | `vp run typecheck` for every package, `vp run knip:check`, `vp run i18n:check` and `vp check`.              |
+| Test packages and desktop  | The tests of every workspace package except the server and web app, including contracts and client-runtime. |
+| Test web                   | The web unit and browser tests in headless Chromium, in two shards.                                         |
+| Test server                | The server tests through `vp run test:cached`, in four shards.                                              |
+
+It leaves out upstream's desktop build and launch check, the GraphQL generation checks, the mobile checks, and anything needing secrets or signing. Upstream's workflows use Blacksmith runners the fork does not have, so they are disabled in the fork's Actions settings.
+
 ## Syncing with upstream
 
 Run `git fetch upstream`, `git checkout main`, `git merge upstream/main`, then push `main` to `origin`. The fork's `main` is published, so it is merged and never rebased. When a carried upstream fix lands upstream, the merge will usually resolve it, and its row in the table above is then removed.
