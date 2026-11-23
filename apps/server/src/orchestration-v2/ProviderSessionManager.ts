@@ -277,6 +277,8 @@ export interface ProviderSessionManagerV2Shape {
     readonly threadId: ThreadId;
     readonly detail?: string;
     readonly revokeMcpCredential?: boolean;
+    /** Wait for the provider to report each unloaded thread closed, so another client can open it. */
+    readonly awaitClosed?: boolean;
   }) => Effect.Effect<void, ProviderSessionManagerV2Error>;
   /**
    * Releases the session unless, at the moment of removal, a turn is busy on it other than one
@@ -3586,7 +3588,10 @@ export const layerWithOptions = (
                     ) {
                       return;
                     }
-                    yield* unloadThread({ providerThread }).pipe(
+                    yield* unloadThread({
+                      providerThread,
+                      awaitClosed: input.awaitClosed === true,
+                    }).pipe(
                       Effect.timeout(UNLOAD_THREAD_TIMEOUT_MS),
                       Effect.catchCause((cause) =>
                         Effect.logWarning("orchestration-v2.driver-session.detach-unload-failed", {

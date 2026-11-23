@@ -1,5 +1,5 @@
 import { useAtomValue } from "@effect/atom-react";
-import { resolveThreadResumeCommand } from "@t3tools/client-runtime/resume-command";
+import { resolveThreadResume, type ThreadResume } from "@t3tools/client-runtime/resume-command";
 import type { ScopedThreadRef, ServerSettings } from "@t3tools/contracts";
 import { Atom } from "effect/reactivity";
 
@@ -13,27 +13,28 @@ const NO_SETTINGS_ATOM = Atom.make<ServerSettings | null>(null);
 type ThreadStructureProjection = NonNullable<
   ReturnType<typeof useQuietThreadProjection>
 >["projection"];
-type ProviderInstances = Parameters<typeof resolveThreadResumeCommand>[0]["providerInstances"];
+type ProviderInstances = Parameters<typeof resolveThreadResume>[0]["providerInstances"];
 
 function resumeCommandFromProjection(
   projection: ThreadStructureProjection | undefined,
   providerInstances: ProviderInstances,
   directory: string | null,
-): string | null {
+): ThreadResume | null {
   if (projection === undefined) return null;
-  return resolveThreadResumeCommand({
+  return resolveThreadResume({
     activeProviderThreadId: projection.thread.activeProviderThreadId,
     providerThreads: projection.providerThreads,
+    providerSessions: projection.providerSessions,
     providerInstances,
     directory,
   });
 }
 
 /** The terminal command that continues the thread's session, once its detail has loaded. */
-export function useThreadResumeCommand(
+export function useThreadResume(
   ref: ScopedThreadRef | null,
   directory: string | null,
-): string | null {
+): ThreadResume | null {
   const projection = useQuietThreadProjection(ref)?.projection;
   const settings = useAtomValue(
     ref === null ? NO_SETTINGS_ATOM : serverEnvironment.settingsValueAtom(ref.environmentId),
@@ -42,10 +43,10 @@ export function useThreadResumeCommand(
 }
 
 /** Reads the command once, for a handler that does not subscribe to the thread. */
-export function readThreadResumeCommand(
+export function readThreadResume(
   ref: ScopedThreadRef,
   directory: string | null,
-): string | null {
+): ThreadResume | null {
   return resumeCommandFromProjection(
     appAtomRegistry.get(environmentThreadDetails.quietThreadAtom(ref))?.projection,
     appAtomRegistry.get(serverEnvironment.settingsValueAtom(ref.environmentId))

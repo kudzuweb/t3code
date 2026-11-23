@@ -194,6 +194,9 @@ export const layerExecutor: Layer.Layer<
                 ...(effect.request.revokeMcpCredential === undefined
                   ? {}
                   : { revokeMcpCredential: effect.request.revokeMcpCredential }),
+                ...(effect.request.awaitClosed === undefined
+                  ? {}
+                  : { awaitClosed: effect.request.awaitClosed }),
               })
               .pipe(
                 Effect.mapError(

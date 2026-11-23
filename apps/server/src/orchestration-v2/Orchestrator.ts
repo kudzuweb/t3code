@@ -5841,6 +5841,38 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           cause: `Provider session ${command.providerSessionId} does not belong to thread ${command.threadId}.`,
         });
       }
+      if (command.onlyIfIdle === true) {
+        const work = yield* projectionStore
+          .getThreadRecords(
+            command.threadId,
+            ["providerThreads", "runs", "runtimeRequests", "turnItems"],
+            { turnItemTypes: ["command_execution", "dynamic_tool", "subagent"] },
+          )
+          .pipe(
+            Effect.mapError(
+              (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+            ),
+          );
+        const rejectBusy = (reason: string) =>
+          new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: reason,
+          });
+        if (threadHasUnfinishedWork(work)) {
+          return yield* rejectBusy("Wait for the current turn to finish.");
+        }
+        const pendingBackgroundTasks = derivePendingBackgroundWork({
+          latestRun: work.runs.findLast((run) => run.status !== "queued"),
+          providerThreads: work.providerThreads,
+          turnItems: work.turnItems,
+          activeProviderThreadId: work.thread.activeProviderThreadId,
+          runs: work.runs,
+        });
+        if (pendingBackgroundTasks.length > 0) {
+          return yield* rejectBusy("Wait for the background tasks to finish.");
+        }
+      }
       const now = yield* DateTime.now;
       yield* emit(
         events,
@@ -5865,6 +5897,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           type: "provider-session.detach",
           providerSessionId: command.providerSessionId,
           ...(command.reason === undefined ? {} : { detail: command.reason }),
+          ...(command.onlyIfIdle === true ? { awaitClosed: true } : {}),
         },
       } satisfies PendingOrchestrationEffectV2;
       yield* Ref.update(effects, (existing) => [...existing, pendingEffect]);

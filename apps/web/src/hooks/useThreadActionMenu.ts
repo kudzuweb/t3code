@@ -30,7 +30,7 @@ import { copyThreadReference } from "../lib/copyThreadReference";
 import { m } from "../i18n/messages";
 import { threadChipCopyTarget } from "@t3tools/client-runtime/thread-reference";
 import { threadEnvironment } from "../state/threads";
-import { readThreadResumeCommand } from "../state/threadResumeCommand";
+import { readThreadResume } from "../state/threadResume";
 import { useOrchestrationCommand } from "../state/use-orchestration-command";
 import { readEnvironmentScope } from "../state/session";
 import {
@@ -97,6 +97,9 @@ export function useThreadActionMenu(input: {
   const regenerateThreadTitle = useOrchestrationCommand(threadEnvironment.regenerateTitle, {
     reportFailure: false,
   });
+  const stopThreadSession = useOrchestrationCommand(threadEnvironment.stopSession, {
+    reportFailure: false,
+  });
   const handleNewThread = useNewThreadHandler();
   const confirmThreadDelete = useClientSettings((s) => s.confirmThreadDelete);
   const confirmThreadArchive = useClientSettings((s) => s.confirmThreadArchive);
@@ -140,7 +143,7 @@ export function useThreadActionMenu(input: {
       };
       const isRegeneratingTitle = thread.titleRegeneration != null;
       const snoozePresets = resolveSnoozePresets(now, timestampFormat, threadRef.environmentId);
-      const resumeCommand = readThreadResumeCommand(threadRef, thread.worktreePath ?? projectCwd);
+      const resume = readThreadResume(threadRef, thread.worktreePath ?? projectCwd);
       const items = buildThreadActionMenuItems({
         canOperate: readEnvironmentScope(threadRef.environmentId, AuthOrchestrationOperateScope),
         canFind: onFind !== undefined,
@@ -157,7 +160,7 @@ export function useThreadActionMenu(input: {
         snoozePresets,
         canShareWithGuest,
         canTurnIntoProject: canTurnThreadIntoProject(threadRef),
-        canCopyResumeCommand: resumeCommand !== null,
+        canCopyResumeCommand: resume !== null,
       });
       const clicked = await settlePromise(() => api.contextMenu.show(items, position));
       if (clicked._tag === "Failure" || clicked.value === null) return;
@@ -322,7 +325,21 @@ export function useThreadActionMenu(input: {
           copyThreadIdToClipboard(thread.id, { threadId: thread.id });
           return;
         case "copy-resume-command":
-          if (resumeCommand !== null) void copyResumeCommand(resumeCommand);
+          if (resume !== null) {
+            void copyResumeCommand(
+              resume,
+              `${threadRef.environmentId}:${threadRef.threadId}`,
+              async () => {
+                const stopped = await stopThreadSession({
+                  environmentId: threadRef.environmentId,
+                  input: { threadId: threadRef.threadId, onlyIfIdle: true },
+                });
+                return stopped._tag === "Failure"
+                  ? { failure: squashAtomCommandFailure(stopped) }
+                  : { detached: stopped.value.detached };
+              },
+            );
+          }
           return;
         case "archive": {
           if (confirmThreadArchive) {

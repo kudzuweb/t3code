@@ -9,6 +9,7 @@ import {
   ORCHESTRATION_V2_WS_METHODS,
   ProjectId,
   ProviderInstanceId,
+  ProviderSessionId,
   ProviderDriverKind,
   RunId,
   ThreadId,
@@ -50,6 +51,7 @@ import {
   revertThreadCheckpoint,
   resumeThreadQueue,
   startThreadTurn,
+  stopThreadSession,
 } from "./commands.ts";
 
 const layerTestRandom = Layer.succeed(
@@ -167,6 +169,35 @@ describe("V2 environment commands", () => {
         { type: "queued-run.start", commandId: "send-selected", threadId, runId: "selected" },
         { type: "queue.resume", commandId: "resume-queue", threadId },
       ]);
+    }).pipe(Effect.provide(layerTestRandom)),
+  );
+
+  it.effect("reports how many sessions a guarded stop detached", () =>
+    Effect.gen(function* () {
+      const session = { id: ProviderSessionId.make("session-1") } as never;
+      const run = (providerSessions: OrchestrationV2ThreadProjection["providerSessions"]) =>
+        Effect.gen(function* () {
+          const commands: OrchestrationV2Command[] = [];
+          const supervisor = yield* makeSupervisor({
+            commands,
+            projects: [],
+            projection: { ...v2Projection, providerSessions },
+          });
+          const result = yield* stopThreadSession({
+            commandId: CommandId.make("stop"),
+            threadId: ThreadId.make("thread-1"),
+            onlyIfIdle: true,
+          }).pipe(Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor));
+          return { commands, result };
+        });
+
+      const none = yield* run([]);
+      expect(none.result.detached).toBe(0);
+      expect(none.commands).toEqual([]);
+
+      const one = yield* run([session]);
+      expect(one.result.detached).toBe(1);
+      expect(one.commands).toMatchObject([{ type: "provider-session.detach", onlyIfIdle: true }]);
     }).pipe(Effect.provide(layerTestRandom)),
   );
 

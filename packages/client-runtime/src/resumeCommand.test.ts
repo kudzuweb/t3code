@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { buildResumeCommand, resolveThreadResumeCommand } from "./resumeCommand.ts";
+import {
+  buildResumeCommand,
+  classifyResumeRelease,
+  createReleaseGuard,
+  resolveThreadResume,
+} from "./resumeCommand.ts";
 
 describe("buildResumeCommand", () => {
   it.each([
@@ -44,7 +49,7 @@ describe("buildResumeCommand", () => {
   });
 });
 
-describe("resolveThreadResumeCommand", () => {
+describe("resolveThreadResume", () => {
   const ref = (driver: string, nativeId: string, strength: string) => ({
     driver,
     nativeId,
@@ -72,17 +77,25 @@ describe("resolveThreadResumeCommand", () => {
       nativeThreadRef: ref("claudeAgent", "s-4", "strong"),
     },
   ] as never;
-  const resolve = (
+  const resolveWithSessions = (
     activeProviderThreadId: string | null,
+    providerSessions: ReadonlyArray<unknown>,
     providerInstances = {},
-    directory = "/a",
+    directory: string | null = "/a",
   ) =>
-    resolveThreadResumeCommand({
+    resolveThreadResume({
       activeProviderThreadId,
       providerThreads,
+      providerSessions,
       providerInstances,
       directory,
     });
+  const resolve = (
+    activeProviderThreadId: string | null,
+    providerInstances = {},
+    directory: string | null = "/a",
+  ) =>
+    resolveWithSessions(activeProviderThreadId, [], providerInstances, directory)?.command ?? null;
 
   it("uses the active provider thread with the default home", () => {
     expect(resolve("pt-1")).toBe("cd '/a' && claude --resume 's-1'");
@@ -112,13 +125,49 @@ describe("resolveThreadResumeCommand", () => {
   it("returns null without an active thread, a strong ref, or a directory", () => {
     expect(resolve(null)).toBeNull();
     expect(resolve("pt-2")).toBeNull();
-    expect(
-      resolveThreadResumeCommand({
-        activeProviderThreadId: "pt-1",
-        providerThreads,
-        providerInstances: {},
-        directory: null,
+    expect(resolve("pt-1", {}, null)).toBeNull();
+  });
+
+  it("asks to release T3's hold only for a Codex thread with a live session", () => {
+    const liveSession = [{ id: "ps-1" }];
+    expect(resolveWithSessions("pt-3", liveSession)?.releaseFirst).toBe(true);
+    expect(resolveWithSessions("pt-3", [])?.releaseFirst).toBe(false);
+    expect(resolveWithSessions("pt-1", liveSession)?.releaseFirst).toBe(false);
+  });
+});
+
+describe("createReleaseGuard", () => {
+  it("skips a release for a thread while one is in flight, and allows the next after it settles", async () => {
+    const guard = createReleaseGuard();
+    let finish: () => void = () => {};
+    const first = guard(
+      "env:thread-1",
+      () => new Promise<string>((resolve) => (finish = () => resolve("first"))),
+    );
+    const duplicate = await guard("env:thread-1", async () => "duplicate");
+    const otherThread = await guard("env:thread-2", async () => "other");
+    expect(duplicate).toBeUndefined();
+    expect(otherThread).toBe("other");
+    finish();
+    expect(await first).toBe("first");
+    expect(await guard("env:thread-1", async () => "again")).toBe("again");
+  });
+
+  it("frees the thread when a release throws", async () => {
+    const guard = createReleaseGuard();
+    await expect(
+      guard("env:thread-1", async () => {
+        throw new Error("boom");
       }),
-    ).toBeNull();
+    ).rejects.toThrow("boom");
+    expect(await guard("env:thread-1", async () => "retry")).toBe("retry");
+  });
+});
+
+describe("classifyResumeRelease", () => {
+  it("reports a release only when a detach was dispatched", () => {
+    expect(classifyResumeRelease({ detached: 1 })).toBe("released");
+    expect(classifyResumeRelease({ detached: 0 })).toBe("nothing");
+    expect(classifyResumeRelease({ failure: new Error("busy") })).toBe("refused");
   });
 });

@@ -11,10 +11,22 @@ export interface ResumeCommandProviderInstance {
 }
 
 const RESUME_COMMAND_BY_DRIVER: Readonly<
-  Record<string, { readonly homeVariable: string; readonly command: string }>
+  Record<
+    string,
+    {
+      readonly homeVariable: string;
+      readonly command: string;
+      /** The provider allows one writer per session, so T3 must let go before a terminal can resume. */
+      readonly singleWriter: boolean;
+    }
+  >
 > = {
-  claudeAgent: { homeVariable: "CLAUDE_CONFIG_DIR", command: "claude --resume" },
-  codex: { homeVariable: "CODEX_HOME", command: "codex resume" },
+  claudeAgent: {
+    homeVariable: "CLAUDE_CONFIG_DIR",
+    command: "claude --resume",
+    singleWriter: false,
+  },
+  codex: { homeVariable: "CODEX_HOME", command: "codex resume", singleWriter: true },
 };
 
 /** Wraps a value in single quotes for a POSIX shell, escaping embedded single quotes. */
@@ -66,15 +78,50 @@ export function buildResumeCommand(input: {
   return `cd ${shellQuote(input.directory)} && ${homePrefix}${resume.command} ${shellQuote(input.nativeId)}`;
 }
 
-/** The resume command for the thread's active provider thread. */
-export function resolveThreadResumeCommand(input: {
+/**
+ * Runs a release for a key unless one is already in flight for it, so repeated clicks do not
+ * dispatch repeated detaches. Resolves to undefined when skipped.
+ */
+export function createReleaseGuard() {
+  const inFlight = new Set<string>();
+  return async <T>(key: string, release: () => Promise<T>): Promise<T | undefined> => {
+    if (inFlight.has(key)) return undefined;
+    inFlight.add(key);
+    try {
+      return await release();
+    } finally {
+      inFlight.delete(key);
+    }
+  };
+}
+
+/** What a release attempt did: `detached` counts the detaches dispatched, `failure` is a refusal. */
+export type ResumeReleaseAttempt = { readonly detached: number } | { readonly failure: unknown };
+
+export function classifyResumeRelease(
+  attempt: ResumeReleaseAttempt,
+): "released" | "nothing" | "refused" {
+  if ("failure" in attempt) return "refused";
+  return attempt.detached > 0 ? "released" : "nothing";
+}
+
+export interface ThreadResume {
+  readonly command: string;
+  /** T3 holds the session and should be told to let go before the command is used. */
+  readonly releaseFirst: boolean;
+}
+
+/** The resume command for the thread's active provider thread, and whether T3 must release it first. */
+export function resolveThreadResume(input: {
   readonly activeProviderThreadId: string | null;
   readonly providerThreads: ReadonlyArray<
     Pick<OrchestrationV2ProviderThread, "id" | "providerInstanceId" | "nativeThreadRef">
   >;
+  /** The thread's live provider sessions; a thread with none holds nothing. */
+  readonly providerSessions: ReadonlyArray<unknown>;
   readonly providerInstances: Readonly<Record<string, ResumeCommandProviderInstance>>;
   readonly directory: string | null;
-}): string | null {
+}): ThreadResume | null {
   const providerThread = input.providerThreads.find(
     (thread) => thread.id === input.activeProviderThreadId,
   );
@@ -88,10 +135,17 @@ export function resolveThreadResumeCommand(input: {
     : undefined;
   const homePath = resolveInstanceHome(homeVariable, instance);
   if (homePath === "unknown") return null;
-  return buildResumeCommand({
+  const command = buildResumeCommand({
     driver: nativeThreadRef.driver,
     nativeId: nativeThreadRef.nativeId,
     directory: input.directory,
     homePath,
   });
+  if (command === null) return null;
+  return {
+    command,
+    releaseFirst:
+      RESUME_COMMAND_BY_DRIVER[nativeThreadRef.driver]?.singleWriter === true &&
+      input.providerSessions.length > 0,
+  };
 }
