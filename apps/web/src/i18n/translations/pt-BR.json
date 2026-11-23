@@ -8923,7 +8923,7 @@
   "dde11d3302b7aa92": "Outra coisa bloqueia a suspensão com a tampa fechada. O T3 Code não vai mexer nisso.",
   "227c520c97722021": "A suspensão com a tampa fechada não está bloqueada.",
   "1b17092d65288499": "{environment}: {status}",
-  "43faa493bc705a0e": "Mantém o Mac acordado com a tampa fechada. Automático faz isso só enquanto os agentes estão trabalhando. Ativado continua valendo depois que o T3 Code fecha, até você mudar para Desativado ou executar `sudo pmset -a disablesleep 0`.",
+  "0f3d85f8b4657dc7": "Mantém o Mac acordado com a tampa fechada. Automático faz isso só enquanto os agentes estão trabalhando. Ativado continua valendo depois que o T3 Code fecha, até você mudar para Desativado. Enquanto o T3 Code não estiver em execução, `sudo pmset -a disablesleep 0` o desfaz.",
   "987d55ee228dced2": "Redefinir o bloqueio de suspensão com a tampa fechada para o padrão",
   "e854d5bbec8ddcd8": "Requer \"Manter ativo enquanto os agentes trabalham\"",
   "3836976622328d61": "O que os agentes daqui podem fazer lá",

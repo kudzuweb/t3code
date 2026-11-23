@@ -93,7 +93,7 @@ export function LidSleepGuardSettingsRow() {
       settingKeys={["lidSleepGuard"]}
       {...setting("lid-sleep-guard")}
       description={gt(
-        "Keeps the Mac awake with the lid closed. Auto does it only while agents are working. On stays in effect after T3 Code quits, until you switch it Off or run `sudo pmset -a disablesleep 0`.",
+        "Keeps the Mac awake with the lid closed. Auto does it only while agents are working. On stays in effect after T3 Code quits, until you switch it Off. While T3 Code is not running, `sudo pmset -a disablesleep 0` clears it.",
       )}
       status={
         lines.length > 0 ? (

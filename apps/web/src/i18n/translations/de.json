@@ -8924,7 +8924,7 @@
   "dde11d3302b7aa92": "Der Ruhezustand bei geschlossenem Deckel wird von etwas anderem gesperrt. T3 Code lässt das unberührt.",
   "227c520c97722021": "Der Ruhezustand bei geschlossenem Deckel ist nicht gesperrt.",
   "1b17092d65288499": "{environment}: {status}",
-  "43faa493bc705a0e": "Hält den Mac bei geschlossenem Deckel wach. Auto tut das nur, solange Agenten arbeiten. „An“ bleibt auch nach dem Beenden von T3 Code in Kraft, bis du es auf „Aus“ stellst oder `sudo pmset -a disablesleep 0` ausführst.",
+  "0f3d85f8b4657dc7": "Hält den Mac bei geschlossenem Deckel wach. Auto tut das nur, solange Agenten arbeiten. „An“ bleibt auch nach dem Beenden von T3 Code in Kraft, bis du es auf „Aus“ stellst. Solange T3 Code nicht läuft, hebt `sudo pmset -a disablesleep 0` es auf.",
   "987d55ee228dced2": "Ruhezustandssperre bei geschlossenem Deckel auf Standard zurücksetzen",
   "e854d5bbec8ddcd8": "Benötigt „Wach halten, während Agenten arbeiten“",
   "3836976622328d61": "Was Agenten von hier dort tun dürfen",

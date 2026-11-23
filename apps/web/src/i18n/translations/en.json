@@ -8932,7 +8932,7 @@
   "dde11d3302b7aa92": "Lid sleep is blocked by something else. T3 Code will leave it alone.",
   "227c520c97722021": "Not blocking lid sleep.",
   "1b17092d65288499": "{environment}: {status}",
-  "43faa493bc705a0e": "Keeps the Mac awake with the lid closed. Auto does it only while agents are working. On stays in effect after T3 Code quits, until you switch it Off or run `sudo pmset -a disablesleep 0`.",
+  "0f3d85f8b4657dc7": "Keeps the Mac awake with the lid closed. Auto does it only while agents are working. On stays in effect after T3 Code quits, until you switch it Off. While T3 Code is not running, `sudo pmset -a disablesleep 0` clears it.",
   "987d55ee228dced2": "Reset lid sleep guard to default",
   "e854d5bbec8ddcd8": "Needs Keep awake while agents work",
   "3836976622328d61": "What agents here may do there",

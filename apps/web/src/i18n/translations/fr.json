@@ -8924,7 +8924,7 @@
   "dde11d3302b7aa92": "La veille capot fermé est bloquée par autre chose. T3 Code n'y touchera pas.",
   "227c520c97722021": "La veille capot fermé n'est pas bloquée.",
   "1b17092d65288499": "{environment}: {status}",
-  "43faa493bc705a0e": "Garde le Mac éveillé capot fermé. Auto ne le fait que pendant que des agents travaillent. Activé reste en vigueur après la fermeture de T3 Code, jusqu'à ce que tu passes en Désactivé ou que tu exécutes `sudo pmset -a disablesleep 0`.",
+  "0f3d85f8b4657dc7": "Garde le Mac éveillé capot fermé. Auto ne le fait que pendant que des agents travaillent. Activé reste en vigueur après la fermeture de T3 Code, jusqu'à ce que tu passes en Désactivé. Tant que T3 Code ne tourne pas, `sudo pmset -a disablesleep 0` l'annule.",
   "987d55ee228dced2": "Rétablir le blocage de la veille capot fermé par défaut",
   "e854d5bbec8ddcd8": "Nécessite « Empêcher la mise en veille pendant que les agents travaillent »",
   "3836976622328d61": "Ce que les agents d’ici peuvent faire là-bas",

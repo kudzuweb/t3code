@@ -109,11 +109,11 @@ On macOS, T3 Code already keeps the Mac from idle-sleeping while agents work
 a Mac from sleeping when you close the lid. **Lid sleep guard** does, by
 turning on macOS's `disablesleep` flag.
 
-| Mode | What it does                                                                                                                                                                               |
-| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Off  | Never changes the flag. This is the default.                                                                                                                                               |
-| Auto | Blocks lid sleep while agents work and for a minute after, then lets go. It needs **Keep awake while agents work**; with that setting off, Auto does nothing and the settings row says so. |
-| On   | Blocks lid sleep until you switch the mode to Off. The block stays in effect when T3 Code quits, crashes or restarts, and `sudo pmset -a disablesleep 0` clears it without T3 Code.        |
+| Mode | What it does                                                                                                                                                                                     |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Off  | Clears a block T3 Code set and leaves a block set by something else alone. This is the default.                                                                                                  |
+| Auto | Blocks lid sleep while agents work and for a minute after, then lets go. It needs **Keep awake while agents work**; with that setting off, Auto does nothing and the settings row says so.       |
+| On   | Blocks lid sleep until you switch the mode to Off. The block stays in effect when T3 Code quits, crashes or restarts, and `sudo pmset -a disablesleep 0` clears it while T3 Code is not running. |
 
 Choose the mode in **Settings > Maintenance**, or with **Lid sleep guard** in
 the command palette. The setting appears only for servers running on macOS. The
@@ -150,11 +150,18 @@ retried, waiting up to 5 minutes between tries.
 
 In On, the lease is marked persistent, so neither the background process nor
 the next start clears the block. The next start keeps it, and the mode then
-decides: On keeps it, Off clears it and Auto clears it unless agents are
-working. While On is selected, T3 Code sets the block again within 30 seconds if
-something clears it. A Mac left in On does not sleep with the lid closed, even
-after T3 Code quits, until you switch the mode to Off or run
-`sudo pmset -a disablesleep 0`.
+decides: On keeps it, Off clears it, and Auto clears it and then sets it again
+if agents are working. While On is selected and T3 Code runs, it sets the block
+again within 30 seconds if something clears it. A Mac left in On does not sleep
+with the lid closed, even after T3 Code quits, until you switch the mode to Off
+or, while T3 Code is not running, run `sudo pmset -a disablesleep 0`.
+
+If you clear the block with `pmset` while T3 Code is quit and another tool then
+sets its own block, T3 Code can take that block for its own at the next start
+and later clear it. That loses the block but never leaves the Mac unable to
+sleep. Switching between On and Auto while agents work briefly clears the block
+and sets it again. If T3 Code cannot start its background process, an Auto block
+has no crash backstop until the next start.
 
 The guard changes `pmset` only in servers started without a Vite dev URL, which
 are the packaged app and `t3` CLI builds. In a development server the settings

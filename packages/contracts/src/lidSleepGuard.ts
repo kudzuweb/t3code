@@ -1,6 +1,6 @@
 import * as Schema from "effect/Schema";
 
-/** `auto` holds the block while agents work; `on` holds it whenever the server runs. */
+/** `auto` holds the block while agents work; `on` holds it until switched off, also after the server exits. */
 export const LidSleepGuardMode = Schema.Literals(["off", "auto", "on"]);
 export type LidSleepGuardMode = typeof LidSleepGuardMode.Type;
 

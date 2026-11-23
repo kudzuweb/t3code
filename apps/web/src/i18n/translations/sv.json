@@ -8930,7 +8930,7 @@
   "dde11d3302b7aa92": "Något annat spärrar viloläge vid stängt lock. T3 Code rör det inte.",
   "227c520c97722021": "Viloläge vid stängt lock spärras inte.",
   "1b17092d65288499": "{environment}: {status}",
-  "43faa493bc705a0e": "Håller Macen vaken med locket stängt. Auto gör det bara medan agenter arbetar. På gäller även efter att T3 Code avslutats, tills du växlar till Av eller kör `sudo pmset -a disablesleep 0`.",
+  "0f3d85f8b4657dc7": "Håller Macen vaken med locket stängt. Auto gör det bara medan agenter arbetar. På gäller även efter att T3 Code avslutats, tills du växlar till Av. Medan T3 Code inte körs tar `sudo pmset -a disablesleep 0` bort spärren.",
   "987d55ee228dced2": "Återställ sömnspärren vid stängt lock till standard",
   "e854d5bbec8ddcd8": "Kräver ”Håll vaken medan agenter arbetar”",
   "3836976622328d61": "Vad agenter här får göra där",

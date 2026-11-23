@@ -8922,7 +8922,7 @@
   "dde11d3302b7aa92": "Otra cosa bloquea la suspensión con la tapa cerrada. T3 Code no lo tocará.",
   "227c520c97722021": "No se está bloqueando la suspensión con la tapa cerrada.",
   "1b17092d65288499": "{environment}: {status}",
-  "43faa493bc705a0e": "Mantiene el Mac activo con la tapa cerrada. Automático lo hace solo mientras los agentes trabajan. Activado sigue en vigor después de cerrar T3 Code, hasta que lo cambies a Desactivado o ejecutes `sudo pmset -a disablesleep 0`.",
+  "0f3d85f8b4657dc7": "Mantiene el Mac activo con la tapa cerrada. Automático lo hace solo mientras los agentes trabajan. Activado sigue en vigor después de cerrar T3 Code, hasta que lo cambies a Desactivado. Mientras T3 Code no se esté ejecutando, `sudo pmset -a disablesleep 0` lo anula.",
   "987d55ee228dced2": "Restablecer el bloqueo de suspensión con la tapa cerrada a su valor predeterminado",
   "e854d5bbec8ddcd8": "Requiere «Mantener activo mientras trabajan los agentes»",
   "3836976622328d61": "Qué pueden hacer allí los agentes de aquí",
