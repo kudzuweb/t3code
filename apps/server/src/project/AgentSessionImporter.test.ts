@@ -1155,6 +1155,27 @@ describe("importing one session", () => {
     }).pipe(Effect.scoped, Effect.provide(persistence)),
   );
 
+  it.effect("stamps an opened session as settled at the import time, unlike the bulk import", () =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const opened = candidate(CLAUDE_MODEL_SELECTION, claudeId, "claudeAgent");
+      const bulk = candidate(CODEX_MODEL_SELECTION, "bulk");
+      const importer = yield* makeImporter([opened, bulk]);
+      const importTime = DateTime.add(now, { days: 30 });
+      yield* TestClock.setTime(DateTime.toEpochMillis(importTime));
+
+      yield* importer.importSession(opened);
+      yield* importer.run;
+
+      const settledAt = (source: typeof opened) =>
+        projections
+          .getThreadRecords(importId(source), [])
+          .pipe(Effect.map(({ thread }) => thread.settledAt));
+      expect(yield* settledAt(opened)).toEqual(importTime);
+      expect(yield* settledAt(bulk)).toEqual(now);
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+  );
+
   it.effect("carries the native ids of a Codex import's items, as Claude and Pi imports do", () =>
     Effect.gen(function* () {
       const projections = yield* ProjectionStore.ProjectionStoreV2;

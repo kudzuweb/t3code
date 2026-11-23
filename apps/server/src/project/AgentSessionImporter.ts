@@ -295,6 +295,8 @@ const make = Effect.gen(function* () {
     readonly runtimeMode: RuntimeMode;
     // Set when the deterministic ids belong to a deleted thread.
     readonly ids?: { readonly threadId: ThreadId; readonly providerThreadId: ProviderThreadId };
+    // Defaults to the session's last activity.
+    readonly settledAt?: DateTime.Utc;
   }) {
     const { outcome, projectId, workspaceRoot, runtimeMode } = input;
     const source = outcome.source;
@@ -395,7 +397,7 @@ const make = Effect.gen(function* () {
       updatedAt,
       archivedAt: null,
       settledOverride: "settled",
-      settledAt: updatedAt,
+      settledAt: input.settledAt ?? updatedAt,
       unsettledAt: null,
       snoozedUntil: null,
       snoozedAt: null,
@@ -761,6 +763,8 @@ const make = Effect.gen(function* () {
       workspaceRoot: project.workspaceRoot,
       runtimeMode: yield* importRuntimeMode(input.projectId, project),
       ids,
+      // A resumed old session must list as recent, or the sidebar's newest-25 shell list drops it.
+      settledAt: yield* DateTime.now,
     }).pipe(
       Effect.map((outcome) =>
         outcome === "imported"
