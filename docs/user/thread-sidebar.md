@@ -61,23 +61,6 @@ in a new thread's model picker to add or remove them. A regular click returns to
 single model. Choose a base branch and send. Each selection starts a separate thread
 and worktree while you stay in the new thread composer. This requires a Git project.
 
-## Resume a session
-
-Resume session brings a Claude Code, Codex or Pi session you started in a
-terminal into T3 Code, the way `claude --resume` picks one in the terminal. Open
-it from the command palette (`Cmd/Ctrl+K`), from a project's context menu in the
-sidebar, or with `Cmd/Ctrl+Shift+U`. The list shows the project's sessions, newest first, and
-you can search by title, provider or branch.
-
-Choosing a session opens a thread that continues that same session, so the
-terminal sees the turns you take in T3 Code afterwards. A session that already
-has a thread opens that thread and is marked **In T3**.
-
-For a Claude Code session, turns you take in the terminal afterwards appear in
-the thread, marked **Terminal**. Threads update on their own within about 10
-seconds, and every thread in the sidebar also updates when you return to the
-window. You can't fork from a Terminal turn.
-
 ## Pin and reorder threads
 
 Pin a thread from its menu to keep it above your active work.

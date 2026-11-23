@@ -321,7 +321,6 @@ const makeImporter = Effect.fn(function* (
   return {
     run: importer.importRecentAgentThreads({ projectId }),
     importNativeHistory: importer.importNativeHistory,
-    listSessions: importer.listSessions({ projectId }),
     importSession: (source: ReturnType<typeof candidate>) =>
       importer.importSession({
         projectId,
@@ -1292,7 +1291,7 @@ describe("importing one session", () => {
     }).pipe(Effect.scoped, Effect.provide(persistence)),
   );
 
-  it.effect("returns and lists a live thread that holds the session in another project", () =>
+  it.effect("returns a live thread that holds the session in another project", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       const source = candidate(CLAUDE_MODEL_SELECTION, claudeId, "claudeAgent");
@@ -1300,7 +1299,6 @@ describe("importing one session", () => {
       yield* sql`UPDATE orchestration_v2_projection_threads SET project_id = 'other-project' WHERE thread_id = ${owner}`;
       const importer = yield* makeImporter([source]);
       expect(yield* importer.importSession(source)).toEqual({ threadId: owner, imported: false });
-      expect((yield* importer.listSessions).sessions[0]?.threadId).toBe(owner);
     }).pipe(Effect.scoped, Effect.provide(persistence)),
   );
 
@@ -1317,7 +1315,6 @@ describe("importing one session", () => {
       const importer = yield* makeImporter([source]);
       expect(yield* importer.run).toEqual({ importedCount: 1, skippedCount: 0 });
       yield* deleteThread(importId(source));
-      expect((yield* importer.listSessions).sessions[0]?.threadId).toBeNull();
 
       const reimported = yield* importer.importSession(source);
       expect(reimported.imported).toBe(true);
@@ -1329,7 +1326,6 @@ describe("importing one session", () => {
       expect(records.thread.deletedAt).toBeNull();
       expect(records.messages.map((message) => message.text)).toEqual(["Fix it", "Fixed"]);
       expect(records.providerThreads[0]?.nativeThreadRef?.nativeId).toBe(claudeId);
-      expect((yield* importer.listSessions).sessions[0]?.threadId).toBe(reimported.threadId);
       expect(yield* importer.importSession(source)).toEqual({
         threadId: reimported.threadId,
         imported: false,
@@ -1386,25 +1382,6 @@ describe("importing one session", () => {
           importer.importSession(candidate(CLAUDE_MODEL_SELECTION, claudeId, "claudeAgent")),
         ),
       ).toMatchObject({ _tag: "AgentSessionUnreadableError", filePath });
-    }).pipe(Effect.scoped, Effect.provide(persistence)),
-  );
-
-  it.effect("lists each session with the thread that holds it", () =>
-    Effect.gen(function* () {
-      const held = candidate(CLAUDE_MODEL_SELECTION, claudeId, "claudeAgent");
-      const free = candidate(CODEX_MODEL_SELECTION, "free");
-      const heldPi = candidate(PI_MODEL_SELECTION, "held-pi", "pi");
-      const owner = yield* seedOwner(held);
-      const piOwner = yield* seedOwner(heldPi);
-      const importer = yield* makeImporter([held, free, heldPi]);
-      expect(yield* importer.listSessions).toEqual({
-        sessions: [
-          expect.objectContaining({ providerSessionId: claudeId, threadId: owner }),
-          expect.objectContaining({ providerSessionId: "free", threadId: null }),
-          expect.objectContaining({ providerSessionId: "held-pi", threadId: piOwner }),
-        ],
-        truncated: false,
-      });
     }).pipe(Effect.scoped, Effect.provide(persistence)),
   );
 });

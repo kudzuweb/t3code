@@ -1,4 +1,4 @@
-import { ProviderInstanceId, ThreadId, type AgentSessionSummary } from "@t3tools/contracts";
+import { ProviderInstanceId, type AgentSessionSummary } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 
 import {
@@ -16,21 +16,13 @@ const session = (
   title: `Session ${overrides.id}`,
   lastActiveAt: null,
   worktree: null,
-  threadId: null,
   ...overrides,
 });
 
 describe("buildResumeSessionRows", () => {
-  it("keeps the server order and labels each row's state", () => {
-    const rows = buildResumeSessionRows([
-      session({ id: "new" }),
-      session({ id: "held", threadId: ThreadId.make("thread-1") }),
-    ]);
-    expect(rows.map((row) => [row.session.providerSessionId, row.state])).toEqual([
-      ["new", "resume"],
-      ["held", "open"],
-    ]);
-    expect(rows[1]?.threadId).toBe("thread-1");
+  it("keeps the server order", () => {
+    const rows = buildResumeSessionRows([session({ id: "first" }), session({ id: "second" })]);
+    expect(rows.map((row) => row.session.providerSessionId)).toEqual(["first", "second"]);
   });
 
   it("takes the provider label and branch from the session", () => {

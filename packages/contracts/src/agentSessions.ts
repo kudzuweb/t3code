@@ -157,8 +157,6 @@ export const AgentSessionSummary = Schema.Struct({
   title: TrimmedNonEmptyString,
   lastActiveAt: Schema.NullOr(IsoDateTime),
   worktree: Schema.NullOr(AgentSessionWorktree),
-  /** The T3 thread that already holds this session. */
-  threadId: Schema.NullOr(ThreadId),
 });
 export type AgentSessionSummary = typeof AgentSessionSummary.Type;
 
