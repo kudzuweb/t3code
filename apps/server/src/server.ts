@@ -33,6 +33,7 @@ import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
 import * as HostPowerMonitor from "./background/HostPowerMonitor.ts";
 import * as NonBlockingSpawner from "./process/NonBlockingSpawner.ts";
 import * as KeepAwake from "./background/KeepAwake.ts";
+import * as LidSleepGuard from "./background/LidSleepGuard.ts";
 import * as ServerConfig from "./config.ts";
 import { withRootRequestSpans, withUntracedRequests } from "./http.ts";
 import * as ServerHttp from "./http.ts";
@@ -726,6 +727,7 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   ),
   layerThreadPullRequestWorker,
   KeepAwake.layer,
+  LidSleepGuard.layer.pipe(Layer.provide(ProcessRunner.layer)),
   DelegatedTaskAnalytics.layer,
   Layer.effectDiscard(
     Effect.gen(function* () {

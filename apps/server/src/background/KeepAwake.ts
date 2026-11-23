@@ -18,6 +18,7 @@ import { forkParked } from "../serverActivation.ts";
 import * as Settings from "../serverSettings.ts";
 
 // Bridges gaps between back-to-back runs, so a long-idle machine does not sleep mid-queue.
+export type Grace = Duration.Input;
 const RELEASE_GRACE = Duration.seconds(60);
 
 // ES_CONTINUOUS | ES_SYSTEM_REQUIRED, held by the calling thread until the script ends.
@@ -98,7 +99,7 @@ function inhibitorCommand(
 export const holdWhileWanted = <E, R>(
   wanted: Stream.Stream<boolean, E, R>,
   hold: Effect.Effect<void>,
-  grace: Duration.Input = RELEASE_GRACE,
+  grace: Grace = RELEASE_GRACE,
 ) =>
   wanted.pipe(
     Stream.changes,
@@ -117,7 +118,7 @@ const backoff = Schedule.exponential("5 seconds").pipe(
     Effect.succeed(Duration.min(duration, Duration.minutes(10))),
   ),
 );
-const retryWithBackoff =
+export const retryWithBackoff =
   (message: string) =>
   <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     effect.pipe(
@@ -134,6 +135,63 @@ class KeepAwakeInhibitorExited extends Schema.TaggedError<KeepAwakeInhibitorExit
   }
 }
 
+/** True while the setting is on and a run is active; KeepAwake and LidSleepGuard both hold on it. */
+export const demand = Effect.gen(function* () {
+  const settings = yield* Settings.ServerSettingsService;
+  const events = yield* OrchestrationEventStore.OrchestrationEventStore;
+  const sql = yield* SqlClient.SqlClient;
+
+  const hasActiveRun = sql<{ readonly active: number }>`
+      SELECT EXISTS (
+        SELECT 1 FROM orchestration_v2_projection_runs
+        WHERE status IN ('preparing', 'starting', 'running')
+      ) AS active
+    `.pipe(
+    Effect.map((rows) => rows[0]?.active === 1),
+    retryWithBackoff("keep-awake could not read active runs"),
+  );
+  // Read the cursor before the snapshot so a run changing in between is replayed, not missed.
+  const active = Stream.unwrap(
+    events.latestApplicationSequence.pipe(
+      retryWithBackoff("keep-awake could not read the event cursor"),
+      Effect.map((afterSequence) =>
+        Stream.concat(
+          Stream.succeed(undefined),
+          events
+            .streamApplicationEvents({ afterSequence })
+            .pipe(
+              Stream.filter(
+                (stored) =>
+                  "event" in stored &&
+                  (stored.event.type === "run.created" || stored.event.type === "run.updated"),
+              ),
+            ),
+        ),
+      ),
+    ),
+  ).pipe(
+    Stream.mapEffect(() => hasActiveRun),
+    // A failed subscription resubscribes, which re-reads the cursor and the snapshot.
+    Stream.tapCause((cause) => Effect.logWarning("keep-awake run event stream failed", { cause })),
+    Stream.retry(backoff),
+  );
+  const enabled = Stream.unwrap(
+    Effect.gen(function* () {
+      const changes = yield* settings.subscribeChanges;
+      const current = yield* settings.getSettings.pipe(
+        Effect.map((value) => value.keepAwakeWhileAgentsWork),
+        Effect.orElseSucceed(() => true),
+      );
+      return Stream.concat(
+        Stream.succeed(current),
+        Stream.map(changes, (value) => value.keepAwakeWhileAgentsWork),
+      );
+    }),
+  );
+
+  return Stream.zipLatestWith(enabled, active, (on, busy) => on && busy);
+});
+
 export const layer = Layer.effectDiscard(
   Effect.gen(function* () {
     const platform = yield* HostProcess.Platform;
@@ -147,60 +205,8 @@ export const layer = Layer.effectDiscard(
       ));
     const command = inhibitorCommand(platform, process.pid, isWsl);
     if (command === undefined) return;
-    const settings = yield* Settings.ServerSettingsService;
-    const events = yield* OrchestrationEventStore.OrchestrationEventStore;
-    const sql = yield* SqlClient.SqlClient;
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-
-    const hasActiveRun = sql<{ readonly active: number }>`
-      SELECT EXISTS (
-        SELECT 1 FROM orchestration_v2_projection_runs
-        WHERE status IN ('preparing', 'starting', 'running')
-      ) AS active
-    `.pipe(
-      Effect.map((rows) => rows[0]?.active === 1),
-      retryWithBackoff("keep-awake could not read active runs"),
-    );
-    // Read the cursor before the snapshot so a run changing in between is replayed, not missed.
-    const active = Stream.unwrap(
-      events.latestApplicationSequence.pipe(
-        retryWithBackoff("keep-awake could not read the event cursor"),
-        Effect.map((afterSequence) =>
-          Stream.concat(
-            Stream.succeed(undefined),
-            events
-              .streamApplicationEvents({ afterSequence })
-              .pipe(
-                Stream.filter(
-                  (stored) =>
-                    "event" in stored &&
-                    (stored.event.type === "run.created" || stored.event.type === "run.updated"),
-                ),
-              ),
-          ),
-        ),
-      ),
-    ).pipe(
-      Stream.mapEffect(() => hasActiveRun),
-      // A failed subscription resubscribes, which re-reads the cursor and the snapshot.
-      Stream.tapCause((cause) =>
-        Effect.logWarning("keep-awake run event stream failed", { cause }),
-      ),
-      Stream.retry(backoff),
-    );
-    const enabled = Stream.unwrap(
-      Effect.gen(function* () {
-        const changes = yield* settings.subscribeChanges;
-        const current = yield* settings.getSettings.pipe(
-          Effect.map((value) => value.keepAwakeWhileAgentsWork),
-          Effect.orElseSucceed(() => true),
-        );
-        return Stream.concat(
-          Stream.succeed(current),
-          Stream.map(changes, (value) => value.keepAwakeWhileAgentsWork),
-        );
-      }),
-    );
+    const wanted = yield* demand;
 
     const holdOnce = Effect.gen(function* () {
       const child = yield* spawner.spawn(
@@ -244,10 +250,9 @@ export const layer = Layer.effectDiscard(
     );
 
     yield* forkParked(
-      holdWhileWanted(
-        Stream.zipLatestWith(enabled, active, (on, busy) => on && busy),
-        hold,
-      ).pipe(Effect.catchCause((cause) => Effect.logWarning("keep-awake stopped", { cause }))),
+      holdWhileWanted(wanted, hold).pipe(
+        Effect.catchCause((cause) => Effect.logWarning("keep-awake stopped", { cause })),
+      ),
     );
   }),
 );
