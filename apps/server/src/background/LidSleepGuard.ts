@@ -2,13 +2,22 @@ import type { LidSleepGuardMode, LidSleepGuardStatus } from "@t3tools/contracts"
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as FiberHandle from "effect/FiberHandle";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as Ref from "effect/Ref";
 import * as Path from "effect/Path";
+import type * as PlatformError from "effect/PlatformError";
+import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
+import * as SecureRandom from "effect/crypto/SecureRandom";
+import * as ChildProcess from "effect/process/ChildProcess";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 
 import * as ServerConfig from "../config.ts";
@@ -30,6 +39,51 @@ const setSleepDisabledArgs = (disabled: boolean) => [
   "disablesleep",
   disabled ? "1" : "0",
 ];
+
+const STATUS_RECHECK_INTERVAL = "30 seconds";
+const releaseBackoff = Schedule.exponential("5 seconds").pipe(
+  Schedule.modifyDelay(({ duration }) =>
+    Effect.succeed(Duration.min(duration, Duration.minutes(5))),
+  ),
+);
+
+export interface ReleaseWatcher {
+  readonly command: string;
+  readonly args: ReadonlyArray<string>;
+}
+
+/**
+ * A process that outlives the server. `caffeinate -w` returns when the server pid exits, whether
+ * it exited cleanly or was killed. The watcher then clears `disablesleep` only if the lease still
+ * names this server's pid and start token; after a normal shutdown the lease is already gone, so
+ * it does nothing. $1 is the server pid, $2 the lease path and $3 the start token.
+ */
+export const releaseWatcher = (input: {
+  readonly serverPid: number;
+  readonly leasePath: string;
+  readonly startToken: string;
+}): ReleaseWatcher => ({
+  command: "sh",
+  args: [
+    "-c",
+    [
+      '/usr/bin/caffeinate -w "$1"',
+      'grep -q "\\"pid\\":$1," "$2" && grep -q "\\"token\\":\\"$3\\"" "$2"' +
+        ` && ${SUDO} ${setSleepDisabledArgs(false).join(" ")} && rm -f "$2"`,
+    ].join("; "),
+    "_",
+    String(input.serverPid),
+    input.leasePath,
+    input.startToken,
+  ],
+});
+
+const LeaseContents = Schema.Struct({
+  pid: Schema.Number,
+  token: Schema.String,
+  home: Schema.String,
+});
+const decodeLease = Schema.decodeUnknownOption(Schema.fromJsonString(LeaseContents));
 
 export class LidSleepGuard extends Context.Service<
   LidSleepGuard,
@@ -53,20 +107,32 @@ const NEEDS_RULE_STDERR = /password is required|not allowed|may not run sudo|no 
 export const make = Effect.fn("LidSleepGuard.make")(function* <E>(input: {
   readonly platform: NodeJS.Platform;
   readonly mode: Stream.Stream<LidSleepGuardMode>;
-  /** True while agents are working, already including KeepAwake's release grace. */
+  /** True while the keep-awake setting is on and a run is active; the guard adds the release grace. */
   readonly demand: Stream.Stream<boolean, E>;
+  /** The "Keep awake while agents work" setting; Auto never blocks while it is off. */
+  readonly keepAwakeEnabled: Stream.Stream<boolean>;
+  /** Only a packaged production build may change `pmset`. */
+  readonly production: boolean;
   readonly leasePath: string;
+  readonly serverPid: number;
+  /** Identifies this server start, so a reused pid is never mistaken for it. */
+  readonly startToken: string;
+  readonly home: string;
+  readonly spawnWatcher: (
+    watcher: ReleaseWatcher,
+  ) => Effect.Effect<void, PlatformError.PlatformError>;
   readonly grace?: KeepAwake.Grace;
 }) {
   const fileSystem = yield* FileSystem.FileSystem;
-  const hasLease = fileSystem.exists(input.leasePath).pipe(Effect.orElseSucceed(() => false));
-  const initiallyOwned = input.platform === "darwin" && (yield* hasLease);
   const statusRef = yield* SubscriptionRef.make<LidSleepGuardStatus>({
-    blocking: initiallyOwned,
-    owned: initiallyOwned,
+    blocking: false,
+    owned: false,
+    ...(input.platform === "darwin" && !input.production
+      ? { inactive: "development-build" as const }
+      : {}),
   });
   const service = LidSleepGuard.of({ status: SubscriptionRef.changes(statusRef) });
-  if (input.platform !== "darwin") return service;
+  if (input.platform !== "darwin" || !input.production) return service;
 
   const runner = yield* ProcessRunner.ProcessRunner;
 
@@ -95,12 +161,26 @@ export const make = Effect.fn("LidSleepGuard.make")(function* <E>(input: {
     Effect.flatMap((now) =>
       fileSystem.writeFileString(
         input.leasePath,
-        JSON.stringify({ acquiredAt: DateTime.formatIso(now) }),
+        // The watcher greps for the pid and token in this order.
+        JSON.stringify({
+          pid: input.serverPid,
+          token: input.startToken,
+          home: input.home,
+          acquiredAt: DateTime.formatIso(now),
+        }),
       ),
     ),
     Effect.mapError(
       (cause) => new LidSleepGuardFailure({ reason: "failed", detail: cause.message }),
     ),
+  );
+  const hasLease = fileSystem.exists(input.leasePath).pipe(Effect.orElseSucceed(() => false));
+  /** True only when the lease names this server start. */
+  const ownsLease = fileSystem.readFileString(input.leasePath).pipe(
+    Effect.map((text) =>
+      Option.exists(decodeLease(text), (lease) => lease.token === input.startToken),
+    ),
+    Effect.orElseSucceed(() => false),
   );
   const removeLease = fileSystem
     .remove(input.leasePath, { force: true })
@@ -124,38 +204,54 @@ export const make = Effect.fn("LidSleepGuard.make")(function* <E>(input: {
   // Serialized because a mode switch can start one hold while another is releasing.
   const serialized = Semaphore.makeUnsafe(1).withPermits(1);
 
+  // The watcher is a backstop for a server that dies without releasing, and one per server
+  // lifetime covers every later acquire, because it checks the lease only when the server exits.
+  const watcherStarted = yield* Ref.make(false);
+  const ensureWatcher = Effect.gen(function* () {
+    if (yield* Ref.get(watcherStarted)) return;
+    yield* input
+      .spawnWatcher(
+        releaseWatcher({
+          serverPid: input.serverPid,
+          leasePath: input.leasePath,
+          startToken: input.startToken,
+        }),
+      )
+      .pipe(Effect.andThen(Ref.set(watcherStarted, true)));
+  }).pipe(
+    Effect.catchCause((cause) =>
+      Effect.logWarning("lid sleep guard could not start its release watcher", { cause }),
+    ),
+  );
+
   const acquire = serialized(
     Effect.gen(function* () {
-      const owned = yield* hasLease;
+      const owned = yield* ownsLease;
       const blocking = yield* readBlocking;
       if (blocking) {
-        // An existing block is adopted only when this server's lease says it set it.
-        return yield* publish({ blocking: true, owned });
+        // An existing block is adopted only when this server start's lease says it set it.
+        if (owned) yield* ensureWatcher;
+        yield* publish({ blocking: true, owned });
+        return;
       }
       yield* writeLease;
-      yield* setBlocking(true).pipe(
-        Effect.tapError(() =>
-          // Nothing applied means nothing to release later.
-          readBlocking.pipe(
-            Effect.flatMap((applied) => (applied ? Effect.void : removeLease)),
-            Effect.ignore,
-          ),
-        ),
-      );
+      // A failed set leaves no lease: losing a block is acceptable, a Mac stuck awake is not.
+      yield* setBlocking(true).pipe(Effect.tapError(() => Effect.ignore(removeLease)));
       if (!(yield* readBlocking)) {
         return yield* new LidSleepGuardFailure({
           reason: "failed",
           detail: "sleep stayed enabled after disablesleep 1",
         });
       }
+      yield* ensureWatcher;
       yield* publish({ blocking: true, owned: true });
     }).pipe(Effect.tapError(publishFailure)),
   );
 
-  // Never fails: it runs in finalizers, and a failure leaves the lease for a later retry.
-  const release = serialized(
+  // Fails when the block could not be cleared, and keeps the lease so a retry still owns it.
+  const releaseOnce = serialized(
     Effect.gen(function* () {
-      if (!(yield* hasLease)) {
+      if (!(yield* ownsLease)) {
         return yield* publish({ blocking: yield* readBlocking, owned: false });
       }
       yield* setBlocking(false);
@@ -167,45 +263,115 @@ export const make = Effect.fn("LidSleepGuard.make")(function* <E>(input: {
       }
       yield* removeLease;
       yield* publish({ blocking: false, owned: false });
-    }).pipe(Effect.tapError(publishFailure), Effect.ignore),
+    }).pipe(Effect.tapError(publishFailure)),
+  );
+  const releaseUntilDone = releaseOnce.pipe(Effect.retry(releaseBackoff), Effect.ignore);
+
+  // A release that failed in a finalizer keeps retrying here until it succeeds or a new acquire
+  // starts, because a finalizer must not wait for it.
+  const pendingRelease = yield* FiberHandle.make();
+  const release = releaseOnce.pipe(
+    Effect.catch(() => FiberHandle.run(pendingRelease, releaseUntilDone, { onlyIfMissing: true })),
+    Effect.asVoid,
   );
 
-  const hold = Effect.acquireRelease(acquire, () => release).pipe(
+  // While another tool holds the block, T3 holds nothing itself, so it re-reads the block and
+  // takes over when the other tool lets go.
+  const takeOverWhenReleased = Effect.gen(function* () {
+    if (yield* ownsLease) return;
+    if (yield* readBlocking) return;
+    yield* acquire;
+  }).pipe(
+    Effect.ignore,
+    Effect.schedule(Schedule.spaced(STATUS_RECHECK_INTERVAL)),
     Effect.andThen(Effect.never),
+  );
+
+  const hold = Effect.acquireRelease(
+    FiberHandle.clear(pendingRelease).pipe(Effect.andThen(acquire)),
+    () => release,
+  ).pipe(
+    Effect.andThen(takeOverWhenReleased),
     Effect.scoped,
     KeepAwake.retryWithBackoff("lid sleep guard could not acquire the sleep block"),
     Effect.ignore,
   );
 
-  // The first reading settles a lease left by a crash: no work now means releasing it, work now
-  // means the next acquire adopts it.
-  const demandWithStartupCleanup = input.demand.pipe(
-    Stream.zipWithIndex,
-    Stream.tap(([wanted, index]) => (index === 0 && !wanted ? release : Effect.void)),
-    Stream.map(([wanted]) => wanted),
-  );
+  // A lease at startup belongs to a server that is gone, because one server per home runs at a
+  // time. Clearing it is safe only while `disablesleep` is set; if another tool set it after a
+  // crash, this releases that block too, which only loses blocking.
+  const settleStaleLease = Effect.gen(function* () {
+    if (!(yield* hasLease)) {
+      const blocking = yield* readBlocking.pipe(Effect.orElseSucceed(() => false));
+      return yield* publish({ blocking, owned: false });
+    }
+    if (yield* readBlocking) yield* setBlocking(false);
+    yield* removeLease;
+    yield* publish({ blocking: false, owned: false });
+  }).pipe(serialized, Effect.tapError(publishFailure), Effect.retry(releaseBackoff), Effect.ignore);
 
   const holdFor = (mode: LidSleepGuardMode) => {
     switch (mode) {
       case "off":
-        return release;
+        return FiberHandle.run(pendingRelease, releaseUntilDone, { onlyIfMissing: true }).pipe(
+          Effect.asVoid,
+        );
       case "on":
         return hold;
       case "auto":
-        return KeepAwake.holdWhileWanted(demandWithStartupCleanup, hold, input.grace);
+        return KeepAwake.holdWhileWanted(input.demand, hold, input.grace);
     }
   };
 
+  const setInactive = (inactive: LidSleepGuardStatus["inactive"]) =>
+    SubscriptionRef.update(statusRef, ({ inactive: _previous, ...status }) =>
+      inactive === undefined ? status : { ...status, inactive },
+    );
+
   yield* forkParked(
-    input.mode.pipe(
-      Stream.changes,
-      Stream.switchMap((mode) => Stream.fromEffect(holdFor(mode))),
-      Stream.runDrain,
+    settleStaleLease.pipe(
+      Effect.andThen(
+        Stream.zipLatestWith(
+          input.mode,
+          input.keepAwakeEnabled,
+          (mode, keepAwake) => [mode, keepAwake] as const,
+        ).pipe(
+          Stream.tap(([mode, keepAwake]) =>
+            setInactive(mode === "auto" && !keepAwake ? "keep-awake-off" : undefined),
+          ),
+          Stream.map(([mode]) => mode),
+          Stream.changes,
+          Stream.switchMap((mode) => Stream.fromEffect(holdFor(mode))),
+          Stream.runDrain,
+        ),
+      ),
       Effect.catchCause((cause) => Effect.logWarning("lid sleep guard stopped", { cause })),
     ),
   );
   return service;
 });
+
+// Detached into its own process group with its stdio closed, and unreferenced so that closing
+// the scope does not kill it: it has to outlive the server.
+const spawnDetached = (
+  spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
+  watcher: ReleaseWatcher,
+) =>
+  spawner
+    .spawn(
+      ChildProcess.make(watcher.command, watcher.args, {
+        detached: true,
+        shell: false,
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+      }),
+    )
+    .pipe(
+      Effect.flatMap((child) => child.unref),
+      Effect.scoped,
+      Effect.asVoid,
+    );
 
 export const layer = Layer.effect(
   LidSleepGuard,
@@ -215,6 +381,10 @@ export const layer = Layer.effect(
     const path = yield* Path.Path;
     const settings = yield* Settings.ServerSettingsService;
     const demand = yield* KeepAwake.demand;
+    const keepAwakeEnabled = yield* KeepAwake.keepAwakeEnabled;
+    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const random = yield* SecureRandom.SecureRandom;
+    const startToken = yield* random.uuidV4();
     const mode = Stream.unwrap(
       Effect.gen(function* () {
         const changes = yield* settings.subscribeChanges;
@@ -230,9 +400,15 @@ export const layer = Layer.effect(
     );
     return yield* make({
       platform,
+      production: ServerConfig.telemetryChannel !== "dev",
       mode,
       demand,
+      keepAwakeEnabled,
       leasePath: path.join(config.stateDir, LEASE_FILE_NAME),
+      serverPid: process.pid,
+      startToken,
+      home: config.baseDir,
+      spawnWatcher: (watcher) => spawnDetached(spawner, watcher),
     });
   }),
 );

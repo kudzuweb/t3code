@@ -135,9 +135,26 @@ class KeepAwakeInhibitorExited extends Schema.TaggedError<KeepAwakeInhibitorExit
   }
 }
 
+/** The "Keep awake while agents work" setting, then every change to it. */
+export const keepAwakeEnabled = Effect.gen(function* () {
+  const settings = yield* Settings.ServerSettingsService;
+  return Stream.unwrap(
+    Effect.gen(function* () {
+      const changes = yield* settings.subscribeChanges;
+      const current = yield* settings.getSettings.pipe(
+        Effect.map((value) => value.keepAwakeWhileAgentsWork),
+        Effect.orElseSucceed(() => true),
+      );
+      return Stream.concat(
+        Stream.succeed(current),
+        Stream.map(changes, (value) => value.keepAwakeWhileAgentsWork),
+      );
+    }),
+  );
+});
+
 /** True while the setting is on and a run is active; KeepAwake and LidSleepGuard both hold on it. */
 export const demand = Effect.gen(function* () {
-  const settings = yield* Settings.ServerSettingsService;
   const events = yield* OrchestrationEventStore.OrchestrationEventStore;
   const sql = yield* SqlClient.SqlClient;
 
@@ -175,19 +192,7 @@ export const demand = Effect.gen(function* () {
     Stream.tapCause((cause) => Effect.logWarning("keep-awake run event stream failed", { cause })),
     Stream.retry(backoff),
   );
-  const enabled = Stream.unwrap(
-    Effect.gen(function* () {
-      const changes = yield* settings.subscribeChanges;
-      const current = yield* settings.getSettings.pipe(
-        Effect.map((value) => value.keepAwakeWhileAgentsWork),
-        Effect.orElseSucceed(() => true),
-      );
-      return Stream.concat(
-        Stream.succeed(current),
-        Stream.map(changes, (value) => value.keepAwakeWhileAgentsWork),
-      );
-    }),
-  );
+  const enabled = yield* keepAwakeEnabled;
 
   return Stream.zipLatestWith(enabled, active, (on, busy) => on && busy);
 });
