@@ -37,7 +37,7 @@ This is Mauria's fork of `pingdotgg/t3code`. It adds a way to resume Claude Code
 | -------------------------- | ----------------------------------------------------------------------------------------------------------- |
 | Lint, format and typecheck | `vp run typecheck` for every package, `vp run knip:check`, `vp run i18n:check` and `vp check`.              |
 | Test packages and desktop  | The tests of every workspace package except the server and web app, including contracts and client-runtime. |
-| Test web                   | The web unit and browser tests in headless Chromium, in two shards.                                         |
+| Test web                   | The web unit and browser tests in headless Chromium, in three shards.                                       |
 | Test server                | The server tests through `vp run test:cached`, in four shards.                                              |
 
 It leaves out upstream's desktop build and launch check, the GraphQL generation checks, the mobile checks, and anything needing secrets or signing. Upstream's workflows use Blacksmith runners the fork does not have, so they are disabled in the fork's Actions settings.
