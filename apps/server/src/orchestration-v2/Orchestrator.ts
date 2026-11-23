@@ -5825,11 +5825,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
     ) {
       const projection = yield* projectionStore
-        .getThreadRecords(
-          command.threadId,
-          ["providerSessions", "providerThreads", "runs", "runtimeRequests", "turnItems"],
-          { turnItemTypes: ["command_execution", "dynamic_tool", "subagent"] },
-        )
+        .getThreadRecords(command.threadId, ["providerSessions"])
         .pipe(
           Effect.mapError(
             (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
@@ -5846,21 +5842,32 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         });
       }
       if (command.onlyIfIdle === true) {
+        const work = yield* projectionStore
+          .getThreadRecords(
+            command.threadId,
+            ["providerThreads", "runs", "runtimeRequests", "turnItems"],
+            { turnItemTypes: ["command_execution", "dynamic_tool", "subagent"] },
+          )
+          .pipe(
+            Effect.mapError(
+              (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+            ),
+          );
         const rejectBusy = (reason: string) =>
           new OrchestratorDispatchError({
             commandId: command.commandId,
             commandType: command.type,
             cause: reason,
           });
-        if (threadHasUnfinishedWork(projection)) {
+        if (threadHasUnfinishedWork(work)) {
           return yield* rejectBusy("Wait for the current turn to finish.");
         }
         const pendingBackgroundTasks = derivePendingBackgroundWork({
-          latestRun: projection.runs.findLast((run) => run.status !== "queued"),
-          providerThreads: projection.providerThreads,
-          turnItems: projection.turnItems,
-          activeProviderThreadId: projection.thread.activeProviderThreadId,
-          runs: projection.runs,
+          latestRun: work.runs.findLast((run) => run.status !== "queued"),
+          providerThreads: work.providerThreads,
+          turnItems: work.turnItems,
+          activeProviderThreadId: work.thread.activeProviderThreadId,
+          runs: work.runs,
         });
         if (pendingBackgroundTasks.length > 0) {
           return yield* rejectBusy("Wait for the background tasks to finish.");

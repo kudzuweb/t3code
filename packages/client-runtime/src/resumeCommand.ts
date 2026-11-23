@@ -78,6 +78,33 @@ export function buildResumeCommand(input: {
   return `cd ${shellQuote(input.directory)} && ${homePrefix}${resume.command} ${shellQuote(input.nativeId)}`;
 }
 
+/**
+ * Runs a release for a key unless one is already in flight for it, so repeated clicks do not
+ * dispatch repeated detaches. Resolves to undefined when skipped.
+ */
+export function createReleaseGuard() {
+  const inFlight = new Set<string>();
+  return async <T>(key: string, release: () => Promise<T>): Promise<T | undefined> => {
+    if (inFlight.has(key)) return undefined;
+    inFlight.add(key);
+    try {
+      return await release();
+    } finally {
+      inFlight.delete(key);
+    }
+  };
+}
+
+/** What a release attempt did: `detached` counts the detaches dispatched, `failure` is a refusal. */
+export type ResumeReleaseAttempt = { readonly detached: number } | { readonly failure: unknown };
+
+export function classifyResumeRelease(
+  attempt: ResumeReleaseAttempt,
+): "released" | "nothing" | "refused" {
+  if ("failure" in attempt) return "refused";
+  return attempt.detached > 0 ? "released" : "nothing";
+}
+
 export interface ThreadResume {
   readonly command: string;
   /** T3 holds the session and should be told to let go before the command is used. */

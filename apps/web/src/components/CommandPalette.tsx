@@ -1533,13 +1533,19 @@ function OpenCommandPaletteDialog(props: {
       description: gt("Continue this thread's session in a terminal"),
       icon: <TerminalIcon className={ITEM_ICON_CLASS} />,
       run: () =>
-        copyResumeCommand(activeThreadResume, async () => {
-          const stopped = await stopThreadSession({
-            environmentId: resumeThread.environmentId,
-            input: { threadId: resumeThread.id, onlyIfIdle: true },
-          });
-          return stopped._tag === "Failure" ? squashAtomCommandFailure(stopped) : null;
-        }),
+        copyResumeCommand(
+          activeThreadResume,
+          `${resumeThread.environmentId}:${resumeThread.id}`,
+          async () => {
+            const stopped = await stopThreadSession({
+              environmentId: resumeThread.environmentId,
+              input: { threadId: resumeThread.id, onlyIfIdle: true },
+            });
+            return stopped._tag === "Failure"
+              ? { failure: squashAtomCommandFailure(stopped) }
+              : { detached: stopped.value.detached };
+          },
+        ),
     });
   }
 

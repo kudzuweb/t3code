@@ -1106,9 +1106,9 @@ export const stopThreadSession = Effect.fn("EnvironmentCommands.stopThreadSessio
 ) {
   const projection = yield* getProjection(input.threadId);
   const commandId = yield* allocateCommandId(input);
-  let result = { sequence: 0 };
+  let result = { sequence: 0, detached: 0 };
   for (const session of projection.providerSessions) {
-    result = yield* dispatch({
+    const dispatched = yield* dispatch({
       type: "provider-session.detach",
       commandId: CommandId.make(`${commandId}:detach:${session.id}`),
       threadId: input.threadId,
@@ -1116,6 +1116,7 @@ export const stopThreadSession = Effect.fn("EnvironmentCommands.stopThreadSessio
       reason: "client-requested",
       ...(input.onlyIfIdle === undefined ? {} : { onlyIfIdle: input.onlyIfIdle }),
     });
+    result = { sequence: dispatched.sequence, detached: result.detached + 1 };
   }
   return result;
 });

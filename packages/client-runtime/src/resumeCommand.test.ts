@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { buildResumeCommand, resolveThreadResume } from "./resumeCommand.ts";
+import {
+  buildResumeCommand,
+  classifyResumeRelease,
+  createReleaseGuard,
+  resolveThreadResume,
+} from "./resumeCommand.ts";
 
 describe("buildResumeCommand", () => {
   it.each([
@@ -128,5 +133,41 @@ describe("resolveThreadResume", () => {
     expect(resolveWithSessions("pt-3", liveSession)?.releaseFirst).toBe(true);
     expect(resolveWithSessions("pt-3", [])?.releaseFirst).toBe(false);
     expect(resolveWithSessions("pt-1", liveSession)?.releaseFirst).toBe(false);
+  });
+});
+
+describe("createReleaseGuard", () => {
+  it("skips a release for a thread while one is in flight, and allows the next after it settles", async () => {
+    const guard = createReleaseGuard();
+    let finish: () => void = () => {};
+    const first = guard(
+      "env:thread-1",
+      () => new Promise<string>((resolve) => (finish = () => resolve("first"))),
+    );
+    const duplicate = await guard("env:thread-1", async () => "duplicate");
+    const otherThread = await guard("env:thread-2", async () => "other");
+    expect(duplicate).toBeUndefined();
+    expect(otherThread).toBe("other");
+    finish();
+    expect(await first).toBe("first");
+    expect(await guard("env:thread-1", async () => "again")).toBe("again");
+  });
+
+  it("frees the thread when a release throws", async () => {
+    const guard = createReleaseGuard();
+    await expect(
+      guard("env:thread-1", async () => {
+        throw new Error("boom");
+      }),
+    ).rejects.toThrow("boom");
+    expect(await guard("env:thread-1", async () => "retry")).toBe("retry");
+  });
+});
+
+describe("classifyResumeRelease", () => {
+  it("reports a release only when a detach was dispatched", () => {
+    expect(classifyResumeRelease({ detached: 1 })).toBe("released");
+    expect(classifyResumeRelease({ detached: 0 })).toBe("nothing");
+    expect(classifyResumeRelease({ failure: new Error("busy") })).toBe("refused");
   });
 });

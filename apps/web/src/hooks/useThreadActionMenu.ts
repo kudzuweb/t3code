@@ -326,13 +326,19 @@ export function useThreadActionMenu(input: {
           return;
         case "copy-resume-command":
           if (resume !== null) {
-            void copyResumeCommand(resume, async () => {
-              const stopped = await stopThreadSession({
-                environmentId: threadRef.environmentId,
-                input: { threadId: threadRef.threadId, onlyIfIdle: true },
-              });
-              return stopped._tag === "Failure" ? squashAtomCommandFailure(stopped) : null;
-            });
+            void copyResumeCommand(
+              resume,
+              `${threadRef.environmentId}:${threadRef.threadId}`,
+              async () => {
+                const stopped = await stopThreadSession({
+                  environmentId: threadRef.environmentId,
+                  input: { threadId: threadRef.threadId, onlyIfIdle: true },
+                });
+                return stopped._tag === "Failure"
+                  ? { failure: squashAtomCommandFailure(stopped) }
+                  : { detached: stopped.value.detached };
+              },
+            );
           }
           return;
         case "archive": {

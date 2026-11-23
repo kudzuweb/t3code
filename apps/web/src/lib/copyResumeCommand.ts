@@ -1,5 +1,10 @@
 import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
-import type { ThreadResume } from "@t3tools/client-runtime/resume-command";
+import {
+  classifyResumeRelease,
+  createReleaseGuard,
+  type ResumeReleaseAttempt,
+  type ThreadResume,
+} from "@t3tools/client-runtime/resume-command";
 import { msg } from "gt-react";
 
 import { stackedThreadToast, toastManager } from "../components/ui/toast";
@@ -27,18 +32,24 @@ async function copyCommandToClipboard(command: string): Promise<boolean> {
   }
 }
 
+const guardRelease = createReleaseGuard();
+
 /**
  * Copies the thread's resume command at once. When T3 holds the session, it then asks the server
- * to let go and says whether that worked. `releaseHold` resolves to the failure, or null on success.
+ * to let go, once at a time per thread, and says so only if it released something or was refused.
  */
 export async function copyResumeCommand(
   resume: ThreadResume,
-  releaseHold: () => Promise<unknown>,
+  threadKey: string,
+  releaseHold: () => Promise<ResumeReleaseAttempt>,
 ): Promise<void> {
   const copied = await copyCommandToClipboard(resume.command);
   if (!copied || !resume.releaseFirst) return;
-  const failure = await releaseHold();
-  if (failure === null) {
+  const attempt = await guardRelease(threadKey, releaseHold);
+  if (attempt === undefined) return;
+  const outcome = classifyResumeRelease(attempt);
+  if (outcome === "nothing") return;
+  if (outcome === "released") {
     toastManager.add({
       type: "success",
       title: m(msg("T3 let go of this thread")),
@@ -53,7 +64,8 @@ export async function copyResumeCommand(
       type: "warning",
       title: m(msg("T3 still holds this thread")),
       description:
-        thrownErrorMessage(failure, m) ?? m(msg("The command is copied, but Codex may refuse it.")),
+        ("failure" in attempt ? thrownErrorMessage(attempt.failure, m) : null) ??
+        m(msg("The command is copied, but Codex may refuse it.")),
     }),
   );
 }
