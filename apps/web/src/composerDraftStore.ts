@@ -1857,6 +1857,44 @@ function draftThreadsEqual(left: DraftThreadState | undefined, right: DraftThrea
   );
 }
 
+/**
+ * Resuming a session can promote a draft into a thread that already has unsent content, which
+ * stays; the draft's content is added after it. A destination with nothing takes the draft as is.
+ */
+function mergeComposerDraftIntoDestination(
+  destination: ComposerThreadDraftState | undefined,
+  draft: ComposerThreadDraftState,
+): ComposerThreadDraftState {
+  if (!destination) {
+    return draft;
+  }
+  const takesDraftModel =
+    destination.activeProvider === null && draft.modelSelectionExplicit === true;
+  return {
+    ...destination,
+    prompt: [destination.prompt, draft.prompt].filter((text) => text !== "").join("\n"),
+    images: [...destination.images, ...draft.images],
+    files: [...destination.files, ...draft.files],
+    nonPersistedImageIds: [...destination.nonPersistedImageIds, ...draft.nonPersistedImageIds],
+    persistedAttachments: [...destination.persistedAttachments, ...draft.persistedAttachments],
+    terminalContexts: [...destination.terminalContexts, ...draft.terminalContexts],
+    previewAnnotations: [...destination.previewAnnotations, ...draft.previewAnnotations],
+    reviewComments: [...destination.reviewComments, ...draft.reviewComments],
+    threadContexts: [...destination.threadContexts, ...draft.threadContexts],
+    environmentContexts: [...destination.environmentContexts, ...draft.environmentContexts],
+    replyTo: destination.replyTo ?? draft.replyTo,
+    runtimeMode: destination.runtimeMode ?? draft.runtimeMode,
+    interactionMode: destination.interactionMode ?? draft.interactionMode,
+    ...(takesDraftModel
+      ? {
+          modelSelectionByProvider: draft.modelSelectionByProvider,
+          activeProvider: draft.activeProvider,
+          modelSelectionExplicit: true,
+        }
+      : {}),
+  };
+}
+
 function removeDraftThreadReferences(
   state: Pick<
     ComposerDraftStoreState,
@@ -1881,7 +1919,11 @@ function removeDraftThreadReferences(
     state.draftThreadsByThreadKey;
   const { [threadKey]: removedComposerDraft, ...restDraftsByThreadKey } = state.draftsByThreadKey;
   if (composerDestination && removedComposerDraft) {
-    restDraftsByThreadKey[composerTargetKey(composerDestination)] = removedComposerDraft;
+    const destinationKey = composerTargetKey(composerDestination);
+    restDraftsByThreadKey[destinationKey] = mergeComposerDraftIntoDestination(
+      restDraftsByThreadKey[destinationKey],
+      removedComposerDraft,
+    );
   } else {
     revokeDraftThreadPreviewUrls(removedComposerDraft);
   }

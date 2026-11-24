@@ -1,15 +1,17 @@
 import type { ScopedProjectRef } from "@t3tools/contracts";
 import { Atom } from "effect/reactivity";
 
+import type { DraftId } from "~/composerDraftStore";
 import { appAtomRegistry } from "~/rpc/atomRegistry";
 
 /**
- * Whether the Resume session dialog is open, and for which project. A request without a project
- * uses the project on screen. The palette, the sidebar menu and the keybinding all close before
- * the dialog shows, so the app renders it once.
+ * Whether the Resume session dialog is open, for which project, and for which new-thread draft.
+ * With a draft, picking a session turns that draft into the session's thread. A request without a
+ * project uses the project on screen.
  */
 export interface ResumeSessionRequest {
   readonly projectRef: ScopedProjectRef | null;
+  readonly draftId: DraftId | null;
 }
 
 export const resumeSessionRequestAtom = Atom.make<ResumeSessionRequest | null>(null).pipe(
@@ -17,6 +19,6 @@ export const resumeSessionRequestAtom = Atom.make<ResumeSessionRequest | null>(n
   Atom.withLabel("resume-session:dialog-request"),
 );
 
-export function openResumeSessionDialog(projectRef: ScopedProjectRef | null = null): void {
-  appAtomRegistry.set(resumeSessionRequestAtom, { projectRef });
+export function openResumeSessionDialog(request: Partial<ResumeSessionRequest> = {}): void {
+  appAtomRegistry.set(resumeSessionRequestAtom, { projectRef: null, draftId: null, ...request });
 }

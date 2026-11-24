@@ -12,15 +12,28 @@ type SlashSearchItem = Extract<
   { type: "slash-command" | "provider-slash-command" | "skill" }
 >;
 
-/** Provider commands, `/side`, `/btw` and `/clear` work only at the message start. */
-export function slashCommandItemsForPromptPosition(
+/**
+ * Provider commands, `/side`, `/btw`, `/clear` and `/resume` work only at the message start, and
+ * `/resume` only in a new thread, where it replaces a provider command of the same name.
+ */
+export function slashCommandItemsForContext(
   items: ReadonlyArray<SlashSearchItem>,
-  isAtPromptStart: boolean,
+  context: { readonly isAtPromptStart: boolean; readonly isDraftRoute: boolean },
 ): SlashSearchItem[] {
-  if (isAtPromptStart) {
-    return [...items];
+  const isBuiltInResume = (item: SlashSearchItem) =>
+    item.type === "slash-command" && item.command === "resume";
+  const offered = items.filter(
+    (item) => !isBuiltInResume(item) || (context.isAtPromptStart && context.isDraftRoute),
+  );
+  const withoutShadowedProviderCommand = offered.some(isBuiltInResume)
+    ? offered.filter(
+        (item) => item.type !== "provider-slash-command" || item.command.name !== "resume",
+      )
+    : offered;
+  if (context.isAtPromptStart) {
+    return withoutShadowedProviderCommand;
   }
-  return items.filter(
+  return withoutShadowedProviderCommand.filter(
     (item) =>
       item.type === "skill" ||
       (item.type === "slash-command" &&

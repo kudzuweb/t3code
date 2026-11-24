@@ -1,8 +1,13 @@
 import { msg } from "gt-react";
 import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
 import { m } from "~/i18n/messages";
-import { isClearComposerCommand, parseSideChatCommand } from "@t3tools/shared/composerTrigger";
+import {
+  isClearComposerCommand,
+  parseResumeComposerCommand,
+  parseSideChatCommand,
+} from "@t3tools/shared/composerTrigger";
 import { readWorktreeBaseBranch } from "../../worktreeRepositoryChoiceStore";
+import { openResumeSessionDialog } from "../resumeSession/resumeSessionDialogState";
 import { armFreshSession, disarmFreshSession, readFreshSessionArm } from "./freshSessionArms";
 import {
   mergeDirectPreviewAnnotation,
@@ -953,6 +958,19 @@ export function useComposerSend(input: ComposerSendInput) {
         promptRef.current = "";
         composerRef.current?.resetCursorState();
       }
+      return;
+    }
+    const resumeCommand = parseResumeComposerCommand(trimmed);
+    if (resumeCommand && draftId !== null && activeProject && composerHoldsOnlyText) {
+      setComposerDraftPrompt(composerDraftTarget, resumeCommand.rest);
+      if (currentRouteThreadKeyRef.current === routeThreadKey) {
+        promptRef.current = resumeCommand.rest;
+        composerRef.current?.resetCursorState();
+      }
+      openResumeSessionDialog({
+        projectRef: scopeProjectRef(activeProject.environmentId, activeProject.id),
+        draftId,
+      });
       return;
     }
     // Read once: an arm made while this send is in flight belongs to the next message.

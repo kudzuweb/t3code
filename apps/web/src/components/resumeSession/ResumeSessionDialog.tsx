@@ -1,5 +1,5 @@
 import { useAtomValue } from "@effect/atom-react";
-import { scopeProjectRef, scopeThreadRef } from "@t3tools/client-runtime/environment";
+import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import {
   buildResumeSessionRows,
   filterResumeSessionRows,
@@ -16,7 +16,9 @@ import { T, useGT, useMessages } from "gt-react";
 import { GitBranchIcon } from "lucide-react";
 import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 
+import { type DraftId, useComposerDraftStore } from "~/composerDraftStore";
 import { useHandleNewThread } from "~/hooks/useHandleNewThread";
+import { resolveThreadActionProjectRef } from "~/lib/chatThreadActions";
 import { cn } from "~/lib/utils";
 import { appAtomRegistry } from "~/rpc/atomRegistry";
 import { agentSessionImportOne, agentSessionList } from "~/state/agentSessions";
@@ -30,6 +32,7 @@ import { Button } from "../ui/button";
 import { CommandDialog, CommandDialogPopup } from "../ui/command";
 import { ScrollArea } from "../ui/scroll-area";
 import { Spinner } from "../ui/spinner";
+import { toastManager } from "../ui/toast";
 import { resumeSessionRequestAtom } from "./resumeSessionDialogState";
 
 const closeDialog = () => appAtomRegistry.set(resumeSessionRequestAtom, null);
@@ -55,18 +58,26 @@ export function ResumeSessionDialogHost() {
         data-testid="resume-session-dialog"
         onBackdropPointerDown={closeDialog}
       >
-        <ResumeSessionDialog requestedProjectRef={request.projectRef} />
+        <ResumeSessionDialog requestedProjectRef={request.projectRef} draftId={request.draftId} />
       </CommandDialogPopup>
     </CommandDialog>
   );
 }
 
-function ResumeSessionDialog(props: { readonly requestedProjectRef: ScopedProjectRef | null }) {
-  const { activeThread, activeDraftThread } = useHandleNewThread();
-  const onScreen = activeThread ?? activeDraftThread;
+function ResumeSessionDialog(props: {
+  readonly requestedProjectRef: ScopedProjectRef | null;
+  readonly draftId: DraftId | null;
+}) {
+  const { activeDraftThread, activeThread, defaultProjectRef, handleNewThread } =
+    useHandleNewThread();
   const projectRef =
     props.requestedProjectRef ??
-    (onScreen ? scopeProjectRef(onScreen.environmentId, onScreen.projectId) : null);
+    resolveThreadActionProjectRef({
+      activeDraftThread,
+      activeThread: activeThread ?? undefined,
+      defaultProjectRef,
+      handleNewThread,
+    });
   const gt = useGT();
   if (projectRef === null) {
     return (
@@ -75,10 +86,13 @@ function ResumeSessionDialog(props: { readonly requestedProjectRef: ScopedProjec
       </ResumeSessionFrame>
     );
   }
-  return <ProjectSessions projectRef={projectRef} />;
+  return <ProjectSessions projectRef={projectRef} draftId={props.draftId} />;
 }
 
-function ProjectSessions(props: { readonly projectRef: ScopedProjectRef }) {
+function ProjectSessions(props: {
+  readonly projectRef: ScopedProjectRef;
+  readonly draftId: DraftId | null;
+}) {
   const { environmentId, projectId } = props.projectRef;
   const gt = useGT();
   const messages = useMessages();
@@ -116,12 +130,26 @@ function ProjectSessions(props: { readonly projectRef: ScopedProjectRef }) {
     return () => window.removeEventListener("focus", sessions.refresh);
   }, [sessions.refresh]);
 
-  const openThread = (threadId: ThreadId) => {
+  const openThread = (threadId: ThreadId, imported: boolean) => {
     closeDialog();
-    void navigate({
-      to: "/$environmentId/$threadId",
-      params: buildThreadRouteParams(scopeThreadRef(environmentId, threadId)),
-    });
+    const threadRef = scopeThreadRef(environmentId, threadId);
+    const draftStore = useComposerDraftStore.getState();
+    const draft = props.draftId === null ? null : draftStore.getDraftSession(props.draftId);
+    // A draft that is gone, or already promoting because its first message was sent, is not ours to take.
+    const promotableDraftId = draft && !draft.promotedTo ? props.draftId : null;
+    if (promotableDraftId !== null) {
+      // The draft route follows the redirect that finalizing records, and the draft's text moves.
+      draftStore.markDraftThreadPromoting(promotableDraftId, threadRef);
+      draftStore.finalizePromotedDraftThread(promotableDraftId);
+    } else {
+      void navigate({ to: "/$environmentId/$threadId", params: buildThreadRouteParams(threadRef) });
+    }
+    if (!imported && promotableDraftId !== null) {
+      toastManager.add({
+        type: "info",
+        title: gt("Opened the existing conversation for this session."),
+      });
+    }
   };
 
   const choose = async (row: ResumeSessionRow) => {
@@ -144,7 +172,7 @@ function ProjectSessions(props: { readonly projectRef: ScopedProjectRef }) {
     if (appAtomRegistry.get(resumeSessionRequestAtom) !== openedFor) return;
     if (result._tag === "Success") {
       sessions.refresh();
-      openThread(result.value.threadId);
+      openThread(result.value.threadId, result.value.imported);
       return;
     }
     if (isAtomCommandInterrupted(result)) return;

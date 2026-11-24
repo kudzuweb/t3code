@@ -1,3 +1,4 @@
+import { scopeProjectRef } from "@t3tools/client-runtime/environment";
 import type { AnyRouter } from "@tanstack/react-router";
 import { msg } from "gt-react";
 
@@ -6,6 +7,7 @@ import {
   isCommandPaletteMounted,
   useCommandPaletteStore,
 } from "../commandPaletteStore";
+import { useComposerDraftStore } from "../composerDraftStore";
 import { overlayModeForCommand } from "../components/CommandPalette.logic";
 import { APPEARANCE_OPTIONS, notifyThemeSaveFailure } from "../components/CommandPaletteThemeItems";
 import { openResumeSessionDialog } from "../components/resumeSession/resumeSessionDialogState";
@@ -107,7 +109,19 @@ export function installCommandPaletteCommands(
         consume(event);
         if (event.repeat) return;
         dispatchCommandPalette({ _tag: "SetOpen", open: false });
-        openResumeSessionDialog();
+        const target = resolveThreadRouteTarget(router.state.matches.at(-1)?.params ?? {});
+        const draft =
+          target?.kind === "draft"
+            ? useComposerDraftStore.getState().getDraftSession(target.draftId)
+            : null;
+        openResumeSessionDialog(
+          target?.kind === "draft" && draft
+            ? {
+                projectRef: scopeProjectRef(draft.environmentId, draft.projectId),
+                draftId: target.draftId,
+              }
+            : {},
+        );
       },
     },
     {

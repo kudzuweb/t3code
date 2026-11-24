@@ -150,6 +150,12 @@ export function isClearComposerCommand(text: string): boolean {
   return /^\/clear\s*$/i.test(text.trim());
 }
 
+/** `/resume`, with any text after it, at the start of the message. */
+export function parseResumeComposerCommand(text: string): { rest: string } | null {
+  const match = /^\/resume(?:\s+([\s\S]*))?$/i.exec(text.trim());
+  return match ? { rest: match[1]?.trim() ?? "" } : null;
+}
+
 /** `/side [prompt]`, or its alias `/btw [prompt]`, as the whole message. */
 export function parseSideChatCommand(text: string): { prompt: string } | null {
   const match = /^\/(?:side|btw)(?:\s+([\s\S]*))?$/i.exec(text.trim());

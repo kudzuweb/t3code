@@ -1180,6 +1180,50 @@ describe("composerDraftStore project draft thread mapping", () => {
     expect(draftFor(threadId, TEST_ENVIRONMENT_ID)?.prompt).toBe("promote me");
   });
 
+  it("appends a promoted draft's text to the unsent text of a thread it is promoted into", () => {
+    const store = useComposerDraftStore.getState();
+    const destination = scopeThreadRef(TEST_ENVIRONMENT_ID, threadId);
+    store.setProjectDraftThreadId(projectRef, draftId, { threadId: ThreadId.make("draft-thread") });
+    store.setPrompt(draftId, "from the new thread");
+    store.addImages(draftId, [makeImage({ id: "from-draft", previewUrl: "blob:from-draft" })]);
+    store.setPrompt(destination, "already here");
+    store.addImages(destination, [makeImage({ id: "queued", previewUrl: "blob:queued" })]);
+    store.addTerminalContexts(destination, [makeTerminalContext({ id: "queued-terminal" })]);
+
+    store.markDraftThreadPromoting(draftId, destination);
+    store.finalizePromotedDraftThread(draftId);
+
+    expect(draftByKey(draftId)).toBeUndefined();
+    const promoted = draftFor(threadId, TEST_ENVIRONMENT_ID);
+    expect(promoted?.prompt.startsWith("already here")).toBe(true);
+    expect(promoted?.prompt.endsWith("\nfrom the new thread")).toBe(true);
+    expect(promoted?.images.map((image) => image.id)).toEqual(["queued", "from-draft"]);
+    expect(promoted?.terminalContexts.map((context) => context.id)).toEqual(["queued-terminal"]);
+  });
+
+  it("keeps the text that is there when a promoted draft has none, and takes the draft's when it has none", () => {
+    const store = useComposerDraftStore.getState();
+    const destination = scopeThreadRef(TEST_ENVIRONMENT_ID, threadId);
+    store.setProjectDraftThreadId(projectRef, draftId, { threadId: ThreadId.make("draft-thread") });
+    store.setPrompt(destination, "already here");
+    store.markDraftThreadPromoting(draftId, destination);
+    store.finalizePromotedDraftThread(draftId);
+    expect(draftFor(threadId, TEST_ENVIRONMENT_ID)?.prompt).toBe("already here");
+
+    const otherDraftId = DraftId.make("other-draft");
+    const otherThreadId = ThreadId.make("other-destination");
+    store.setProjectDraftThreadId(projectRef, otherDraftId, {
+      threadId: ThreadId.make("other-draft-thread"),
+    });
+    store.setPrompt(otherDraftId, "only the draft has text");
+    store.markDraftThreadPromoting(
+      otherDraftId,
+      scopeThreadRef(TEST_ENVIRONMENT_ID, otherThreadId),
+    );
+    store.finalizePromotedDraftThread(otherDraftId);
+    expect(draftFor(otherThreadId, TEST_ENVIRONMENT_ID)?.prompt).toBe("only the draft has text");
+  });
+
   it("preserves existing branch and worktree when setProjectDraftThreadId receives undefined", () => {
     const store = useComposerDraftStore.getState();
     store.setProjectDraftThreadId(projectRef, draftId, {

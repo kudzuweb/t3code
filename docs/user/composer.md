@@ -321,6 +321,14 @@ earlier messages, and the thread marks where it began with **New session**.
 Earlier messages and diffs stay in the thread. Dismiss the notice above the
 composer to keep the current session instead.
 
+In a new thread, send `/resume` at the start of a message, or pick it from the slash
+menu, to continue a Claude Code, Codex or Pi session from the project's folder, the way
+`claude --resume` does in a terminal. Search the list, then choose a session. The new thread
+becomes that session's thread and shows its history, and the text you had typed stays in the
+composer. A session that already has a thread opens that thread instead, with a notice, and your
+typed text is added after the text already in its composer. The terminal sees the turns you take
+in T3 Code afterwards. `/resume` is not offered in a thread that has already started.
+
 On web and desktop, turn on **Context window** in **Settings → Appearance →
 Thread details** to see context usage in the thread details card. It appears
 once the provider reports usage.
