@@ -4,6 +4,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   detectComposerTrigger,
+  parseResumeComposerCommand,
   parseSideChatCommand,
   serializeComposerFileLink,
 } from "./composerTrigger.ts";
@@ -178,5 +179,19 @@ describe("parseSideChatCommand", () => {
     expect(parseSideChatCommand("/sidebar")).toBeNull();
     expect(parseSideChatCommand("/btwx")).toBeNull();
     expect(parseSideChatCommand("ask /side later")).toBeNull();
+  });
+});
+
+describe("parseResumeComposerCommand", () => {
+  it("reads the text that follows /resume at the start of the message", () => {
+    expect(parseResumeComposerCommand("/resume")).toEqual({ rest: "" });
+    expect(parseResumeComposerCommand("  /RESUME  keep this\nline two ")).toEqual({
+      rest: "keep this\nline two",
+    });
+  });
+
+  it("ignores other commands and /resume elsewhere in the message", () => {
+    expect(parseResumeComposerCommand("/resumes")).toBeNull();
+    expect(parseResumeComposerCommand("please /resume")).toBeNull();
   });
 });

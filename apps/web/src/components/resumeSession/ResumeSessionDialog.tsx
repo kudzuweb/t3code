@@ -133,15 +133,18 @@ function ProjectSessions(props: {
   const openThread = (threadId: ThreadId, imported: boolean) => {
     closeDialog();
     const threadRef = scopeThreadRef(environmentId, threadId);
-    if (props.draftId !== null) {
+    const draftStore = useComposerDraftStore.getState();
+    const draft = props.draftId === null ? null : draftStore.getDraftSession(props.draftId);
+    // A draft that is gone, or already promoting because its first message was sent, is not ours to take.
+    const promotableDraftId = draft && !draft.promotedTo ? props.draftId : null;
+    if (promotableDraftId !== null) {
       // The draft route follows the redirect that finalizing records, and the draft's text moves.
-      const draftStore = useComposerDraftStore.getState();
-      draftStore.markDraftThreadPromoting(props.draftId, threadRef);
-      draftStore.finalizePromotedDraftThread(props.draftId);
+      draftStore.markDraftThreadPromoting(promotableDraftId, threadRef);
+      draftStore.finalizePromotedDraftThread(promotableDraftId);
     } else {
       void navigate({ to: "/$environmentId/$threadId", params: buildThreadRouteParams(threadRef) });
     }
-    if (!imported && props.draftId !== null) {
+    if (!imported && promotableDraftId !== null) {
       toastManager.add({
         type: "info",
         title: gt("Opened the existing conversation for this session."),
