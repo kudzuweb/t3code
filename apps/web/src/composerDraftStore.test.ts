@@ -1180,6 +1180,45 @@ describe("composerDraftStore project draft thread mapping", () => {
     expect(draftFor(threadId, TEST_ENVIRONMENT_ID)?.prompt).toBe("promote me");
   });
 
+  it("appends a promoted draft's text to the unsent text of a thread it is promoted into", () => {
+    const store = useComposerDraftStore.getState();
+    const destination = scopeThreadRef(TEST_ENVIRONMENT_ID, threadId);
+    store.setProjectDraftThreadId(projectRef, draftId, { threadId: ThreadId.make("draft-thread") });
+    store.setPrompt(draftId, "from the new thread");
+    store.setPrompt(destination, "already here");
+
+    store.markDraftThreadPromoting(draftId, destination);
+    store.finalizePromotedDraftThread(draftId);
+
+    expect(draftByKey(draftId)).toBeUndefined();
+    expect(draftFor(threadId, TEST_ENVIRONMENT_ID)?.prompt).toBe(
+      "already here\nfrom the new thread",
+    );
+  });
+
+  it("keeps the text that is there when a promoted draft has none, and takes the draft's when it has none", () => {
+    const store = useComposerDraftStore.getState();
+    const destination = scopeThreadRef(TEST_ENVIRONMENT_ID, threadId);
+    store.setProjectDraftThreadId(projectRef, draftId, { threadId: ThreadId.make("draft-thread") });
+    store.setPrompt(destination, "already here");
+    store.markDraftThreadPromoting(draftId, destination);
+    store.finalizePromotedDraftThread(draftId);
+    expect(draftFor(threadId, TEST_ENVIRONMENT_ID)?.prompt).toBe("already here");
+
+    const otherDraftId = DraftId.make("other-draft");
+    const otherThreadId = ThreadId.make("other-destination");
+    store.setProjectDraftThreadId(projectRef, otherDraftId, {
+      threadId: ThreadId.make("other-draft-thread"),
+    });
+    store.setPrompt(otherDraftId, "only the draft has text");
+    store.markDraftThreadPromoting(
+      otherDraftId,
+      scopeThreadRef(TEST_ENVIRONMENT_ID, otherThreadId),
+    );
+    store.finalizePromotedDraftThread(otherDraftId);
+    expect(draftFor(otherThreadId, TEST_ENVIRONMENT_ID)?.prompt).toBe("only the draft has text");
+  });
+
   it("preserves existing branch and worktree when setProjectDraftThreadId receives undefined", () => {
     const store = useComposerDraftStore.getState();
     store.setProjectDraftThreadId(projectRef, draftId, {

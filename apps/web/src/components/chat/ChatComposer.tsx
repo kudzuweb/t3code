@@ -54,7 +54,11 @@ import { settlePromise, squashAtomCommandFailure } from "@t3tools/client-runtime
 import * as Schema from "effect/Schema";
 import { formatComposerModelMention } from "@t3tools/client-runtime/composer-model-mentions";
 import { isPasteAsTextShortcut } from "@t3tools/client-runtime/text-paste";
-import { scopedThreadKey, scopeThreadRef } from "@t3tools/client-runtime/environment";
+import {
+  scopedThreadKey,
+  scopeProjectRef,
+  scopeThreadRef,
+} from "@t3tools/client-runtime/environment";
 import { serializeComposerFileLink } from "@t3tools/shared/composerTrigger";
 import { type FolderDropTarget, folderDropTarget, resolveDroppedFolderPath } from "./folderDrop";
 import { splitTransferredFiles } from "./workspaceFileDrop";
@@ -250,6 +254,7 @@ import { observeResize } from "~/lib/observeResize";
 
 const isEnvironmentRequestInvalidError = Schema.is(EnvironmentRequestInvalidError);
 import { toastManager } from "../ui/toast";
+import { openResumeSessionDialog } from "../resumeSession/resumeSessionDialogState";
 import { m as resolveMessage } from "../../i18n/messages";
 import { BuildingIcon, PlayIcon, ReplyIcon } from "lucide-react";
 import { useNavigate } from "@tanstack/react-router";
@@ -1226,6 +1231,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     sideChatAvailable: props.sideChatAvailable === true,
     sideChatDisabledReason: props.sideChatDisabledReason ?? null,
     freshSessionAvailable: props.onFreshSession !== undefined,
+    isDraftRoute: draftId !== null && activeProjectId !== null,
     compactSlashCommandAvailable,
     selectedProvider,
     selectedProviderSkills,
@@ -2088,6 +2094,21 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         if (applied) {
           setComposerHighlightedItemId(null);
           setIsComposerModelPickerOpen(true);
+        }
+        return;
+      }
+      if (item.command === "resume") {
+        if (draftId === null || activeProjectId === null) return;
+        const applied = applyPromptReplacement(trigger.rangeStart, trigger.rangeEnd, "", {
+          expectedText: snapshot.value.slice(trigger.rangeStart, trigger.rangeEnd),
+          focusEditorAfterReplace: false,
+        });
+        if (applied) {
+          setComposerHighlightedItemId(null);
+          openResumeSessionDialog({
+            projectRef: scopeProjectRef(environmentId, activeProjectId),
+            draftId,
+          });
         }
         return;
       }

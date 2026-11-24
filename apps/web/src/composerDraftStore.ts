@@ -1881,7 +1881,13 @@ function removeDraftThreadReferences(
     state.draftThreadsByThreadKey;
   const { [threadKey]: removedComposerDraft, ...restDraftsByThreadKey } = state.draftsByThreadKey;
   if (composerDestination && removedComposerDraft) {
-    restDraftsByThreadKey[composerTargetKey(composerDestination)] = removedComposerDraft;
+    const destinationKey = composerTargetKey(composerDestination);
+    const unsentText = restDraftsByThreadKey[destinationKey]?.prompt ?? "";
+    // Only resuming a session promotes into a thread that can already hold unsent text.
+    const prompt = [unsentText, removedComposerDraft.prompt]
+      .filter((text) => text !== "")
+      .join("\n");
+    restDraftsByThreadKey[destinationKey] = { ...removedComposerDraft, prompt };
   } else {
     revokeDraftThreadPreviewUrls(removedComposerDraft);
   }

@@ -1,6 +1,12 @@
 import { threadPullRequestKeyOf } from "@t3tools/client-runtime/thread-pull-requests";
 import { filterComposerPullRequestMatches } from "@t3tools/shared/composerPullRequestMatches";
-import { EnvironmentId, MessageId, ThreadId, type AssistantCitation } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  MessageId,
+  ProviderDriverKind,
+  ThreadId,
+  type AssistantCitation,
+} from "@t3tools/contracts";
 import {
   collectAssistantCitations,
   expandAssistantCitationsForProvider,
@@ -25,7 +31,7 @@ import {
   isPathSuggestionCurrent,
   replaceTextRange,
 } from "./composer-logic";
-import { slashCommandItemsForPromptPosition } from "./components/chat/composerSlashCommandSearch";
+import { slashCommandItemsForContext } from "./components/chat/composerSlashCommandSearch";
 import { carryDisplacedCustomAnswerIntoPrompt } from "./pendingUserInput";
 import { formatTerminalContextReference } from "./lib/terminalContext";
 
@@ -602,8 +608,44 @@ describe("side chat slash commands", () => {
       label: `/${command}`,
       description: "",
     }));
-    expect(slashCommandItemsForPromptPosition(items, false).map((item) => item.id)).toEqual([
-      "slash:model",
+    expect(
+      slashCommandItemsForContext(items, { isAtPromptStart: false, isDraftRoute: false }).map(
+        (item) => item.id,
+      ),
+    ).toEqual(["slash:model"]);
+  });
+});
+
+describe("/resume slash command", () => {
+  const builtInResume = {
+    id: "slash:resume",
+    type: "slash-command" as const,
+    command: "resume" as const,
+    label: "/resume",
+    description: "",
+  };
+  const providerResume = {
+    id: "provider-slash-command:claudeAgent:resume",
+    type: "provider-slash-command" as const,
+    provider: ProviderDriverKind.make("claudeAgent"),
+    command: { name: "resume" },
+    label: "/resume",
+    description: "",
+  };
+  const idsFor = (context: { isAtPromptStart: boolean; isDraftRoute: boolean }) =>
+    slashCommandItemsForContext([builtInResume, providerResume], context).map((item) => item.id);
+
+  it("is offered in a new thread at the start of the message, in place of the provider's", () => {
+    expect(idsFor({ isAtPromptStart: true, isDraftRoute: true })).toEqual(["slash:resume"]);
+  });
+
+  it("is not offered after the start of a message", () => {
+    expect(idsFor({ isAtPromptStart: false, isDraftRoute: true })).toEqual([]);
+  });
+
+  it("is not offered in a started thread, where the provider's command stays", () => {
+    expect(idsFor({ isAtPromptStart: true, isDraftRoute: false })).toEqual([
+      "provider-slash-command:claudeAgent:resume",
     ]);
   });
 });

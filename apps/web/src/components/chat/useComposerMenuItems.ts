@@ -52,10 +52,7 @@ import type { ComposerCommandItem } from "./ComposerCommandMenu";
 import { matchComposerModelItems } from "./composerModelMentions";
 import type { ModelEsque } from "./providerIconUtils";
 import type { ProviderInstanceEntry } from "../../providerInstances";
-import {
-  searchSlashCommandItems,
-  slashCommandItemsForPromptPosition,
-} from "./composerSlashCommandSearch";
+import { searchSlashCommandItems, slashCommandItemsForContext } from "./composerSlashCommandSearch";
 
 const COMPOSER_PULL_REQUEST_LIST_LIMIT = 99;
 const COMPOSER_PULL_REQUEST_RESULT_LIMIT = 12;
@@ -75,6 +72,7 @@ export function useComposerMenuItems({
   sideChatAvailable,
   sideChatDisabledReason,
   freshSessionAvailable,
+  isDraftRoute,
   compactSlashCommandAvailable,
   selectedProvider,
   selectedProviderSkills,
@@ -95,6 +93,7 @@ export function useComposerMenuItems({
   readonly sideChatAvailable: boolean;
   readonly sideChatDisabledReason: string | null;
   readonly freshSessionAvailable: boolean;
+  readonly isDraftRoute: boolean;
   readonly compactSlashCommandAvailable: boolean;
   readonly selectedProvider: ProviderDriverKind;
   readonly selectedProviderSkills: ServerProvider["skills"];
@@ -280,6 +279,13 @@ export function useComposerMenuItems({
               },
             ] as const)
           : []),
+        {
+          id: "slash:resume",
+          type: "slash-command",
+          command: "resume",
+          label: "/resume",
+          description: gt("Continue a Claude Code, Codex or Pi session in this thread"),
+        },
         ...(freshSessionAvailable
           ? ([
               {
@@ -325,9 +331,9 @@ export function useComposerMenuItems({
           (item.command.name !== "compact" || compactSlashCommandAvailable) &&
           (item.command.name !== "clear" || !freshSessionAvailable),
       );
-      const slashCommandItems = slashCommandItemsForPromptPosition(
+      const slashCommandItems = slashCommandItemsForContext(
         [...builtInSlashCommandItems, ...visibleProviderSlashCommandItems, ...skillItems],
-        composerTrigger.rangeStart === 0,
+        { isAtPromptStart: composerTrigger.rangeStart === 0, isDraftRoute },
       );
       return searchSlashCommandItems(slashCommandItems, query);
     }
